@@ -1,6 +1,7 @@
 # Vault MCP server. Runs in its own container so the key never shares a
 # process with the untrusted open-tier query surface.
-mcp>=1.1.0
+# 1.x FastMCP was renamed MCPServer in 2.x, so an unpinned major silently breaks.
+mcp>=2.0,<3
 pydantic-settings>=2.4.0
 uvicorn>=0.30.0
 fastembed>=0.8.0,<0.9

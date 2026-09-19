@@ -3,7 +3,8 @@
 # Crawl4AI is deliberately NOT here yet: it pulls Playwright + Chromium (1-2 GB)
 # and belongs only in this image, never in the MCP or vault images. It lands
 # with the web extractor in Phase 2.
-mcp>=1.1.0
+# 1.x FastMCP was renamed MCPServer in 2.x, so an unpinned major silently breaks.
+mcp>=2.0,<3
 qdrant-client>=1.12,<2
 pydantic-settings>=2.4.0
 fastembed>=0.8.0,<0.9

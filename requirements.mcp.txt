@@ -1,5 +1,6 @@
 # Open-tier MCP server. Deliberately carries no crypto and no vault code.
-mcp>=1.1.0
+# 1.x FastMCP was renamed MCPServer in 2.x, so an unpinned major silently breaks.
+mcp>=2.0,<3
 # 1.9 is what shipped the bug this replaced: client.search() was removed in
 # 1.12+, so an unpinned floor let a fresh build resolve to a broken API.
 qdrant-client>=1.12,<2
