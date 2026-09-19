@@ -214,3 +214,34 @@ def test_missing_source_path_reports_incomplete_enumeration(tmp_path):
     )
     assert files == []
     assert complete is False
+
+
+def test_same_basename_in_different_directories_does_not_collide(tmp_path):
+    """Regression: doc_id derives from rel_uri, and extractors default it to
+    the basename because they only ever see one file. Without the source-root
+    relative path, every CLAUDE.md in a tree collapses into one document, each
+    silently overwriting the last."""
+    from app.pipeline.extract.base import doc_id_for
+
+    assert doc_id_for("dev-notes", "RAG/CLAUDE.md") != doc_id_for("dev-notes", "LLM/CLAUDE.md")
+
+
+def test_sync_sets_the_source_relative_uri(tmp_path):
+    from app.pipeline import extract
+    from app.sources import Source
+
+    (tmp_path / "RAG").mkdir()
+    (tmp_path / "LLM").mkdir()
+    (tmp_path / "RAG" / "CLAUDE.md").write_text("# RAG\n\nOne.\n")
+    (tmp_path / "LLM" / "CLAUDE.md").write_text("# LLM\n\nTwo.\n")
+
+    source = Source(id="s", type="local", domain="notes", path=tmp_path)
+    from app.pipeline.sync import enumerate_files
+
+    files, _ = enumerate_files(source)
+    uris = set()
+    for path in files:
+        doc = extract.extract(path)
+        doc.rel_uri = str(path.relative_to(source.path))
+        uris.add(doc.rel_uri)
+    assert uris == {"RAG/CLAUDE.md", "LLM/CLAUDE.md"}

@@ -352,6 +352,12 @@ def sync_source(source: Source, run_id: str, *, force: bool = False, dry_run: bo
                 doc = extract.extract(path)
                 if doc is None:
                     continue
+                # Extractors only see one file, so they default rel_uri to the
+                # basename. Only this loop knows the source root, and doc_id is
+                # derived from rel_uri -- leaving it a basename makes every
+                # CLAUDE.md under a tree collide into one document, each
+                # silently overwriting the last.
+                doc.rel_uri = str(path.relative_to(source.path))
                 if doc.status == OCR_REQUIRED:
                     result.ocr_required += 1
                     if not source.is_vault:
