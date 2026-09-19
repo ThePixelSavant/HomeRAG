@@ -1,0 +1,13 @@
+[Unit]
+Description=Ingest documents dropped into the RAG inbox
+After=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jnovick/Dev/RAG
+# Debounce: a multi-file drop or a partially-written download would otherwise
+# trigger several runs, and a half-copied file would be indexed as truncated.
+ExecStartPre=/bin/sleep 10
+ExecStart=/usr/bin/make ingest
+SyslogIdentifier=rag-inbox
+Nice=10

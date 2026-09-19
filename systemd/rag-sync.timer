@@ -1,0 +1,14 @@
+[Unit]
+Description=Run the RAG ingestion sync periodically
+
+[Timer]
+# One timer for every source. Per-source cadences stay in sources.yaml and are
+# honoured in code, so cadence lives in exactly one place.
+OnCalendar=*:0/15
+# Catches runs missed while the machine was off, which a long-lived scheduler
+# container would simply lose.
+Persistent=true
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target

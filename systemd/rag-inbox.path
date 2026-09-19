@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch the RAG drop-folder inbox
+
+[Path]
+PathChanged=/home/jnovick/Dev/RAG/data/inbox
+Unit=rag-inbox.service
+
+[Install]
+WantedBy=paths.target

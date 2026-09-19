@@ -1,0 +1,227 @@
+"""The gates must fail closed.
+
+These are the tests that matter most: every one of them asserts that something
+is REFUSED. A regression here does not break a feature, it silently exposes
+financial and personal data, so each failure mode gets its own case.
+"""
+
+from __future__ import annotations
+
+import time
+
+import pytest
+
+from app.vault import grants, identity, service
+from app.vault.crypto import VaultSealed, WrongPassphrase
+from app.vault.keyagent import AGENT
+
+
+def mcp_ctx(tok, chat="c1", message="m1"):
+    return service.Context(
+        transport=service.MCP,
+        headers={"X-OpenWebUI-User-Jwt": tok},
+        chat_id=chat,
+        message_id=message,
+    )
+
+
+# --- gate 1: sealed --------------------------------------------------------
+
+
+def test_sealed_vault_denies_model(vault_dir, token):
+    with pytest.raises(VaultSealed):
+        service.search("anything", ctx=mcp_ctx(token()))
+
+
+def test_sealed_vault_denies_cli_too(vault_dir):
+    """The CLI skips only the approval gate, never the key."""
+    with pytest.raises(VaultSealed):
+        service.search("anything", ctx=service.Context())
+
+
+def test_status_readable_while_sealed(vault_dir):
+    status = service.status()
+    assert status["unlocked"] is False
+    assert "chunks_by_domain" not in status  # reveals no contents
+
+
+def test_wrong_passphrase_rejected(unlocked):
+    AGENT.lock()
+    with pytest.raises(WrongPassphrase):
+        AGENT.unlock("not the passphrase")
+
+
+def test_key_ttl_wipes(vault_dir):
+    from app.vault import crypto, store
+
+    AGENT.unlock("test passphrase", ttl_seconds=600)
+    conn = AGENT.connect()
+    store.init(conn)
+    conn.close()
+    crypto.write_verifier(AGENT.key())
+
+    AGENT.unlock("test passphrase", ttl_seconds=1)
+    time.sleep(1.1)
+    assert AGENT.is_unlocked() is False
+    with pytest.raises(VaultSealed):
+        AGENT.key()
+
+
+# --- gate 2: identity ------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        pytest.param({"secret": "wrong-secret-entirely-0000000000"}, id="forged-signature"),
+        pytest.param({"ttl": -10}, id="expired"),
+        pytest.param({"email": "someone@else.com"}, id="email-not-allowlisted"),
+        pytest.param({"role": "user"}, id="role-not-permitted"),
+    ],
+)
+def test_identity_rejected(unlocked, token, kwargs):
+    with pytest.raises(identity.IdentityError):
+        service.search("receipts", ctx=mcp_ctx(token(**kwargs)))
+
+
+def test_missing_jwt_rejected(unlocked):
+    ctx = service.Context(transport=service.MCP, headers={}, chat_id="c1", message_id="m1")
+    with pytest.raises(identity.IdentityError):
+        service.search("receipts", ctx=ctx)
+
+
+def test_plaintext_headers_are_not_identity(unlocked):
+    """Open WebUI's unsigned X-OpenWebUI-User-* headers must carry no weight.
+
+    Anything that can reach the port can set them, which is exactly why the
+    signed assertion is the only thing checked.
+    """
+    ctx = service.Context(
+        transport=service.MCP,
+        headers={"X-OpenWebUI-User-Email": "owner@example.com", "X-OpenWebUI-User-Role": "admin"},
+        chat_id="c1",
+        message_id="m1",
+    )
+    with pytest.raises(identity.IdentityError):
+        service.search("receipts", ctx=ctx)
+
+
+def test_empty_allowlist_denies_everyone(unlocked, token, monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "vault_allowed_emails", "")
+    with pytest.raises(identity.IdentityError):
+        service.search("receipts", ctx=mcp_ctx(token()))
+
+
+# --- gate 3: per-request approval -----------------------------------------
+
+
+def test_valid_identity_still_needs_approval(unlocked, token):
+    grants.REGISTRY.clear()
+    with pytest.raises(grants.PendingApproval) as excinfo:
+        service.search("receipts", ctx=mcp_ctx(token()))
+    grant = excinfo.value.grant
+    assert grant.code.isdigit() and len(grant.code) == 6
+    # The approver must be able to see who and what they are releasing.
+    assert "owner@example.com" in grant.principal
+    assert "receipts" in grant.query_preview
+
+
+def test_approval_releases_then_cannot_be_replayed(unlocked, token):
+    grants.REGISTRY.clear()
+    tok = token()
+    with pytest.raises(grants.PendingApproval) as excinfo:
+        service.search("receipts", ctx=mcp_ctx(tok))
+    grants.REGISTRY.approve(excinfo.value.grant.code)
+
+    service.search("receipts", ctx=mcp_ctx(tok))  # released
+
+    with pytest.raises(grants.PendingApproval):
+        service.search("receipts", ctx=mcp_ctx(tok))  # single use
+
+
+def test_grant_does_not_carry_to_another_message(unlocked, token):
+    grants.REGISTRY.clear()
+    tok = token()
+    with pytest.raises(grants.PendingApproval) as excinfo:
+        service.search("receipts", ctx=mcp_ctx(tok, message="m1"))
+    grants.REGISTRY.approve(excinfo.value.grant.code)
+
+    with pytest.raises(grants.PendingApproval):
+        service.search("receipts", ctx=mcp_ctx(tok, message="m2"))
+
+
+def test_grant_does_not_carry_to_another_query(unlocked, token):
+    grants.REGISTRY.clear()
+    tok = token()
+    with pytest.raises(grants.PendingApproval) as excinfo:
+        service.search("receipts", ctx=mcp_ctx(tok))
+    grants.REGISTRY.approve(excinfo.value.grant.code)
+
+    with pytest.raises(grants.PendingApproval):
+        service.search("something else entirely", ctx=mcp_ctx(tok))
+
+
+def test_grant_expires(unlocked, token, monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "vault_grant_ttl_seconds", 1)
+    grants.REGISTRY.clear()
+    tok = token()
+    with pytest.raises(grants.PendingApproval) as excinfo:
+        service.search("receipts", ctx=mcp_ctx(tok))
+    code = excinfo.value.grant.code
+    time.sleep(1.2)
+    with pytest.raises(KeyError):
+        grants.REGISTRY.approve(code)
+
+
+def test_cli_path_skips_approval_only(unlocked):
+    """A human at a terminal is already the approval."""
+    assert service.search("receipts", ctx=service.Context()) == []
+
+
+# --- ledger SQL ------------------------------------------------------------
+
+
+def test_ledger_rejects_unknown_filter(unlocked):
+    with pytest.raises(ValueError, match="Unsupported filter"):
+        service.query_ledger(evil="1; DROP TABLE ledger", ctx=service.Context())
+
+
+def test_ledger_rejects_unknown_group_by(unlocked):
+    with pytest.raises(ValueError, match="Unsupported group_by"):
+        service.query_ledger(group_by="1; DROP TABLE ledger", ctx=service.Context())
+
+
+# --- encryption at rest ----------------------------------------------------
+
+
+def test_vault_file_is_ciphertext(unlocked):
+    from app.vault import store
+    from app.vault.keyagent import AGENT as agent
+
+    conn = agent.connect()
+    store.upsert_document(
+        conn,
+        doc_id="d1",
+        source_id="inbox:receipts",
+        domain="receipts",
+        uri="r.jpg",
+        title="Distinctive Merchant Name",
+        content_hash="h",
+        extractor="vlm",
+        status="indexed",
+    )
+    conn.commit()
+    conn.close()
+
+    raw = (unlocked / "vault.db").read_bytes()
+    assert b"Distinctive Merchant Name" not in raw
+    assert not raw.startswith(b"SQLite format 3")
+
+
+def test_open_tier_domain_rejected_by_vault_search(unlocked):
+    with pytest.raises(PermissionError, match="open-tier"):
+        service.search("x", domains=["manuals"], ctx=service.Context())

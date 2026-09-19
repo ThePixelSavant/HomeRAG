@@ -1,0 +1,20 @@
+[Unit]
+Description=RAG ingestion sync
+Documentation=file:///home/jnovick/Dev/RAG/README.md
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jnovick/Dev/RAG
+ExecStart=/usr/bin/make ingest
+
+# onnxruntime otherwise spawns a thread per core and thrashes against
+# llama-server, visibly degrading generation. EMBED_THREADS_INGEST caps the
+# pool; this caps the cgroup as a backstop.
+CPUQuota=800%
+Nice=10
+IOSchedulingClass=idle
+
+# Journald, matching the rest of the stack: journalctl -t rag-sync -f
+SyslogIdentifier=rag-sync
