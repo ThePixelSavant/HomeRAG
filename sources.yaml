@@ -1,0 +1,37 @@
+# Source manifest — single source of truth for what gets indexed and how often.
+#
+# IMPORTANT: Changing EMBED_MODEL or EMBED_DIM after index creation requires
+# running `make rebuild-index` to drop and re-embed the entire collection.
+# Never add a source while the collection uses a different embedding model.
+
+sources:
+  - id: crawl4ai-docs
+    type: web
+    url: https://docs.crawl4ai.com
+    cadence: "0 */6 * * *"   # every 6 hours
+    chunking:
+      strategy: markdown
+      chunk_size: 512
+      chunk_overlap: 64
+
+  - id: local-notes
+    type: local
+    path: /docs               # bind-mounted from LOCAL_DOCS_PATH in .env
+    cadence: "0 * * * *"     # hourly
+    chunking:
+      strategy: text
+      chunk_size: 512
+      chunk_overlap: 64
+
+  - id: qdrant-python-client
+    type: git
+    url: https://github.com/qdrant/qdrant-client
+    branch: master
+    paths:
+      - "*.md"
+      - "docs/**"
+    cadence: "0 0 * * *"     # daily at midnight
+    chunking:
+      strategy: markdown
+      chunk_size: 512
+      chunk_overlap: 64

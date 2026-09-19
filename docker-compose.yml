@@ -1,0 +1,72 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    restart: unless-stopped
+    volumes:
+      - qdrant-data:/qdrant/storage
+    networks:
+      - llm-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    logging:
+      driver: journald
+      options:
+        tag: "qdrant"
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    volumes:
+      - ollama-data:/root/.ollama
+    networks:
+      - llm-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    logging:
+      driver: journald
+      options:
+        tag: "ollama"
+
+  mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.mcp
+    container_name: mcp-server
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${MCP_PORT:-8000}:8000"
+    env_file:
+      - .env
+    environment:
+      # Override env_file values so services talk over Docker DNS, not localhost
+      QDRANT_URL: http://qdrant:6333
+      OLLAMA_URL: http://ollama:11434
+    depends_on:
+      qdrant:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    networks:
+      - llm-net
+    logging:
+      driver: journald
+      options:
+        tag: "mcp-server"
+
+networks:
+  llm-net:
+    external: true   # Defined in ~/Dev/LLM/docker-compose.yml; start that stack first
+
+volumes:
+  qdrant-data:
+  ollama-data:
