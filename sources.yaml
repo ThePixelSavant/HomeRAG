@@ -1,37 +1,56 @@
-# Source manifest — single source of truth for what gets indexed and how often.
+# Source manifest for sources OUTSIDE the drop-folder inbox.
 #
-# IMPORTANT: Changing EMBED_MODEL or EMBED_DIM after index creation requires
-# running `make rebuild-index` to drop and re-embed the entire collection.
-# Never add a source while the collection uses a different embedding model.
+# The inbox needs no entry here: every directory under data/inbox/ is an
+# implicit source whose DIRECTORY NAME IS ITS DOMAIN. Drop a PDF into
+# data/inbox/manuals/ and it is indexed as `manuals`, no config edit.
+#
+# `domain` is REQUIRED on every entry below and must exist in app/domains.py.
+# It decides the storage tier -- open (Qdrant, plaintext) or vault (SQLCipher,
+# encrypted, sealed). There is deliberately no default: a typo that silently
+# became open-tier would write a plaintext vector, and a vector is recoverable
+# back to its source text.
+#
+# Changing EMBED_MODEL or EMBED_DIM after the collection exists requires
+# `make rebuild-index`; the fingerprint stored with the vectors enforces it.
 
 sources:
-  - id: crawl4ai-docs
-    type: web
-    url: https://docs.crawl4ai.com
-    cadence: "0 */6 * * *"   # every 6 hours
-    chunking:
-      strategy: markdown
-      chunk_size: 512
-      chunk_overlap: 64
-
-  - id: local-notes
+  # Markdown notes authored under ~/Dev, bind-mounted read-only at /docs.
+  - id: dev-notes
     type: local
-    path: /docs               # bind-mounted from LOCAL_DOCS_PATH in .env
-    cadence: "0 * * * *"     # hourly
-    chunking:
-      strategy: text
-      chunk_size: 512
-      chunk_overlap: 64
+    domain: notes
+    path: /docs
+    cadence: "0 * * * *"      # hourly
+    include:
+      - "**/*.md"
+    exclude:
+      - "**/node_modules/**"
+      - "**/.venv/**"
+      - "**/site-packages/**"
+      - "**/.git/**"
 
-  - id: qdrant-python-client
-    type: git
-    url: https://github.com/qdrant/qdrant-client
-    branch: master
-    paths:
-      - "*.md"
-      - "docs/**"
-    cadence: "0 0 * * *"     # daily at midnight
-    chunking:
-      strategy: markdown
-      chunk_size: 512
-      chunk_overlap: 64
+  # Past Claude Code sessions. VAULT tier: transcripts carry pasted secrets,
+  # file contents and working paths, so they are encrypted and gated rather
+  # than indexed in the clear.
+  - id: claude-sessions
+    type: transcripts
+    domain: transcripts
+    path: /transcripts
+    cadence: "0 */4 * * *"    # every 4 hours
+
+  # --- Phase 2 (not yet implemented; enabled:false so validation passes) ---
+
+  # - id: crawl4ai-docs
+  #   type: web
+  #   domain: sdk-docs
+  #   url: https://docs.crawl4ai.com
+  #   cadence: "0 */6 * * *"
+  #   enabled: false
+
+  # - id: qdrant-python-client
+  #   type: git
+  #   domain: sdk-docs
+  #   url: https://github.com/qdrant/qdrant-client
+  #   branch: master
+  #   include: ["*.md", "docs/**"]
+  #   cadence: "0 0 * * *"
+  #   enabled: false
