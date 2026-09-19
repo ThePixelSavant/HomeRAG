@@ -1,0 +1,8 @@
+[tool.pytest.ini_options]
+# The package lives at <root>/app, and pytest does not add the rootdir to
+# sys.path on its own when the test directory has no __init__.py. Without this
+# the suite passes locally (where the cwd happens to be on the path) and fails
+# inside the image.
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"

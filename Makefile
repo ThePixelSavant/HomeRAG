@@ -6,7 +6,8 @@ WORKER     = $(COMPOSE) run --rm ingestion-worker
 # Vault control commands must reach the RUNNING vault server, because that is
 # the process holding the key in memory. A one-shot container would derive a
 # key into its own memory and then exit.
-VAULTEXEC  = docker exec -it mcp-vault python -m app.ingest
+VAULTEXEC  = docker exec -it mcp-vault python -m app.vaultctl
+VAULTRUN   = docker exec mcp-vault python -m app.vaultctl
 
 .PHONY: up down logs build doctor warm-cache ingest reindex add query status \
         rebuild-index review-quarantine unlock lock vault-status vault-query \
@@ -70,20 +71,20 @@ unlock:                 ## Unlock the vault (prompts; key lives in memory with a
 	@$(VAULTEXEC) unlock $(if $(TTL),--ttl $(TTL))
 
 lock:                   ## Seal the vault now and wipe the key
-	@docker exec mcp-vault python -m app.ingest lock
+	@$(VAULTRUN) lock
 
 vault-status:
-	@docker exec mcp-vault python -m app.ingest vault-status
+	@$(VAULTRUN) status
 
 vault-query:            ## Search the vault as a human: make vault-query Q="..."
 	@test -n "$(Q)" || { echo 'usage: make vault-query Q="..."'; exit 2; }
-	@docker exec mcp-vault python -m app.ingest vault-query "$(Q)" $(if $(LIMIT),--limit $(LIMIT))
+	@$(VAULTRUN) query "$(Q)" $(if $(LIMIT),--limit $(LIMIT))
 
 approve:                ## Release one pending request: make approve CODE=123456
 	@$(VAULTEXEC) approve $(if $(CODE),--code $(CODE))
 
 vault-audit:            ## Every access attempt, allowed or denied
-	@docker exec mcp-vault python -m app.ingest vault-audit $(if $(N),--limit $(N))
+	@$(VAULTRUN) audit $(if $(N),--limit $(N))
 
 ## --- development ---------------------------------------------------------
 

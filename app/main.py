@@ -148,7 +148,8 @@ def get_index_status() -> dict:
 def main() -> None:
     logger.info("Initialising Qdrant collection...")
     qdrant_store.init_collection()
-    state.init()
+    # Deliberately NOT state.init(): this server is a reader and mounts
+    # data/state read-only. The ingestion worker owns that file.
     logger.info(
         "Open-tier MCP server on %s:%d/mcp  domains=%s",
         settings.mcp_host,

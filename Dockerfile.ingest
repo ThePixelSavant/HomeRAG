@@ -16,6 +16,9 @@ RUN pip install --no-cache-dir -r requirements.ingest.txt
 
 COPY app/ app/
 COPY sources.yaml .
+# `make test` runs the suite in this image, so it needs the tests.
+COPY tests/ tests/
+COPY pyproject.toml .
 
 RUN python -c "from app.pipeline.embedder import warm_cache; warm_cache()"
 

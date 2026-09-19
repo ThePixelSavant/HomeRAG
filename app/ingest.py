@@ -10,7 +10,6 @@ it still works when the servers are down.
 from __future__ import annotations
 
 import argparse
-import getpass
 import json
 import logging
 import shutil
@@ -360,118 +359,6 @@ def cmd_review_quarantine(args) -> int:
 
 
 # --------------------------------------------------------------------------
-# vault commands (thin clients over the control socket)
-# --------------------------------------------------------------------------
-
-
-def _control(request: dict) -> dict:
-    from app.vault import control
-
-    try:
-        return control.send(request)
-    except control.ControlUnavailable as exc:
-        raise SystemExit(str(exc)) from None
-
-
-def cmd_unlock(args) -> int:
-    if not sys.stdin.isatty():
-        raise SystemExit(
-            "unlock needs a terminal. Run it as: make unlock\n"
-            "The passphrase is deliberately not accepted from a flag, a file or an "
-            "environment variable -- that is what stops a model from unlocking the vault."
-        )
-    passphrase = getpass.getpass("Vault passphrase: ")
-    if not passphrase:
-        raise SystemExit("aborted")
-    reply = _control({"action": "unlock", "passphrase": passphrase, "ttl": args.ttl})
-    if not reply.get("ok"):
-        raise SystemExit(reply.get("error", "unlock failed"))
-    print(f"Vault unlocked for {reply['seconds_remaining']}s.")
-    return 0
-
-
-def cmd_lock(args) -> int:
-    _control({"action": "lock"})
-    print("Vault sealed; key wiped.")
-    return 0
-
-
-def cmd_vault_status(args) -> int:
-    print(json.dumps(_control({"action": "status"}).get("status"), indent=2, default=str))
-    return 0
-
-
-def cmd_vault_query(args) -> int:
-    from app.vault import service
-
-    domains = args.domains.split(",") if args.domains else None
-    hits = service.search(args.query, domains=domains, limit=args.limit, ctx=service.Context())
-    if args.json:
-        print(json.dumps(hits, indent=2, default=str))
-        return 0
-    if not hits:
-        print("no results")
-        return 0
-    for hit in hits:
-        print(f"\n[{hit['score']:.4f}] {hit['title']}  ({hit['domain']})")
-        print(f"  {hit['uri']}  chunk {hit['chunk_index']}")
-        print(f"  {_snippet(hit['content'])}")
-    return 0
-
-
-def cmd_approve(args) -> int:
-    pending = _control({"action": "pending"}).get("pending", [])
-    if not args.code:
-        if not pending:
-            print("Nothing awaiting approval.")
-            return 0
-        for grant in pending:
-            print(f"  code={grant['code']}  {grant['tool']}  by {grant['principal']}")
-            print(f"     chat={grant['chat_id']} message={grant['message_id']}")
-            print(f"     query: {grant['query_preview']}\n")
-        return 0
-
-    match = next((g for g in pending if g["code"] == args.code), None)
-    if match is None:
-        raise SystemExit(f"No pending request with code {args.code} (it may have expired).")
-
-    # Show exactly what is being released, then require a typed confirmation.
-    # A reflexive y/n is no protection against a prompt-injected model, and
-    # the model asking here is the one thing this check exists to catch.
-    print("\nRelease vault data for this request?\n")
-    print(f"  principal : {match['principal']}")
-    print(f"  tool      : {match['tool']}")
-    print(f"  chat      : {match['chat_id']}  message: {match['message_id']}")
-    print(f"  query     : {match['query_preview']}\n")
-    print("  Confirm the model in that chat is the local one; a frontier model would")
-    print("  send these results off this machine.\n")
-    if input("Type 'yes' to approve: ").strip().lower() != "yes":
-        print("denied")
-        return 1
-    reply = _control({"action": "approve", "code": args.code})
-    if not reply.get("ok"):
-        raise SystemExit(reply.get("error", "approval failed"))
-    print("Approved. This grant is single-use and expires shortly.")
-    return 0
-
-
-def cmd_vault_audit(args) -> int:
-    reply = _control({"action": "audit", "limit": args.limit})
-    if not reply.get("ok"):
-        raise SystemExit(reply.get("error", "audit unavailable"))
-    rows = reply["rows"]
-    if args.json:
-        print(json.dumps(rows, indent=2, default=str))
-        return 0
-    for row in rows:
-        print(f"{row['ts']}  {row['decision']:16s} {row['tool']:14s} "
-              f"{row['principal'] or '-':38s} rows={row['rows_returned']}")
-        if row["reason"]:
-            print(f"     {row['reason']}")
-    return 0
-
-
-# --------------------------------------------------------------------------
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -518,28 +405,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("review-quarantine").set_defaults(func=cmd_review_quarantine)
 
-    p = sub.add_parser("unlock", help="unlock the vault (TTY only)")
-    p.add_argument("--ttl", type=int, default=None)
-    p.set_defaults(func=cmd_unlock)
-
-    sub.add_parser("lock").set_defaults(func=cmd_lock)
-    sub.add_parser("vault-status").set_defaults(func=cmd_vault_status)
-
-    p = sub.add_parser("vault-query", help="search the vault (human path; no approval needed)")
-    p.add_argument("query")
-    p.add_argument("--domains")
-    p.add_argument("--limit", type=int, default=5)
-    p.add_argument("--json", action="store_true")
-    p.set_defaults(func=cmd_vault_query)
-
-    p = sub.add_parser("approve", help="release one pending vault request")
-    p.add_argument("--code")
-    p.set_defaults(func=cmd_approve)
-
-    p = sub.add_parser("vault-audit")
-    p.add_argument("--limit", type=int, default=50)
-    p.add_argument("--json", action="store_true")
-    p.set_defaults(func=cmd_vault_audit)
+    # Vault commands live in app/vaultctl.py: they run inside the vault
+    # container, which deliberately lacks this module's qdrant dependency.
 
     return parser
 

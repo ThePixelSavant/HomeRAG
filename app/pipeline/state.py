@@ -97,6 +97,15 @@ def new_run_id() -> str:
 
 
 def _connect(path: Path, *, read_only: bool) -> sqlite3.Connection:
+    if read_only:
+        # The MCP servers mount data/state read-only, so the file cannot be
+        # opened read-write at all -- not just by convention, by the mount.
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10.0)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA query_only=ON")
+        return conn
+
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), timeout=10.0)
     conn.row_factory = sqlite3.Row
@@ -106,11 +115,6 @@ def _connect(path: Path, *, read_only: bool) -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
-    if read_only:
-        # Opening with mode=ro is fragile: WAL readers still need write
-        # permission on the directory to create -shm/-wal. We open read-write
-        # and enforce read-only by only exposing SELECTs through this module.
-        conn.execute("PRAGMA query_only=ON")
     return conn
 
 
@@ -130,13 +134,25 @@ def writer(path: Path | None = None):
 
 @contextmanager
 def reader(path: Path | None = None):
+    """Read-only handle.
+
+    Degrades to an empty in-memory database when the file does not exist yet or
+    cannot be opened. A reader must never create or migrate the file -- the
+    MCP servers mount data/state read-only on purpose -- and an index that has
+    simply not been built yet should report "nothing indexed", not crash the
+    server that reports it.
+    """
     target = path or settings.state_db_path
-    if not target.exists():
-        conn = _connect(target, read_only=False)
+    try:
+        conn = _connect(target, read_only=True) if target.exists() else None
+    except sqlite3.OperationalError:
+        conn = None
+
+    if conn is None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
         conn.executescript(SCHEMA)
-        conn.commit()
-        conn.close()
-    conn = _connect(target, read_only=True)
+
     try:
         yield conn
     finally:
