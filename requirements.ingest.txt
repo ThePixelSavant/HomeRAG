@@ -1,0 +1,23 @@
+# Ingestion worker. Writes to both tiers, so it carries both dependency sets.
+#
+# Crawl4AI is deliberately NOT here yet: it pulls Playwright + Chromium (1-2 GB)
+# and belongs only in this image, never in the MCP or vault images. It lands
+# with the web extractor in Phase 2.
+mcp>=1.1.0
+qdrant-client>=1.12,<2
+pydantic-settings>=2.4.0
+fastembed>=0.8.0,<0.9
+numpy>=1.26
+PyYAML>=6.0
+
+# Vault write path.
+sqlcipher3-binary>=0.5.4
+argon2-cffi>=23.1.0
+cryptography>=42.0
+
+# Per-source cron cadences from sources.yaml.
+croniter>=2.0.0
+# Calls llama-server for VLM receipt extraction.
+httpx>=0.27.0
+
+pytest>=8.0.0

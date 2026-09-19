@@ -1,0 +1,15 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+ENV FASTEMBED_CACHE_PATH=/models
+
+COPY requirements.vault.txt .
+RUN pip install --no-cache-dir -r requirements.vault.txt
+
+COPY app/ app/
+COPY sources.yaml .
+
+RUN python -c "from app.pipeline.embedder import warm_cache; warm_cache()"
+
+CMD ["python", "-m", "app.vault_server"]

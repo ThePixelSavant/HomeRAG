@@ -1,0 +1,23 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+ENV FASTEMBED_CACHE_PATH=/models
+
+# poppler-utils provides pdftotext, the text-native PDF path. OCR tooling
+# (tesseract, ocrmypdf, ghostscript) lands here in Phase 2 -- this image only,
+# never the MCP or vault images.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends poppler-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.ingest.txt .
+RUN pip install --no-cache-dir -r requirements.ingest.txt
+
+COPY app/ app/
+COPY sources.yaml .
+
+RUN python -c "from app.pipeline.embedder import warm_cache; warm_cache()"
+
+ENTRYPOINT ["python", "-m", "app.ingest"]
+CMD ["status"]

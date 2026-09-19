@@ -1,42 +1,41 @@
 services:
+  # Vector store for the OPEN tier only. Sensitive data never reaches it --
+  # a vector cannot be encrypted and stay searchable, and inversion recovers
+  # most of the source text from one.
+  #
+  # Pinned by digest: snapshot restore requires a matching minor version, so a
+  # silent `latest` bump between taking a backup and restoring it breaks the
+  # migration. Rollback digest: (record the previous digest here on upgrade)
   qdrant:
-    image: qdrant/qdrant:latest
+    image: qdrant/qdrant@sha256:057ee3a8da769fe7310dd3537b4dc7583bf87a95ce8ac43c0af5a46bc580d1fc
     container_name: qdrant
     restart: unless-stopped
     volumes:
-      - qdrant-data:/qdrant/storage
+      - ./data/qdrant:/qdrant/storage
+    environment:
+      # Set once Qdrant is reachable off the local bridge. Unauthenticated is
+      # survivable on a private bridge, not on a LAN.
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:-}
+      QDRANT__SERVICE__READ_ONLY_API_KEY: ${QDRANT_READ_ONLY_API_KEY:-}
+    healthcheck:
+      # The image ships no curl, wget, nc or python3 -- only bash. The previous
+      # `curl -f .../health` could never pass, which is why mcp-server sat in
+      # Created for six weeks. 127.0.0.1 rather than localhost: the latter can
+      # resolve ::1 first and fail against a v4-only listener.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/6333"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     networks:
       - llm-net
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:6333/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
     logging:
       driver: journald
       options:
         tag: "qdrant"
 
-  ollama:
-    image: ollama/ollama:latest
-    container_name: ollama
-    restart: unless-stopped
-    volumes:
-      - ollama-data:/root/.ollama
-    networks:
-      - llm-net
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:11434/"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 60s
-    logging:
-      driver: journald
-      options:
-        tag: "ollama"
-
+  # Open-tier MCP server. Carries no crypto, holds no key, and has NO vault
+  # mount -- it cannot read vault.db even if compromised.
   mcp-server:
     build:
       context: .
@@ -48,13 +47,17 @@ services:
     env_file:
       - .env
     environment:
-      # Override env_file values so services talk over Docker DNS, not localhost
       QDRANT_URL: http://qdrant:6333
-      OLLAMA_URL: http://ollama:11434
+      # Read-only key: this service never writes.
+      QDRANT_API_KEY: ${QDRANT_READ_ONLY_API_KEY:-}
+      STATE_DB_PATH: /data/state/rag.db
+      SOURCES_FILE: /app/sources.yaml
+    volumes:
+      # state/ only. Deliberately NO vault mount: this service must not be able
+      # to open vault.db under any circumstances.
+      - ./data/state:/data/state:ro
     depends_on:
       qdrant:
-        condition: service_healthy
-      ollama:
         condition: service_healthy
     networks:
       - llm-net
@@ -63,10 +66,70 @@ services:
       options:
         tag: "mcp-server"
 
+  # Vault MCP server. Separate process so the in-memory key never shares an
+  # address space with the untrusted open-tier query surface.
+  mcp-vault:
+    build:
+      context: .
+      dockerfile: Dockerfile.vault
+    container_name: mcp-vault
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${VAULT_PORT:-8001}:8001"
+    env_file:
+      - .env
+    environment:
+      VAULT_DB_PATH: /data/vault/vault.db
+      VAULT_BLOBS_PATH: /data/vault/blobs
+      STATE_DB_PATH: /data/state/rag.db
+      DATA_ROOT: /data
+    volumes:
+      - ./data/vault:/data/vault
+      - ./data/state:/data/state:ro
+    networks:
+      - llm-net
+    logging:
+      driver: journald
+      options:
+        tag: "mcp-vault"
+
+  # One-shot worker, driven by the Makefile. `profiles` keeps `make up` from
+  # starting it; it runs per invocation and returns its memory afterwards,
+  # rather than idling with a resident ONNX model.
+  ingestion-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.ingest
+    image: rag-ingestion-worker
+    profiles: ["tools"]
+    env_file:
+      - .env
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      LLAMA_URL: ${LLAMA_URL:-http://llama-server:8080}
+      DATA_ROOT: /data
+      INBOX_PATH: /data/inbox
+      ARCHIVE_PATH: /data/archive
+      QUARANTINE_PATH: /data/quarantine
+      VAULT_BLOBS_PATH: /data/vault/blobs
+      STATE_DB_PATH: /data/state/rag.db
+      VAULT_DB_PATH: /data/vault/vault.db
+    volumes:
+      - ./data:/data
+      - ./sources.yaml:/app/sources.yaml:ro
+      - ${LOCAL_DOCS_PATH:-/dev/null}:/docs:ro
+      - ${CLAUDE_PROJECTS_PATH:-/dev/null}:/transcripts:ro
+    networks:
+      - llm-net
+    logging:
+      driver: journald
+      options:
+        tag: "ingestion-worker"
+
 networks:
   llm-net:
     external: true   # Defined in ~/Dev/LLM/docker-compose.yml; start that stack first
 
-volumes:
-  qdrant-data:
-  ollama-data:
+# No named volumes. Everything lives under ./data as bind mounts so the whole
+# stack is one rsync-able directory -- named volumes are root-owned and need
+# sudo even to inspect, which makes the eventual server move needlessly hard.

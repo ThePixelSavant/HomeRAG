@@ -32,13 +32,18 @@ class Settings(BaseSettings):
     chunk_max_tokens: int = 480
 
     # --- Paths ---
+    # Split so that state/ and vault/ can be mounted independently: mcp-server
+    # gets state/ read-only and no vault mount at all, so it cannot open
+    # vault.db even if compromised. Directories rather than single files,
+    # because Docker silently creates a *directory* when a bind-mounted file
+    # does not exist yet.
     data_root: Path = Path("/data")
     inbox_path: Path = Path("/data/inbox")
     archive_path: Path = Path("/data/archive")
     quarantine_path: Path = Path("/data/quarantine")
-    vault_blobs_path: Path = Path("/data/vault_blobs")
-    state_db_path: Path = Path("/data/rag.db")
-    vault_db_path: Path = Path("/data/vault.db")
+    state_db_path: Path = Path("/data/state/rag.db")
+    vault_db_path: Path = Path("/data/vault/vault.db")
+    vault_blobs_path: Path = Path("/data/vault/blobs")
     sources_file: Path = Path("/app/sources.yaml")
 
     # --- MCP servers ---

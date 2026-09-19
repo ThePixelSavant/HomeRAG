@@ -1,4 +1,9 @@
+# Open-tier MCP server. Deliberately carries no crypto and no vault code.
 mcp>=1.1.0
-qdrant-client>=1.9.0
+# 1.9 is what shipped the bug this replaced: client.search() was removed in
+# 1.12+, so an unpinned floor let a fresh build resolve to a broken API.
+qdrant-client>=1.12,<2
 pydantic-settings>=2.4.0
 uvicorn>=0.30.0
+fastembed>=0.8.0,<0.9
+PyYAML>=6.0

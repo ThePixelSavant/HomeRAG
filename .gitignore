@@ -9,4 +9,7 @@ build/
 .venv/
 venv/
 *.db
+
+# Runtime state: the corpus, the Qdrant index, and the encrypted vault.
+# This is also the tree that moves when the stack moves.
 data/

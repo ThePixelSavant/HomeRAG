@@ -1,0 +1,17 @@
+# Vault MCP server. Runs in its own container so the key never shares a
+# process with the untrusted open-tier query surface.
+mcp>=1.1.0
+pydantic-settings>=2.4.0
+uvicorn>=0.30.0
+fastembed>=0.8.0,<0.9
+numpy>=1.26
+PyYAML>=6.0
+
+# SQLCipher bundled as a wheel -- no system libsqlcipher needed.
+sqlcipher3-binary>=0.5.4
+# Argon2id for passphrase -> key. Deliberately expensive.
+argon2-cffi>=23.1.0
+# AES-256-GCM for the encrypted original-document blobs.
+cryptography>=42.0
+# Verifies Open WebUI's signed HS256 identity assertion.
+PyJWT>=2.8.0
