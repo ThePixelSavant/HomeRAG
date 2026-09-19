@@ -1,180 +1,260 @@
-# Local RAG + MCP Documentation Service
+# Local RAG + MCP Knowledge Service
 
-A self-hosted pipeline that ingests documentation (web pages, local files, git repos), creates embeddings, and exposes retrieval as an **MCP server over Streamable HTTP** — consumable by both Open WebUI and Claude (Desktop / Code) from a single shared endpoint.
+A self-hosted knowledge base over your own documents — manuals, SDK docs, notes,
+infra plans, past agent sessions, receipts — exposed to a local LLM through MCP.
 
-## Architecture
+Documents go in from the command line. You query them from Open WebUI. Anything
+sensitive is encrypted, sealed by default, and reachable by a model only with
+your explicit per-request approval.
 
 ```
-  Sources                  RAG Stack (~/Dev/RAG)           Consumers
-  -------                  ---------------------           ---------
-  Web pages ──┐                                        ┌── Open WebUI
-  Local files─┤── Ingestion worker                     │   (Admin → External Tools)
-  Git repos ──┘   │ Crawl4AI / file walker / git pull  │
-                  │ Chunk → Embed (Ollama)              │
-                  ▼                                     │
-               Qdrant ◄── MCP server (FastMCP) ────────┤
-               (vectors +   http://localhost:8000/mcp   │
-                metadata)                               └── Claude Desktop / Code
+                                     ┌─ OPEN TIER ──────────────────────┐
+  data/inbox/<domain>/ ─> extract ─> │  Qdrant: dense + BM25, plaintext │ ─┐
+  ~/Dev (notes)          scan        │  manuals · sdk-docs · notes      │  │   Open WebUI
+                         chunk       └──────────────────────────────────┘  ├─> (Qwen3-VL,
+                         embed                                             │    or Claude)
+  ~/.claude/projects ──> extract ─>  ┌─ VAULT TIER ─────────────────────┐  │
+  data/inbox/receipts/   redact      │  SQLCipher: rows, text, vectors  │ ─┘
+                         chunk       │  receipts · financial ·          │
+                         embed       │  transcripts · personal          │
+                                     │  SEALED until `make unlock`      │
+                                     └──────────────────────────────────┘
 ```
 
-All services share `llm-net` with the existing LLM stack (Open WebUI, llama-server), so Open WebUI can reach the MCP server over Docker DNS without exposing extra ports.
+## The two tiers
 
-## Services
+The tier a document lands in is decided by **the folder you put it in**, never
+inferred from its contents.
 
-| Container | Image | Purpose |
-|---|---|---|
-| `qdrant` | `qdrant/qdrant` | Vector database with persistent storage |
-| `ollama` | `ollama/ollama` | Embedding model server (`nomic-embed-text` by default) |
-| `mcp-server` | local build | FastMCP Streamable HTTP server — exposes `search_docs`, `list_sources`, `get_index_status` |
-| `ingestion-worker` | local build | Crawlers + chunker + embedder + scheduler |
+| Tier | Domains | Storage | Who can read it |
+|---|---|---|---|
+| **Open** | `manuals`, `sdk-docs`, `notes`, `infra` | Qdrant, plaintext | Any local model, freely |
+| **Vault** | `receipts`, `financial`, `transcripts`, `personal` | SQLCipher, encrypted | Unlocked vault **+** verified identity **+** per-request approval |
 
-## Setup
+Sensitive data never reaches Qdrant. A vector has to be plaintext floats to be
+searchable, and inversion attacks reconstruct most of the source text from an
+embedding — so encrypting a payload while leaving its vector searchable would
+protect the wrong half. Vault vectors live inside the encrypted database and are
+brute-forced in memory while unlocked.
 
-### Prerequisites
+## Quick start
 
-The LLM stack (`~/Dev/LLM`) must be running first — it creates the `llm-net` Docker network that this stack joins.
+The LLM stack must be up first — it owns the `llm-net` network:
 
 ```bash
 cd ~/Dev/LLM && docker compose up -d
 ```
 
-### First-time setup
-
-**1. Copy and edit the env file:**
+Then:
 
 ```bash
-cp .env.example .env
-```
-
-Edit `.env` and set `LOCAL_DOCS_PATH` to the directory you want to index as local files. All other defaults are ready to use.
-
-**2. Start the stack:**
-
-```bash
+cp .env.example .env     # set LOCAL_DOCS_PATH, VAULT_ALLOWED_EMAILS, VAULT_JWT_SECRET
+make build
 make up
+make doctor              # everything should be green before you ingest
 ```
 
-**3. Pull the embedding model into Ollama:**
+Drop a document in and search for it:
 
 ```bash
-make pull-models
-```
-
-This downloads `nomic-embed-text` (~274 MB) into the `ollama-data` volume. Only needed once.
-
-**4. Index your sources:**
-
-```bash
+cp ~/Downloads/pump-manual.pdf data/inbox/manuals/
 make ingest
+make query Q="how do I prime the pump"
 ```
 
-Re-running is safe — unchanged chunks are skipped and nothing is duplicated.
+`data/inbox/<domain>/` **is** the classification — the directory name is the
+domain. `make add FILE=x.pdf DOMAIN=manuals` does the same thing explicitly. An
+unrecognised domain is an error rather than a default, because a typo that
+quietly became open-tier would publish a plaintext vector you cannot un-publish.
 
-## MCP tools
+## Commands
 
-| Tool | Description |
-|---|---|
-| `search_docs` | Semantic search over indexed documentation. Args: `query`, `limit` (default 5), optional `source_id` to restrict to one source. |
-| `list_sources` | Returns all configured sources and their last sync status. |
-| `get_index_status` | Returns last successful sync time and chunk count per source. |
+```bash
+make doctor                      # preflight: reachability, paths, fingerprint, backlogs
+make ingest [SOURCE=id] [DOMAIN=d] [FORCE=1]
+make add FILE=x.pdf DOMAIN=manuals [MOVE=1]
+make query Q="..." [DOMAINS=a,b] [LIMIT=5]
+make status [JSON=1]
+make reindex SOURCE=id
+make rebuild-index               # after changing EMBED_MODEL/EMBED_DIM
+make review-quarantine           # documents the sensitivity scan held back
+
+make unlock [TTL=900]            # prompts; key lives in memory only
+make lock
+make vault-status
+make vault-query Q="..."         # human path: no approval needed
+make approve [CODE=123456]       # release one pending model request
+make vault-audit [N=50]
+
+make test
+```
+
+`make query` talks to Qdrant directly rather than through MCP, so it still works
+with the servers down.
+
+## Quarantine
+
+Filing is declarative, but misfiling happens. Before any open-tier document is
+embedded its text is scanned for Luhn-valid card numbers, SSN/IBAN/account
+shapes, key and token prefixes, and co-occurring financial vocabulary. A hit
+means **quarantine, not index** — the file moves to `data/quarantine/` and
+nothing is embedded until you decide:
+
+```bash
+make review-quarantine
+make add FILE=data/quarantine/statement.pdf DOMAIN=financial
+```
+
+Card numbers are Luhn-checked so ordinary order numbers don't flood the queue
+into noise. This catches formatted identifiers, not "my password is hunter2" in
+prose — it is a backstop for misfiling, not a classifier.
+
+## The vault
+
+Sealed by default. `make unlock` prompts on a terminal, derives the key with
+Argon2id, and holds it in the vault server's memory with a TTL. **No key is ever
+written to disk** — not in `.env`, not in an image layer.
+
+The disk is already LUKS-encrypted, so powered-off theft is covered without any
+of this. What the vault adds is sealed-by-default on a *running* system: while
+locked the data is unreadable even to root, and **a model cannot unlock it**,
+because unlocking requires a human at a TTY. That is what makes the rule
+enforced rather than declared.
+
+Three gates on every model-initiated read:
+
+1. **Unlocked** — else `VAULT_SEALED`, before identity is even considered.
+2. **Verified identity** — Open WebUI mints a signed HS256 assertion per tool
+   call; the vault checks the signature, issuer, expiry, email and role. The
+   plaintext `X-OpenWebUI-User-*` headers carry no weight, because anything that
+   can reach the port could set them.
+3. **Per-request approval** — bound to `(subject, chat_id, message_id, query)`,
+   single-use. The first call returns a code, not data:
+
+```
+you  > what did I spend at Home Depot in Q2?
+model> PENDING_APPROVAL, code 481920
+
+$ make approve CODE=481920
+  principal : jnovick@pixelsavant.net (admin)
+  query     : SUM by month, Q2
+  Type 'yes' to approve:
+```
+
+Approving one request does not approve the next one, and the grant cannot be
+replayed on another turn.
+
+**Claude Code gets no exemption** — it is a model, so it passes all three gates.
+Only `make vault-query`, typed by a human, skips the approval step.
+
+Every attempt is recorded, allowed or denied: `make vault-audit`.
+
+### Frontier models
+
+Vault data released into a chat with a frontier model leaves this machine. The
+vault cannot detect that on its own — Open WebUI forwards no model identifier —
+so the control is **per-model tool scoping**: give the vault tool to a local-only
+"Finance" preset and to nothing else.
+
+| Preset | Model | Tools |
+|---|---|---|
+| Finance | local Qwen3-VL | `mcp-server` + `mcp-vault` |
+| General | local Qwen3-VL | `mcp-server` |
+| Claude | remote | `mcp-server` only |
+
+This is enforced configuration, not a cryptographic boundary. Re-check the
+preset tool lists after an Open WebUI upgrade, and remember the approval prompt
+is the backstop — it names the chat so you can confirm before releasing.
 
 ## Connecting Open WebUI
 
-In Open WebUI: **Admin Settings → External Tools → MCP → Add Server**
+Set these in `~/Dev/LLM/.env` first, or identity verification cannot work:
 
-- **URL:** `http://mcp-server:8000/mcp` (Docker DNS, since Open WebUI is on `llm-net`)
+```
+WEBUI_AUTH=true
+WEBUI_SECRET_KEY=<openssl rand -hex 32>                     # stable, or registrations are wiped
+ENABLE_FORWARD_USER_INFO_HEADERS=true
+FORWARD_USER_INFO_HEADER_JWT_SECRET=<openssl rand -hex 32>  # must equal VAULT_JWT_SECRET here
+FORWARD_USER_INFO_HEADER_JWT_EXPIRES_SECONDS=60
+ENABLE_PLUGINS=false
+```
 
-> **WEBUI_SECRET_KEY:** Set this in `~/Dev/LLM/.env` and keep it stable. If it changes, Open WebUI invalidates all saved tool credentials on the next restart. Generate with: `openssl rand -hex 32`
+Then **Admin Settings → External Tools → MCP → Add Server**:
 
-## Connecting Claude Desktop / Claude Code
+- Open tier: `http://mcp-server:8000/mcp`
+- Vault: `http://mcp-vault:8001/mcp` (attach to the Finance preset only)
 
-Add to your MCP client config (e.g. `~/.claude/mcp_servers.json` or Claude Desktop `claude_desktop_config.json`):
+## Claude Desktop / Claude Code
 
 ```json
 {
   "mcpServers": {
-    "rag-docs": {
-      "type": "streamable-http",
-      "url": "http://localhost:8000/mcp"
-    }
+    "rag-docs": { "type": "streamable-http", "url": "http://localhost:8000/mcp" }
   }
 }
 ```
 
-### mcpo fallback (stdio-only clients)
+The vault endpoint is intentionally omitted: without Open WebUI's signed
+identity assertion every call is denied anyway. Use `make vault-query`.
 
-If your client requires stdio transport, run the server behind [mcpo](https://github.com/open-webui/mcpo):
+## Sources
 
-```bash
-uvx mcpo --port 8001 -- python -m app.main
-```
-
-Then point your client at `http://localhost:8001`.
-
-## Managing sources
-
-Sources are defined in [`sources.yaml`](sources.yaml). Each entry has a type, location, refresh cadence (cron expression), and chunking profile.
-
-**Source types:**
+`data/inbox/` needs no configuration. Everything else is declared in
+[`sources.yaml`](sources.yaml), where `domain` is **required**:
 
 ```yaml
-# Web page / site (Crawl4AI, JS rendering, sitemap-aware)
-- id: my-docs
-  type: web
-  url: https://docs.example.com
-  cadence: "0 */6 * * *"   # every 6 hours
-  chunking:
-    strategy: markdown
-    chunk_size: 512
-    chunk_overlap: 64
-
-# Local files (bind-mounted from LOCAL_DOCS_PATH in .env)
-- id: my-notes
-  type: local
-  path: /docs
-  cadence: "0 * * * *"     # hourly
-
-# Git repository (indexes only changed files on each pull)
-- id: my-repo
-  type: git
-  url: https://github.com/org/repo
-  branch: main
-  paths: ["*.md", "docs/**"]
-  cadence: "0 0 * * *"     # daily
+sources:
+  - id: dev-notes
+    type: local
+    domain: notes           # decides plaintext vs encrypted
+    path: /docs
+    cadence: "0 * * * *"
+    include: ["**/*.md"]
 ```
 
-To add a source: edit `sources.yaml`, then run `make ingest`.
+## Scheduling
 
-## Common commands
+Host systemd timers rather than a scheduler container — journald integration for
+free, no resident model idling, and missed runs are caught after a reboot:
 
 ```bash
-make up              # Start all services
-make down            # Stop all services
-make logs            # Tail all logs
-make pull-models     # Pull/update the embedding model in Ollama
-make ingest          # Ingest all sources (skips unchanged chunks)
-make reindex SOURCE=my-source-id   # Force reindex one source
-make status          # Show last sync time and chunk count per source
-make rebuild-index   # Drop and rebuild the entire Qdrant collection
+sudo cp systemd/* /etc/systemd/system/
+sudo systemctl enable --now rag-sync.timer rag-inbox.path
 ```
+
+One timer covers every source; per-source `cadence` is honoured in code so it
+lives in exactly one place. `rag-inbox.path` makes a dropped file searchable
+without running anything by hand.
+
+**Vault sources only sync while unlocked.** The timer skips them when sealed and
+`make status` reports the backlog. That friction is the security property.
 
 ## Changing the embedding model
 
-The embedding model and its vector dimension are **frozen at collection creation**. Mixing models in one collection produces nonsense retrieval results.
+`EMBED_MODEL` and `EMBED_DIM` are frozen at collection creation. A fingerprint
+stored alongside the vectors records the model, dimension and prefixes, and
+startup fails loudly on a mismatch — dimension alone cannot catch it, since
+bge-base, nomic-v1.5, gte-base and arctic-m are all 768-dim.
 
-To switch models:
+1. Edit `EMBED_MODEL` / `EMBED_DIM` in `.env`
+2. `make rebuild-index` (the vault is not touched)
 
-1. Update `EMBED_MODEL` and `EMBED_DIM` in `.env`
-2. Run `make pull-models` to download the new model
-3. Run `make rebuild-index` — this drops the collection and re-embeds everything
+## Known gaps
+
+- **Scanned PDFs are not indexed.** Below 100 chars/page there is no text layer,
+  and an empty chunk becomes a high-similarity vector matching almost anything.
+  Those documents are marked `ocr_required` and reported by `make status` rather
+  than silently making the index look complete. OCR lands in Phase 2.
+- **Receipts** are Phase 2: the VLM extractor, ledger and `query_ledger`.
+- **git and web sources** are Phase 2 (Crawl4AI pulls Playwright, ingest image
+  only).
 
 ## Logs
 
-All containers log to journald:
-
 ```bash
 journalctl -t mcp-server -f
-journalctl -t qdrant -f
-journalctl -t ollama -f
+journalctl -t mcp-vault -f
 journalctl -t ingestion-worker -f
+journalctl -t qdrant -f
+journalctl -t rag-sync -f
 ```
