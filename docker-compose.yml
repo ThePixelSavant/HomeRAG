@@ -59,6 +59,11 @@ services:
     depends_on:
       qdrant:
         condition: service_healthy
+    # This service parses untrusted open-tier documents, which makes it the most
+    # likely thing on the bridge to be compromised. NET_RAW is in Docker's
+    # default set and is what ARP spoofing needs; nothing here sends raw packets.
+    cap_drop:
+      - NET_RAW
     networks:
       - llm-net
     logging:
@@ -86,8 +91,13 @@ services:
     volumes:
       - ./data/vault:/data/vault
       - ./data/state:/data/state:ro
+    # Deliberately NOT on llm-net. vault-net carries only this container and
+    # open-webui, so mcp-server is not in the same broadcast domain and cannot
+    # ARP-spoof the hop the identity assertion travels on. This service makes no
+    # outbound network calls, and vaultctl reaches it over control.sock, so
+    # being unreachable from everything else costs nothing.
     networks:
-      - llm-net
+      - vault-net
     logging:
       driver: journald
       options:
@@ -119,6 +129,11 @@ services:
       - ./sources.yaml:/app/sources.yaml:ro
       - ${LOCAL_DOCS_PATH:-/dev/null}:/docs:ro
       - ${CLAUDE_PROJECTS_PATH:-/dev/null}:/transcripts:ro
+    # Same reasoning as mcp-server: this one opens untrusted PDFs and
+    # transcripts. It needs outbound TCP to qdrant and llama-server, which
+    # NET_RAW has nothing to do with.
+    cap_drop:
+      - NET_RAW
     networks:
       - llm-net
     logging:
@@ -129,6 +144,8 @@ services:
 networks:
   llm-net:
     external: true   # Defined in ~/Dev/LLM/docker-compose.yml; start that stack first
+  vault-net:
+    external: true   # Same -- the isolated open-webui <-> mcp-vault bridge
 
 # No named volumes. Everything lives under ./data as bind mounts so the whole
 # stack is one rsync-able directory -- named volumes are root-owned and need
