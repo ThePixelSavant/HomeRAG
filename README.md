@@ -7,6 +7,9 @@ Documents go in from the command line. You query them from Open WebUI. Anything
 sensitive is encrypted, sealed by default, and reachable by a model only with
 your explicit per-request approval.
 
+> Developer documentation is in **[docs/](docs/)** — design, security model,
+> [implementation status](docs/status.md) and the [roadmap](docs/roadmap.md).
+
 ```
                                      ┌─ OPEN TIER ──────────────────────┐
   data/inbox/<domain>/ ─> extract ─> │  Qdrant: dense + BM25, plaintext │ ─┐

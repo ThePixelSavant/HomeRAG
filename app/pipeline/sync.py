@@ -40,8 +40,10 @@ logger = logging.getLogger(__name__)
 
 LOCK_NAME = ".sync.lock"
 
-# Excluded by default: 140 MB of scanned game books would take days through the
-# vision model for near-zero retrieval value. Revisit when bulk OCR lands.
+# Noise that is never worth indexing, whatever the source. This does NOT cover
+# large scanned PDFs -- those are kept out by not pointing a source at them,
+# since no pattern here would distinguish a scanned manual worth OCRing from a
+# scanned book that would cost days of vision inference for nothing.
 DEFAULT_EXCLUDES = ["**/.*", "**/node_modules/**", "**/.git/**", "**/.venv/**"]
 
 

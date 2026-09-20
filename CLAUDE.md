@@ -9,6 +9,12 @@ in plaintext; sensitive ones live in an encrypted, sealed-by-default SQLCipher
 vault. A local LLM reaches both through MCP; ingestion is driven from the
 Makefile. See [README.md](README.md) for user-facing setup.
 
+This file is the terse list of invariants and gotchas. The reasoning behind them
+lives in [docs/](docs/) — start with [docs/architecture.md](docs/architecture.md),
+then [docs/status.md](docs/status.md) for what is built and
+[docs/decisions.md](docs/decisions.md) for why. Before changing anything
+security-related, read [docs/security-model.md](docs/security-model.md).
+
 **Consumers**: Open WebUI (`~/Dev/LLM`) is the query plane. The Makefile is the
 control plane. `make query` bypasses MCP and talks to Qdrant directly, so it
 works with the servers down.
