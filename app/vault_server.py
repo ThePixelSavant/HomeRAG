@@ -32,9 +32,9 @@ def _context(ctx: Context | None) -> service.Context:
 
     The headers themselves are client-supplied and untrusted; the only one that
     carries weight is the signed JWT, and identity.verify checks its signature
-    against a secret shared with Open WebUI. chat_id and message_id are used to
-    bind an approval to one specific turn, so a forged pair can only ever make
-    an approval harder to obtain, never easier.
+    against a secret shared with Open WebUI. chat_id binds an approval to one
+    conversation and message_id is recorded for the audit log, so a forged pair
+    can only ever make an approval harder to obtain, never easier.
     """
     headers = dict(ctx.headers or {}) if ctx is not None else {}
     lookup = {k.lower(): v for k, v in headers.items()}

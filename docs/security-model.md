@@ -18,12 +18,13 @@ Defended against:
 |---|---|
 | A model deciding on its own to read financial records | Per-request approval, granted at a TTY |
 | A prompt-injected model exfiltrating vault data | Same, plus a typed confirmation naming the principal and query |
-| Another container on `llm-net` reaching vault data | Identity gate; no unlock endpoint on the network |
+| Another container on `llm-net` reaching vault data | `mcp-vault` is not on `llm-net`; identity gate; no unlock endpoint on the network |
+| A compromised `mcp-server` ARP-spoofing the identity assertion | `mcp-vault` sits on a separate `vault-net` bridge with only `open-webui`; `mcp-server` runs `cap_drop: [NET_RAW]` |
 | Someone reading `vault.db` off the disk or a backup | SQLCipher AES-256; the key is never on disk |
 | Sensitive text recovered from a vector | Sensitive data never gets a Qdrant vector at all |
 | A misfiled sensitive document reaching the open tier | Pre-embedding sensitivity scan → quarantine |
 | Forged `X-OpenWebUI-User-*` headers | Identity comes from a signed HS256 assertion, not plaintext headers |
-| An approval replayed for a second query | Grants are single-use and bound to `(subject, chat_id, message_id, query_hash)` |
+| An approval replayed for a second query | Grants are single-use and bound to `(subject, chat_id, query_hash)` |
 | A model walking a document out one chunk at a time | `fetch_context` is gated separately from `search` |
 
 **Not** defended against, and you should know it:
@@ -41,6 +42,43 @@ Defended against:
   hash, which reveals timing and volume.
 - **The open tier.** It is plaintext by design. Anything in `manuals`,
   `sdk-docs`, `notes` or `infra` is readable by any model with MCP access.
+
+### Network segmentation
+
+`mcp-vault` is deliberately **not** on `llm-net`. It sits on `vault-net`, a
+bridge carrying exactly two containers: `open-webui` and `mcp-vault`.
+
+The reason is that every container on a bridge shares a broadcast domain, and
+Docker's default capability set includes `NET_RAW`. A compromised peer could
+therefore ARP-spoof its way onto a path it is not part of — and the peer most
+likely to be compromised is `mcp-server`, because parsing untrusted open-tier
+documents is its whole job. Left on the same bridge it could have sat between
+`open-webui` and `mcp-vault` and read the identity assertion, or the contents
+of a reply to a request you had legitimately approved.
+
+Segmenting is a stronger guarantee than encrypting traffic the attacker can
+still see, and it costs no certificates. `mcp-vault` makes no outbound network
+calls and `vaultctl` reaches it over the bind-mounted `control.sock`, so it
+loses nothing by being unreachable from everything else.
+
+`mcp-server` and `ingestion-worker` additionally run with
+`cap_drop: [NET_RAW]`, which removes the spoofing primitive from the two
+containers that touch untrusted input.
+
+Verified by connecting from inside the containers: `mcp-server` cannot resolve
+`mcp-vault`, and cannot reach it by raw IP either — the packets are dropped
+between bridges, so this is isolation and not merely a missing DNS record.
+
+> **TLS is not used on any of these hops, on purpose.** Everything is bound to
+> `127.0.0.1`, so nothing crosses a wire. Capturing on loopback requires
+> `CAP_NET_RAW`, i.e. root, which is already out of scope above. This changes
+> the moment anything binds off-loopback — then TLS is mandatory, terminated by
+> a reverse proxy at the edge rather than per-service on the bridge. Note that
+> `AIOHTTP_CLIENT_SESSION_TOOL_SERVER_SSL` is `True` in the Open WebUI image,
+> so it verifies tool-server certificates; a self-signed cert must be trusted
+> inside that container, and setting the flag to `false` to "make it work"
+> buys encryption without authentication, which does not stop the MITM the TLS
+> was for.
 
 ## The three gates
 
@@ -75,9 +113,10 @@ Identity comes from Open WebUI's **signed HS256 assertion**
 The plaintext `X-OpenWebUI-User-Email` / `-Name` / `-Role` headers are **not**
 identity. Anything that can reach port 8001 can set them.
 
-`chat_id` and `message_id` come from plaintext headers and are used only to
-bind an approval to one turn. A forged pair can make an approval harder to
-obtain, never easier.
+`chat_id` comes from a plaintext header and is used only to bind an approval
+to one conversation; `message_id` is recorded for the audit log and the
+approval prompt but is not matched on. A forged value can make an approval
+harder to obtain, never easier.
 
 With `VAULT_JWT_SECRET` unset, no caller's identity can be verified and every
 model-initiated vault call is denied. `make doctor` warns about this; it is the
@@ -85,12 +124,17 @@ safe direction, so it is a warning and not a hard failure.
 
 ### Gate 3 — a human approved *this* request
 
-A grant is bound to `(subject, chat_id, message_id, query_hash)` and is
-**single-use**. The first call returns an approval code instead of data:
+A grant is bound to `(subject, chat_id, query_hash)` and is **single-use**.
+The first call returns an approval code instead of data:
 
 ```
 make approve CODE=123456
 ```
+
+You approve, then ask again in the same chat and that turn is released. The
+binding stops at the chat deliberately: Open WebUI mints a new `message_id`
+every turn, and the approval is typed after the turn that triggered it has
+already ended, so a message binding could never be redeemed at all.
 
 The prompt prints the principal, the tool, the chat and message, and the query
 preview, then requires the word `yes` typed in full. A reflexive y/n is no

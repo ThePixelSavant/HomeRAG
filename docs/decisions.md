@@ -128,7 +128,7 @@ Gate 2 proves *who* is asking. It cannot prove that the human whose identity is
 attached actually wanted this particular query — a prompt-injected model runs
 under exactly the same verified identity as a legitimate one.
 
-Gate 3 binds an approval to `(subject, chat_id, message_id, query_hash)`,
+Gate 3 binds an approval to `(subject, chat_id, query_hash)`,
 single-use, and requires the word `yes` typed at a terminal after showing the
 principal, tool and query. A reflexive y/n is no defence against the one thing
 this gate exists to catch.

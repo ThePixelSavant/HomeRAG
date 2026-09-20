@@ -141,15 +141,34 @@ def test_approval_releases_then_cannot_be_replayed(unlocked, token):
         service.search("receipts", ctx=mcp_ctx(tok))  # single use
 
 
-def test_grant_does_not_carry_to_another_message(unlocked, token):
+def test_grant_redeems_on_the_next_turn_in_the_same_chat(unlocked, token):
+    """The approval is typed at a terminal after the triggering turn has ended.
+
+    So the next turn -- a new message_id, same chat, same query -- is the one
+    that must redeem it. Binding to message_id instead would leave the grant
+    permanently unredeemable.
+    """
     grants.REGISTRY.clear()
     tok = token()
     with pytest.raises(grants.PendingApproval) as excinfo:
         service.search("receipts", ctx=mcp_ctx(tok, message="m1"))
     grants.REGISTRY.approve(excinfo.value.grant.code)
 
+    service.search("receipts", ctx=mcp_ctx(tok, message="m2"))  # released
+
     with pytest.raises(grants.PendingApproval):
-        service.search("receipts", ctx=mcp_ctx(tok, message="m2"))
+        service.search("receipts", ctx=mcp_ctx(tok, message="m3"))  # still single use
+
+
+def test_grant_does_not_carry_to_another_chat(unlocked, token):
+    grants.REGISTRY.clear()
+    tok = token()
+    with pytest.raises(grants.PendingApproval) as excinfo:
+        service.search("receipts", ctx=mcp_ctx(tok, chat="c1"))
+    grants.REGISTRY.approve(excinfo.value.grant.code)
+
+    with pytest.raises(grants.PendingApproval):
+        service.search("receipts", ctx=mcp_ctx(tok, chat="c2"))
 
 
 def test_grant_does_not_carry_to_another_query(unlocked, token):

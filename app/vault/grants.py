@@ -4,10 +4,17 @@ A verified identity is not sufficient. A model that has been prompt-injected by
 a poisoned open-tier document is still a legitimately authenticated caller, so
 gates 1 and 2 pass and only a human standing outside the loop can catch it.
 
-A grant is bound to (subject, chat_id, message_id, query_hash) and is
-single-use. The message binding is what makes "granted for that request only"
-literal: the same approval cannot be redeemed on the next turn, and cannot be
-redeemed for a different query.
+A grant is bound to (subject, chat_id, query_hash) and is single-use. That is
+what makes "granted for that request only" literal: an approval cannot be
+redeemed for a different query, in a different chat, or a second time.
+
+It is deliberately NOT bound to message_id. Open WebUI mints a new message id
+for every turn, and the approval is typed at a terminal after the turn that
+triggered it has already ended -- so a message binding could only ever be
+redeemed by the model retrying mid-turn while a human raced it to the
+terminal. Binding to the chat instead lets the owner approve and then re-ask,
+which is the flow the approval gate is actually for. The originating
+message_id is still recorded on the grant and shown to the approver.
 
 Grants live in memory only. A restart drops every pending approval, which is
 the safe direction.
@@ -86,11 +93,13 @@ class GrantRegistry:
         with self._lock:
             self._prune_locked()
             for grant in self._grants.values():
+                # message_id is recorded but not matched on -- see the module
+                # docstring. Widening it to the chat is what makes an approval
+                # redeemable on the turn after it was granted.
                 if (
                     grant.subject == subject
                     and grant.tool == tool
                     and grant.chat_id == chat_id
-                    and grant.message_id == message_id
                     and grant.query_hash == qhash
                 ):
                     if grant.approved and not grant.redeemed:

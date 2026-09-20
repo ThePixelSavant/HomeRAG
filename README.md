@@ -171,7 +171,7 @@ Three gates on every model-initiated read:
    call; the vault checks the signature, issuer, expiry, email and role. The
    plaintext `X-OpenWebUI-User-*` headers carry no weight, because anything that
    can reach the port could set them.
-3. **Per-request approval** — bound to `(subject, chat_id, message_id, query)`,
+3. **Per-request approval** — bound to `(subject, chat_id, query)`,
    single-use. The first call returns a code, not data:
 
 ```
@@ -218,9 +218,16 @@ WEBUI_AUTH=true
 WEBUI_SECRET_KEY=<openssl rand -hex 32>                     # stable, or registrations are wiped
 ENABLE_FORWARD_USER_INFO_HEADERS=true
 FORWARD_USER_INFO_HEADER_JWT_SECRET=<openssl rand -hex 32>  # must equal VAULT_JWT_SECRET here
-FORWARD_USER_INFO_HEADER_JWT_EXPIRES_SECONDS=60
 ENABLE_PLUGINS=false
 ```
+
+Leave `FORWARD_USER_INFO_HEADER_JWT_EXPIRES_SECONDS` at its 300 s default.
+Open WebUI mints the assertion once, when it opens the MCP session at the start
+of a turn (`utils/middleware.py:connect_mcp_server`), and reuses it for every
+tool call in that turn — so the clock starts *before* the model prefills and
+generates. A shorter window expires mid-turn on a long prompt and surfaces as
+an intermittent `IDENTITY_REJECTED` that looks exactly like a mismatched
+secret.
 
 Then **Admin Settings → External Tools → MCP → Add Server**:
 

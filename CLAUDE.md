@@ -191,7 +191,7 @@ files. Do not relax either guard.
 ### The vault
 
 Three gates in [app/vault/service.py](app/vault/service.py): unlocked → verified
-identity → per-request approval bound to `(subject, chat_id, message_id,
+identity → per-request approval bound to `(subject, chat_id,
 query_hash)`, single-use. CLI skips only gate 3. **Claude Code gets no
 exemption** — it is a model.
 
