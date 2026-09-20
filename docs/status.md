@@ -156,8 +156,13 @@ Nothing in this list can be done from inside the repo.
 2. **Set `VAULT_JWT_SECRET`** in `.env` to the same value as
    `FORWARD_USER_INFO_HEADER_JWT_SECRET` in `~/Dev/LLM/.env`. Until then every
    model-initiated vault call is denied. Generate with `openssl rand -hex 32`.
-3. **Configure Open WebUI** (`~/Dev/LLM`): `WEBUI_AUTH=true`, the JWT secret
-   above, and register both MCP servers as tool servers.
+3. **Configure Open WebUI** (`~/Dev/LLM`): auth is currently **off**, so there
+   is no identity to sign and gate 2 cannot pass. Full step-by-step instructions,
+   verified against the running 0.11.0 image, are in
+   **`~/Dev/LLM/HANDOFF-rag-integration.md`**. In short: enable `WEBUI_AUTH`,
+   pin `WEBUI_SECRET_KEY`, set `ENABLE_FORWARD_USER_INFO_HEADERS=true` alongside
+   the secret, provision an admin account whose email matches
+   `VAULT_ALLOWED_EMAILS`, and register both MCP servers as tool servers.
 4. **Swap in a vision model** — Qwen3-VL-30B-A3B-Instruct Q4_K_M plus its
    mmproj, ~18.6 GB — which Phase 2's receipt extraction depends on.
 5. **Decide on the orphaned Docker volumes.** `rag_qdrant-data` and
