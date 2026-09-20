@@ -225,3 +225,91 @@ def test_vault_file_is_ciphertext(unlocked):
 def test_open_tier_domain_rejected_by_vault_search(unlocked):
     with pytest.raises(PermissionError, match="open-tier"):
         service.search("x", domains=["manuals"], ctx=service.Context())
+
+
+# --- fetch_context is not a bypass ------------------------------------------
+
+
+def test_fetch_context_denied_while_sealed(vault_dir, token):
+    """A context fetch returns vault chunk text, so it is gated exactly like a
+    search. Anything less would be a hole straight through the boundary."""
+    with pytest.raises(VaultSealed):
+        service.fetch_context("d1", 0, ctx=mcp_ctx(token()))
+
+
+def test_fetch_context_denied_without_identity(unlocked):
+    with pytest.raises(identity.IdentityError):
+        service.fetch_context("d1", 0, ctx=service.Context(transport=service.MCP, headers={}))
+
+
+def test_fetch_context_needs_its_own_approval(unlocked, token):
+    grants.REGISTRY.clear()
+    with pytest.raises(grants.PendingApproval):
+        service.fetch_context("d1", 0, ctx=mcp_ctx(token()))
+
+
+def test_search_approval_does_not_release_fetch_context(unlocked, token):
+    """Otherwise a model could walk a whole document out one neighbour at a
+    time on the strength of a single approved search."""
+    grants.REGISTRY.clear()
+    tok = token()
+    with pytest.raises(grants.PendingApproval) as excinfo:
+        service.search("receipts", ctx=mcp_ctx(tok))
+    grants.REGISTRY.approve(excinfo.value.grant.code)
+
+    with pytest.raises(grants.PendingApproval):
+        service.fetch_context("d1", 0, ctx=mcp_ctx(tok))
+
+
+# --- lifecycle is not a model-facing control --------------------------------
+
+
+def test_model_cannot_change_what_counts_as_true():
+    """There is deliberately no MCP tool for lifecycle. Retraction decides what
+    the system believes; that is a human's call, made at a terminal."""
+    import app.vault_server as vault_server
+
+    exposed = {
+        name
+        for name, value in vars(vault_server).items()
+        if callable(value) and not name.startswith("_")
+    }
+    assert "set_lifecycle" not in exposed
+    assert "retract" not in exposed
+
+
+def test_vault_lifecycle_change_requires_an_unlocked_vault(vault_dir):
+    with pytest.raises(VaultSealed):
+        service.set_lifecycle("receipt.pdf", "retracted", reason="wrong")
+
+
+def test_retracting_a_vault_document_destroys_its_chunks(unlocked):
+    from app import documents
+    from app.vault import store
+
+    conn = AGENT.connect()
+    store.upsert_document(
+        conn, doc_id="d1", source_id="s", domain="receipts", uri="receipt.pdf",
+        title="Receipt", content_hash="h", extractor="vlm", status="indexed",
+    )
+    store.replace_chunks(conn, "d1", [{
+        "chunk_id": "d1-0", "doc_id": "d1", "domain": "receipts", "chunk_index": 0,
+        "text": "Distinctive Merchant Name 42.00", "content_hash": "c",
+        "vector": store.pack_vector([0.1] * 384), "token_count": 8,
+        "heading_path": "[]", "locator": "{}", "indexed_at": store.utcnow(),
+    }])
+    conn.commit()
+    conn.close()
+
+    service.set_lifecycle("receipt.pdf", documents.RETRACTED, reason="wrong merchant")
+
+    conn = AGENT.connect()
+    try:
+        assert conn.execute("SELECT COUNT(*) n FROM chunks WHERE doc_id='d1'").fetchone()["n"] == 0
+        row = store.get_document(conn, "d1")
+        # The row stays: it IS the exclusion that keeps re-ingestion out.
+        assert row is not None
+        assert row["lifecycle"] == documents.RETRACTED
+        assert not store.search_keyword(conn, "Distinctive", domains=["receipts"])
+    finally:
+        conn.close()

@@ -16,6 +16,7 @@ import shutil
 import sys
 from pathlib import Path
 
+from app import documents
 from app.config import settings
 from app.domains import DOMAIN_TIERS, Tier, UnknownDomainError, domains_in, tier_of
 from app.pipeline import embedder, qdrant_store, state, sync
@@ -179,7 +180,10 @@ def _run(sources: list[Source], *, force: bool, dry_run: bool) -> int:
             f"chunks-={result.chunks_deleted:<4}"
         )
         for label, count in (("quarantined", result.quarantined), ("ocr_required", result.ocr_required),
-                             ("queued(sealed)", result.queued_sealed), ("failed", result.failed)):
+                             ("queued(sealed)", result.queued_sealed),
+                             ("skipped(retracted)", result.skipped_retracted),
+                             ("pages flagged for review", result.flagged_pages),
+                             ("failed", result.failed)):
             if count:
                 print(f"      {label}: {count}")
         if result.error:
@@ -238,6 +242,136 @@ def cmd_add(args) -> int:
 
 
 # --------------------------------------------------------------------------
+# lifecycle
+# --------------------------------------------------------------------------
+
+
+def _resolve_one(conn, uri: str, domain: str | None):
+    """Exactly one open-tier document, or a usable error."""
+    rows = state.find_by_uri(conn, uri, domain)
+    if not rows:
+        raise SystemExit(
+            f"No open-tier document matches {uri!r}"
+            + (f" in domain {domain!r}" if domain else "")
+            + ".\nIf it is a vault document, use `make vault-retract` / `make vault-stale`."
+        )
+    if len(rows) > 1:
+        listed = "\n".join(f"  {r['uri']}  ({r['domain']})" for r in rows)
+        raise SystemExit(f"{uri!r} matches {len(rows)} documents. Narrow it with DOMAIN=\n{listed}")
+    return rows[0]
+
+
+def _apply(conn, row, lifecycle: str, **fields) -> None:
+    """Write a lifecycle change to the state row AND the index, together."""
+    state.set_lifecycle(conn, row["doc_id"], lifecycle, **fields)
+    if lifecycle == documents.RETRACTED:
+        # Deleted, not filtered. "Never returned" then holds because the points
+        # are gone, rather than because every query path remembered to exclude
+        # them. The state row stays behind as the tombstone.
+        qdrant_store.delete_doc(row["doc_id"])
+        conn.execute("UPDATE documents SET chunk_count=0 WHERE doc_id=?", (row["doc_id"],))
+    else:
+        qdrant_store.set_lifecycle(
+            row["doc_id"],
+            {
+                "lifecycle": lifecycle,
+                "lifecycle_reason": fields.get("reason"),
+                "lifecycle_set_at": state.utcnow(),
+                "superseded_by": fields.get("superseded_by"),
+            },
+        )
+
+
+def cmd_supersede(args) -> int:
+    with state.writer() as conn:
+        old = _resolve_one(conn, args.old, args.domain)
+        new = _resolve_one(conn, args.new, args.domain)
+        if old["doc_id"] == new["doc_id"]:
+            raise SystemExit("OLD and NEW are the same document.")
+        _apply(
+            conn, old, documents.SUPERSEDED,
+            reason=f"replaced by {new['uri']}", superseded_by=new["uri"],
+        )
+        state.set_lifecycle(conn, new["doc_id"], new["lifecycle"], supersedes=old["uri"])
+    print(f"{old['uri']}  ->  superseded by  {new['uri']}")
+    print("It is excluded from search by default; pass include_superseded to see it.")
+    return 0
+
+
+def cmd_stale(args) -> int:
+    with state.writer() as conn:
+        row = _resolve_one(conn, args.uri, args.domain)
+        if args.after:
+            # Scheduled, not applied. The flip happens on the ingest run that
+            # first sees the date has passed, so it is recorded and visible.
+            state.schedule_review(conn, row["doc_id"], args.after)
+            print(f"{row['uri']}: will be marked stale on or after {args.after}")
+            return 0
+        _apply(conn, row, documents.STALE, reason=args.reason)
+    print(f"{row['uri']}: marked stale. Excluded from search unless include_stale is passed.")
+    return 0
+
+
+def cmd_retract(args) -> int:
+    with state.writer() as conn:
+        row = _resolve_one(conn, args.uri, args.domain)
+        _apply(conn, row, documents.RETRACTED, reason=args.reason)
+    print(f"{row['uri']}: retracted. {row['chunk_count']} chunk(s) deleted from the index.")
+    print("A tombstone keeps it out of future runs even though the file is still on disk.")
+    print(f"To undo: make restore URI={row['uri']} && make ingest FORCE=1")
+    return 0
+
+
+def cmd_restore(args) -> int:
+    with state.writer() as conn:
+        row = _resolve_one(conn, args.uri, args.domain)
+        if row["lifecycle"] == documents.ACTIVE:
+            print(f"{row['uri']} is already active.")
+            return 0
+        was = row["lifecycle"]
+        state.set_lifecycle(conn, row["doc_id"], documents.ACTIVE, reason=None)
+        state.clear_review(conn, row["doc_id"])
+        if was == documents.RETRACTED:
+            # The chunks were deleted, so clearing the flag is only half of it:
+            # nothing comes back until the file is read again.
+            conn.execute("UPDATE documents SET content_hash='' WHERE doc_id=?", (row["doc_id"],))
+        else:
+            qdrant_store.set_lifecycle(
+                row["doc_id"],
+                {"lifecycle": documents.ACTIVE, "lifecycle_reason": None,
+                 "lifecycle_set_at": state.utcnow(), "superseded_by": None},
+            )
+    print(f"{row['uri']}: restored to active (was {was}).")
+    if was == documents.RETRACTED:
+        print("Its chunks were deleted. Run `make ingest` to re-index it.")
+    return 0
+
+
+def cmd_lifecycle(args) -> int:
+    with state.writer() as conn:
+        rows = conn.execute(
+            "SELECT uri, domain, lifecycle, lifecycle_reason, lifecycle_set_at, "
+            "superseded_by, review_after FROM documents "
+            "WHERE lifecycle<>? OR review_after IS NOT NULL ORDER BY lifecycle, uri",
+            (documents.ACTIVE,),
+        ).fetchall()
+        counts = state.count_by_lifecycle(conn)
+    if args.json:
+        print(json.dumps({"counts": counts, "flagged": [dict(r) for r in rows]},
+                         indent=2, default=str))
+        return 0
+    print("  ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "no documents")
+    for row in rows:
+        detail = row["lifecycle_reason"] or ""
+        if row["lifecycle"] == documents.SUPERSEDED and row["superseded_by"]:
+            detail = f"-> {row['superseded_by']}"
+        elif row["lifecycle"] == documents.ACTIVE and row["review_after"]:
+            detail = f"review on {row['review_after']}"
+        print(f"  {row['lifecycle']:11s} {row['uri']:48s} ({row['domain']})  {detail}")
+    return 0
+
+
+# --------------------------------------------------------------------------
 # query / status
 # --------------------------------------------------------------------------
 
@@ -253,6 +387,8 @@ def cmd_query(args) -> int:
     hits = qdrant_store.search(
         args.query, limit=args.limit, domains=domains or domains_in(Tier.OPEN),
         hybrid=not args.dense,
+        include_superseded=args.include_superseded,
+        include_stale=args.include_stale,
     )
     if args.json:
         print(json.dumps(hits, indent=2, default=str))
@@ -262,8 +398,10 @@ def cmd_query(args) -> int:
         return 0
     for hit in hits:
         crumb = " > ".join(hit["heading_path"]) if hit["heading_path"] else ""
-        print(f"\n[{hit['score']:.4f}] {hit['title']}  ({hit['domain']})")
-        print(f"  {hit['uri']}  chunk {hit['chunk_index']}" + (f"  |  {crumb}" if crumb else ""))
+        flag = "" if hit["lifecycle"] == documents.ACTIVE else f"  [{hit['lifecycle'].upper()}]"
+        print(f"\n[{hit['score']:.4f}] {hit['title']}  ({hit['domain']}){flag}")
+        print(f"  {hit['citation'] or hit['uri']}  chunk {hit['chunk_index']}"
+              + (f"  |  {crumb}" if crumb else ""))
         print(f"  {_snippet(hit['content'])}")
     return 0
 
@@ -286,6 +424,8 @@ def cmd_status(args) -> int:
 
     with state.reader() as conn:
         payload["documents_by_status"] = state.count_by_status(conn)
+        payload["documents_by_lifecycle"] = state.count_by_lifecycle(conn)
+        payload["flagged_pages"] = [dict(r) for r in state.flagged_pages(conn)]
         payload["quarantined_open"] = len(state.open_quarantine(conn))
         payload["sources"] = [dict(r) for r in state.all_sources(conn)]
         payload["last_runs"] = [dict(r) for r in state.last_runs(conn, 5)]
@@ -307,6 +447,17 @@ def cmd_status(args) -> int:
     for domain, count in (payload.get("by_domain") or {}).items():
         print(f"    {domain:14s} {count}")
     print(f"documents by status: {payload['documents_by_status']}")
+    lifecycle = payload["documents_by_lifecycle"]
+    print(f"documents by lifecycle: {lifecycle or 'not yet migrated -- run make ingest'}")
+    inactive = sum(n for k, n in lifecycle.items() if k != documents.ACTIVE)
+    if inactive:
+        print(f"  {inactive} not active -- see `make lifecycle`")
+    flagged = payload["flagged_pages"]
+    if flagged:
+        total = sum(r["flagged_pages"] for r in flagged)
+        print(f"pages with undecided layout: {total} across {len(flagged)} document(s)")
+        for row in flagged[:5]:
+            print(f"    {row['flagged_pages']:3d}  {row['uri']}  ({row['domain']})")
     if payload["quarantined_open"]:
         print(f"  !! {payload['quarantined_open']} quarantined document(s) awaiting review")
     vault = payload.get("vault") or {}
@@ -392,6 +543,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--domains")
     p.add_argument("--limit", type=int, default=5)
     p.add_argument("--dense", action="store_true", help="disable hybrid, dense only")
+    p.add_argument("--include-superseded", action="store_true")
+    p.add_argument("--include-stale", action="store_true")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_query)
 
@@ -404,6 +557,35 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_rebuild_index)
 
     sub.add_parser("review-quarantine").set_defaults(func=cmd_review_quarantine)
+
+    # --- lifecycle ---
+    p = sub.add_parser("supersede", help="mark one document as replaced by another")
+    p.add_argument("old")
+    p.add_argument("new")
+    p.add_argument("--domain")
+    p.set_defaults(func=cmd_supersede)
+
+    p = sub.add_parser("stale", help="mark a document out of date, now or on a date")
+    p.add_argument("uri")
+    p.add_argument("--after", help="schedule instead: mark stale on or after this date")
+    p.add_argument("--reason")
+    p.add_argument("--domain")
+    p.set_defaults(func=cmd_stale)
+
+    p = sub.add_parser("retract", help="delete a document's vectors and keep it out for good")
+    p.add_argument("uri")
+    p.add_argument("--reason", required=True)
+    p.add_argument("--domain")
+    p.set_defaults(func=cmd_retract)
+
+    p = sub.add_parser("restore", help="clear a lifecycle flag")
+    p.add_argument("uri")
+    p.add_argument("--domain")
+    p.set_defaults(func=cmd_restore)
+
+    p = sub.add_parser("lifecycle", help="documents that are not plainly active")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_lifecycle)
 
     # Vault commands live in app/vaultctl.py: they run inside the vault
     # container, which deliberately lacks this module's qdrant dependency.

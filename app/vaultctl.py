@@ -88,6 +88,32 @@ def cmd_ledger(args) -> int:
     return 0
 
 
+def cmd_lifecycle(args) -> int:
+    from app import documents
+    from app.vault import service
+
+    kwargs = {"domain": args.domain, "reason": args.reason}
+    if args.lifecycle == documents.SUPERSEDED:
+        if not args.superseded_by:
+            raise SystemExit("supersede needs --superseded-by <uri>")
+        kwargs["superseded_by"] = args.superseded_by
+        kwargs["reason"] = args.reason or f"replaced by {args.superseded_by}"
+    if args.lifecycle == documents.RETRACTED and not args.reason:
+        raise SystemExit("retract needs --reason")
+
+    try:
+        touched = service.set_lifecycle(args.uri, args.lifecycle, **kwargs)
+    except (LookupError, service.VaultSealed) as exc:
+        raise SystemExit(str(exc)) from None
+
+    for uri in touched:
+        print(f"{uri}: {args.lifecycle}")
+    if args.lifecycle == documents.RETRACTED:
+        print("Chunks, vectors and the encrypted original are gone. The row remains as a "
+              "tombstone so ingestion does not bring it back.")
+    return 0
+
+
 def cmd_approve(args) -> int:
     pending = _send({"action": "pending"}).get("pending", [])
     if not args.code:
@@ -171,6 +197,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--group-by", dest="group_by")
     p.add_argument("--limit", type=int, default=100)
     p.set_defaults(func=cmd_ledger)
+
+    # Lifecycle. CLI only, and there is deliberately no MCP tool for it: a
+    # model may not decide what counts as true.
+    p = sub.add_parser("lifecycle", help="flag a vault document stale/superseded/retracted")
+    p.add_argument("uri")
+    p.add_argument("lifecycle", choices=["active", "stale", "superseded", "retracted"])
+    p.add_argument("--reason")
+    p.add_argument("--superseded-by", dest="superseded_by")
+    p.add_argument("--domain")
+    p.set_defaults(func=cmd_lifecycle)
 
     p = sub.add_parser("approve")
     p.add_argument("--code")

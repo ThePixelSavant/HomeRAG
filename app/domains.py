@@ -18,7 +18,10 @@ POINT_NAMESPACE = uuid.UUID("6f1a9c2e-5b74-4e8a-9d31-0c7f2ab48e15")
 
 # Bumped when the payload schema changes in a way that makes existing points
 # unreadable. Stored in the collection fingerprint and checked at startup.
-SCHEMA_VERSION = 1
+#
+# 2: adds `locator` (citations) and `lifecycle` (versioning/staleness) to the
+#    payload, and repeats table headers across chunks, which changes chunk text.
+SCHEMA_VERSION = 2
 
 
 class Tier(str, Enum):

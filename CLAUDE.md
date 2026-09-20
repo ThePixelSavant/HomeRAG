@@ -34,7 +34,8 @@ Consequences you must preserve when changing [app/pipeline/sync.py](app/pipeline
 make build && make up      # llm-net must exist first: cd ~/Dev/LLM && docker compose up -d
 make doctor                # run this before trusting anything
 make ingest / query / status / add / reindex / rebuild-index
-make unlock / lock / vault-query / approve / vault-audit
+make lifecycle / supersede / stale / retract / restore
+make unlock / lock / vault-query / vault-lifecycle / approve / vault-audit
 make test                  # pytest inside the worker image
 ```
 
@@ -55,6 +56,7 @@ in-image path). Argon2id is capped low in `conftest.py`, or the vault tests craw
 | Module | Role |
 |---|---|
 | [app/domains.py](app/domains.py) | The single domain→tier map. Also the frozen `POINT_NAMESPACE` and `SCHEMA_VERSION`. |
+| [app/documents.py](app/documents.py) | Lifecycle states and citation formatting. Dependency-free, because both tiers need it and neither may import the other. |
 | [app/pipeline/embedder.py](app/pipeline/embedder.py) | **The only module that imports fastembed.** |
 | [app/pipeline/classify.py](app/pipeline/classify.py) | Sensitivity scan (open tier) + redaction (vault tier). |
 | [app/pipeline/sync.py](app/pipeline/sync.py) | Orchestration, tier routing, the sweep. |
@@ -85,7 +87,86 @@ measurement and hide the rest of a document. Tokenize once and slice by token
 index; the naive recursive splitter is O(n²) and takes minutes on a large PDF.
 
 Markdown prepends its heading breadcrumb to the embedded text and charges it to
-the token budget.
+the token budget. A **split markdown table repeats its header** on every
+continuation chunk, charged the same way — otherwise chunk 2 of a torque table
+is bare numbers with nothing saying which column is torque.
+
+`chunk_blocks` **accumulates** page numbers across a chunk rather than letting
+the last block win. A chunk built from pages 11 and 12 that cited only 12 sends
+the reader past the answer.
+
+### PDF extraction: every page is done twice
+
+`pdftotext -layout` keeps a table row or a numbered step on one line, and
+scrambles two-column pages by interleaving the columns. Dropping `-layout`
+fixes the columns and breaks the rows. A manual is both, so `_classify_page`
+measures the median width of the text left of the first 3+ space gutter —
+short means rows, long means columns — and each page keeps whichever
+extraction fits.
+
+Measure from the **first non-space character**, not column 0: an indented step
+(`   1    Turn on...`) has its first gutter at position 0, and counting that
+scores the line as having nothing on the left.
+
+Between the thresholds the whitespace genuinely cannot tell a data table from
+two-column prose. Those pages take reading order and are **recorded in
+`flagged_pages`** rather than silently guessed; that list is the Phase 2 VLM
+pass's work queue, and `make status` reports the count. Whitespace-aligned
+tables are deliberately not detected for the same reason — the VLM transcribing
+a page to markdown is the fix, and the chunker's table handling then applies.
+
+### Citations
+
+Payloads carry a generic `locator` (`{"page": 12, "pages": [12,13]}`,
+`{"lines": [40,58]}`, `{"anchor": ...}`), not a page field, so git and web
+sources need no second rebuild. `search()` returns it plus a prebuilt
+`citation`. Both MCP servers' tool docstrings tell the model to quote numeric
+specs verbatim and cite — ugly-but-checkable beats fluent-but-wrong for a
+torque figure.
+
+### Document lifecycle
+
+`documents.lifecycle` is **separate from `documents.status`**. `status` is
+whether the pipeline could read the file (`indexed`, `ocr_required`, …);
+`lifecycle` is whether its contents should still be believed (`active`,
+`superseded`, `stale`, `retracted`). One column cannot answer both.
+
+- `superseded` and `stale` are filtered out by default and opt-in-able. A stale
+  hit's warning banner is added **at read time** in `_hit`, never stored —
+  storing it would change the embedded text and make flipping a flag a re-embed.
+- `retracted` has **no opt-in**: its points are deleted, so "never returned"
+  holds by absence rather than by a filter three query paths must remember.
+
+The file is still on disk, so a flag has to survive the next run:
+
+- `sync_source` reads tombstones **before** `extract.extract(path)`, so a
+  retracted document costs no parsing and has no path to the embedder.
+- `documents_missing_run` **excludes tombstones**. A retracted document never
+  gets the run marker, so collecting it would delete the row that keeps it out
+  and the next run would re-index it.
+- Re-indexing preserves the existing lifecycle: editing a superseded file must
+  not quietly make it current.
+- `schedule_review` sets only the date. Reusing `set_lifecycle` for it
+  overwrote `lifecycle_reason` with `None` and erased why a document was
+  flagged.
+
+**Supersession and staleness are never inferred.** Ingest names likely pairs
+and stops. Candidates must share a directory and carry no date — matching bare
+filenames flags every `CLAUDE.md` in a tree against every other, and a March
+statement is not a newer version of February's.
+
+### Schema migrations
+
+`CREATE TABLE IF NOT EXISTS` is a no-op against an existing file, so a new
+column in `SCHEMA` never reaches a live database — `_ADDED_COLUMNS` +
+`_migrate()` do. Two consequences:
+
+- A `CREATE INDEX` on a new column **cannot live in `SCHEMA`**: the script runs
+  before the column is added and the whole thing fails. Create it in `_migrate`.
+- **Readers cannot migrate** — the MCP servers mount `data/state` read-only —
+  so reader-side helpers (`count_by_lifecycle`, `flagged_pages`) catch
+  `OperationalError` and return empty rather than crashing a server that is
+  waiting on the worker.
 
 ### Deletion — two mechanisms, both required
 
@@ -107,6 +188,12 @@ Three gates in [app/vault/service.py](app/vault/service.py): unlocked → verifi
 identity → per-request approval bound to `(subject, chat_id, message_id,
 query_hash)`, single-use. CLI skips only gate 3. **Claude Code gets no
 exemption** — it is a model.
+
+`fetch_context` runs the same three gates as `search`, and an approval for one
+does not release the other. Otherwise a whole document could be walked out one
+neighbour at a time on the strength of a single approved search. There is
+deliberately **no MCP tool for lifecycle**: retraction decides what the system
+believes, which is a human's call at a terminal.
 
 The key lives only in the vault server's memory with a TTL. `make unlock` reaches
 that specific process over a **Unix socket** ([app/vault/control.py](app/vault/control.py)),
@@ -155,3 +242,10 @@ over that.
 VLM receipt extraction + `ledger` + `query_ledger`; git/web sources with Crawl4AI
 (**ingest image only** — Playwright is 1-2 GB); tesseract for bulk scanned OCR.
 `sources.yaml` rejects `git`/`web` types until then rather than failing obscurely.
+
+The vision model added for receipts is also the layout extractor for manuals:
+render a flagged page with `pdftoppm` (already installed), ask for markdown, and
+the table-aware chunker handles the result. One mechanism covers column
+scrambling, broken tables and pages with no text layer, on the ~6% of pages that
+need it rather than all of them. Tesseract keeps the narrower job — bulk
+plain-text OCR where structure is not the content.

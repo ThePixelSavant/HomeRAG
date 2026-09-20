@@ -12,16 +12,20 @@ extraction straight to `embed_passages`.
 
 from __future__ import annotations
 
+import datetime as dt
+import difflib
 import fcntl
 import fnmatch
 import hashlib
 import json
 import logging
+import re
 import shutil
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from app import documents
 from app.config import settings
 from app.domains import Tier
 from app.pipeline import chunker, classify, embedder, extract, qdrant_store, state
@@ -52,6 +56,8 @@ class SourceResult:
     quarantined: int = 0
     ocr_required: int = 0
     queued_sealed: int = 0
+    skipped_retracted: int = 0
+    flagged_pages: int = 0
     failed: int = 0
     enumeration_complete: bool = False
     error: str | None = None
@@ -138,6 +144,75 @@ def _chunks_for(doc: extract.RawDoc, prefix: str = "") -> list[chunker.Chunk]:
     return chunker.chunk_text(doc.text, extra=doc.extra, prefix=prefix)
 
 
+# Version-ish decoration in a filename: v2, rev3, -2, (1), _final.
+_VERSIONISH_RE = re.compile(r"(?:[._\-\s(]|^)(?:v|ver|rev|r|draft|final|copy)?\s*\d{0,3}\)?$", re.I)
+_DATEISH_RE = re.compile(r"\d{4}[-_]?\d{2}(?:[-_]?\d{2})?")
+
+# How alike two normalised stems must be before the pair is worth mentioning.
+SIMILAR_RATIO = 0.85
+
+
+def _normalised_stem(uri: str) -> str:
+    stem = _VERSIONISH_RE.sub("", Path(uri).stem.lower())
+    return re.sub(r"[^a-z0-9]+", " ", stem).strip()
+
+
+def similar_documents(rows) -> list[tuple[str, str]]:
+    """Pairs of documents that look like versions of each other.
+
+    Surfaces a candidate for `make supersede` and stops there. Acting on this
+    automatically would retire live records: a March statement is not a newer
+    version of February's, and both must stay queryable. Anything carrying a
+    date is therefore excluded outright -- periodic documents are the case this
+    heuristic gets wrong, and they are exactly the ones in `financial`.
+
+    Candidates must share a DIRECTORY. Comparing bare filenames matches every
+    CLAUDE.md and README.md in a source tree against every other, which is a
+    warning on every run about files that have nothing to do with each other --
+    and a warning nobody reads is worse than no warning. A document and its
+    replacement live in the same folder.
+    """
+    candidates = [
+        (row["uri"], str(Path(row["uri"]).parent), _normalised_stem(row["uri"]))
+        for row in rows
+        if row["lifecycle"] == documents.ACTIVE and not _DATEISH_RE.search(row["uri"])
+    ]
+    pairs = []
+    for i, (uri_a, dir_a, stem_a) in enumerate(candidates):
+        if not stem_a:
+            continue
+        for uri_b, dir_b, stem_b in candidates[i + 1 :]:
+            if dir_a != dir_b:
+                continue
+            if difflib.SequenceMatcher(None, stem_a, stem_b).ratio() >= SIMILAR_RATIO:
+                pairs.append((uri_a, uri_b))
+    return pairs
+
+
+def _apply_review_dates(conn, result: SourceResult) -> None:
+    """Flip documents whose review date has passed to `stale`.
+
+    An explicit, recorded transition rather than date arithmetic at query time:
+    the flag is visible in `make status` and in the payload, so a document
+    going quiet is something you can see rather than infer from a bad answer.
+    """
+    today = dt.date.today().isoformat()
+    for row in state.due_for_review(conn, today):
+        reason = f"review date {row['review_after']} passed"
+        state.set_lifecycle(conn, row["doc_id"], documents.STALE, reason=reason)
+        state.clear_review(conn, row["doc_id"])
+        if row["tier"] == Tier.OPEN.value:
+            qdrant_store.set_lifecycle(
+                row["doc_id"],
+                {
+                    "lifecycle": documents.STALE,
+                    "lifecycle_reason": reason,
+                    "lifecycle_set_at": state.utcnow(),
+                },
+            )
+        result.notes.append(f"{row['uri']}: marked stale ({reason})")
+
+
 def _quarantine(conn, source: Source, path: Path, result: SourceResult, scan) -> None:
     settings.quarantine_path.mkdir(parents=True, exist_ok=True)
     target = settings.quarantine_path / path.name
@@ -198,6 +273,17 @@ def _sync_open_doc(conn, source: Source, path: Path, doc, run_id: str, result: S
         )
         return
 
+    # A re-indexed document keeps whatever lifecycle it already carried: an
+    # edit to a superseded file does not quietly make it current again.
+    lifecycle = previous["lifecycle"] if previous else documents.ACTIVE
+    lifecycle_fields = {
+        "lifecycle": lifecycle,
+        "lifecycle_reason": previous["lifecycle_reason"] if previous else None,
+        "lifecycle_set_at": previous["lifecycle_set_at"] if previous else None,
+        "superseded_by": previous["superseded_by"] if previous else None,
+        "effective_date": previous["effective_date"] if previous else None,
+    }
+
     existing = qdrant_store.existing_chunks(doc_id)
     texts = [c.text for c in chunks]
     hashes = [hashlib.sha256(t.encode()).hexdigest() for t in texts]
@@ -222,6 +308,11 @@ def _sync_open_doc(conn, source: Source, path: Path, doc, run_id: str, result: S
                         "heading_path": chunk.heading_path, "token_count": chunk.token_count,
                         "indexed_at": state.utcnow(), "doc_mtime": doc.mtime,
                         "extractor": doc.extractor, "last_seen_run": run_id,
+                        # Lifted out of `extra` to a top-level key: a citation
+                        # is read on every hit, and search() should not have to
+                        # go digging through a free-form bag for it.
+                        "locator": chunk.extra.get("locator", {}),
+                        **lifecycle_fields,
                         "extra": json.loads(json.dumps(chunk.extra, default=str)),
                     },
                 )
@@ -240,6 +331,7 @@ def _sync_open_doc(conn, source: Source, path: Path, doc, run_id: str, result: S
         uri=doc.rel_uri, title=doc.title or path.stem, content_hash=content_hash,
         chunk_count=len(chunks), extractor=doc.extractor, status=state.INDEXED,
         status_detail=None, mtime=doc.mtime, size_bytes=doc.size_bytes, last_seen_run=run_id,
+        flagged_pages=len(doc.extra.get("flagged_pages") or ()),
     )
     result.docs_indexed += 1
 
@@ -294,6 +386,7 @@ def _sync_vault_doc(vconn, source: Source, path: Path, doc, run_id: str, result:
                 "content_hash": hashlib.sha256(chunk.text.encode()).hexdigest(),
                 "vector": vault_store.pack_vector(vectors[n]), "token_count": chunk.token_count,
                 "heading_path": json.dumps(chunk.heading_path),
+                "locator": json.dumps(chunk.extra.get("locator", {}), default=str),
                 "indexed_at": vault_store.utcnow(),
             }
             for n, chunk in enumerate(chunks)
@@ -348,7 +441,23 @@ def sync_source(source: Source, run_id: str, *, force: bool = False, dry_run: bo
         with state.writer() as conn:
             state.record_source_start(conn, source.id, source.domain, source.type, run_id)
 
+            # Read once per source, not per file. A retracted document is
+            # skipped BEFORE extraction: it costs no parsing, and more
+            # importantly there is then no path from it to the embedder at all.
+            # Vault documents are only ever recorded in the vault's own
+            # database, so that is where their tombstones live too.
+            if source.is_vault:
+                tombstoned = vault_store.tombstones(vconn, source.id)
+            else:
+                tombstoned = state.tombstones(conn, source.id)
+                _apply_review_dates(conn, result)
+
             for path in files:
+                rel_uri = str(path.relative_to(source.path))
+                if doc_id_for(source.id, rel_uri) in tombstoned:
+                    result.skipped_retracted += 1
+                    continue
+
                 doc = extract.extract(path)
                 if doc is None:
                     continue
@@ -357,7 +466,8 @@ def sync_source(source: Source, run_id: str, *, force: bool = False, dry_run: bo
                 # derived from rel_uri -- leaving it a basename makes every
                 # CLAUDE.md under a tree collide into one document, each
                 # silently overwriting the last.
-                doc.rel_uri = str(path.relative_to(source.path))
+                doc.rel_uri = rel_uri
+                result.flagged_pages += len(doc.extra.get("flagged_pages") or ())
                 if doc.status == OCR_REQUIRED:
                     result.ocr_required += 1
                     if not source.is_vault:
@@ -406,6 +516,17 @@ def sync_source(source: Source, run_id: str, *, force: bool = False, dry_run: bo
                     vault_blobs.delete(vconn, row["doc_id"])
                     result.chunks_deleted += 1
                 vconn.commit()
+
+            sibling_conn = vconn if source.is_vault and vconn is not None else conn
+            rows = sibling_conn.execute(
+                "SELECT uri, lifecycle FROM documents WHERE source_id=? AND domain=?",
+                (source.id, source.domain),
+            ).fetchall()
+            for uri_a, uri_b in similar_documents(rows):
+                result.notes.append(
+                    f"{uri_a!r} and {uri_b!r} look like versions of each other. "
+                    f"If one replaces the other: make supersede OLD=<old> NEW=<new>"
+                )
 
             state.record_source_finish(
                 conn, source.id, "ok" if not result.error else "error",

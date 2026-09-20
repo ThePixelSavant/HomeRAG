@@ -32,11 +32,23 @@ def search_docs(
     domains: list[str] | None = None,
     source_id: str | None = None,
     hybrid: bool = True,
+    include_superseded: bool = False,
+    include_stale: bool = False,
 ) -> list[dict]:
     """Search indexed documentation by meaning and by exact term.
 
     Covers the open tier only: manuals, SDK docs, notes, infra plans. Financial
     and personal material is not searchable here.
+
+    Each result carries a `citation` such as `pump.pdf, page 12`. When you use a
+    number from a result -- a torque figure, a voltage, a part number, a command
+    flag -- QUOTE IT EXACTLY as it appears and give the citation alongside it.
+    Do not round it, convert its units, or paraphrase the sentence it sits in. A
+    wrong torque spec that reads fluently is worse than an awkward quote, and
+    the citation is what lets the reader check it.
+
+    If a result looks like it stops mid-procedure, call `fetch_context` on its
+    `doc_id` and `chunk_index` rather than guessing the rest.
 
     Args:
         query: Natural language question, or an exact term like a part number.
@@ -45,6 +57,11 @@ def search_docs(
         source_id: Restrict to a single configured source.
         hybrid: Fuse semantic and keyword matching (default). Exact identifiers
             rely on the keyword half, so leave this on unless comparing.
+        include_superseded: Also return documents a newer version replaced.
+            Off by default; `superseded_by` on a result names the replacement.
+        include_stale: Also return documents marked out of date. Off by default.
+            Their content arrives prefixed with a `[STALE ...]` warning, which
+            you must pass on rather than strip.
     """
     open_domains = domains_in(Tier.OPEN)
     if domains:
@@ -78,8 +95,47 @@ def search_docs(
         selected = open_domains
 
     return qdrant_store.search(
-        query, limit=limit, domains=selected, source_id=source_id, hybrid=hybrid
+        query,
+        limit=limit,
+        domains=selected,
+        source_id=source_id,
+        hybrid=hybrid,
+        include_superseded=include_superseded,
+        include_stale=include_stale,
     )
+
+
+@mcp.tool()
+def fetch_context(doc_id: str, chunk_index: int, before: int = 1, after: int = 1) -> list[dict]:
+    """Return the chunks either side of a search result, in order.
+
+    Use this when a result ends mid-procedure or mid-table: the step that
+    completes it is usually the next chunk, which did not score highly enough
+    to be returned on its own.
+
+    Open tier only. A vault `doc_id` returns an error rather than data -- vault
+    content requires the vault server, an unlocked vault, a verified identity
+    and a per-request approval.
+
+    Args:
+        doc_id: From a `search_docs` result.
+        chunk_index: From the same result.
+        before: Chunks to include before it (default 1).
+        after: Chunks to include after it (default 1).
+    """
+    # The real guarantee is structural: Qdrant holds no vault points, so a
+    # vault doc_id finds nothing here whatever this check does. The check is
+    # here to say so out loud rather than return a confusing empty list.
+    with state.reader() as conn:
+        row = state.get_document(conn, doc_id)
+    if row is not None and row["tier"] != Tier.OPEN.value:
+        return [
+            {
+                "error": f"{doc_id} is a vault document and is not readable from this server.",
+                "hint": "Use the vault tool server; it needs an unlocked vault and an approval.",
+            }
+        ]
+    return qdrant_store.fetch_context(doc_id, chunk_index, before=before, after=after)
 
 
 @mcp.tool()
@@ -122,6 +178,8 @@ def get_index_status() -> dict:
     """Index health: totals per domain, last run, and known gaps."""
     with state.reader() as conn:
         by_status = state.count_by_status(conn)
+        by_lifecycle = state.count_by_lifecycle(conn)
+        flagged = state.flagged_pages(conn)
         runs = [dict(r) for r in state.last_runs(conn, 1)]
         quarantined = len(state.open_quarantine(conn))
 
@@ -135,10 +193,15 @@ def get_index_status() -> dict:
             for d in domains_in(Tier.OPEN)
         },
         "documents_by_status": by_status,
+        "documents_by_lifecycle": by_lifecycle,
         "last_run": runs[0] if runs else None,
         # Surfaced rather than hidden: an index that silently omits scanned
         # PDFs looks complete when it is not.
         "ocr_required_count": by_status.get(state.OCR_REQUIRED, 0),
+        # Pages whose layout could not be decided from whitespace alone. Text
+        # from them is in reading order, which is right for prose and wrong for
+        # a table, so treat figures quoted from these documents with care.
+        "undecided_layout_pages": sum(r["flagged_pages"] for r in flagged),
         "quarantined_count": quarantined,
         "vault_domains": domains_in(Tier.VAULT),
         "note": "Vault domains are served by the separate vault tool server.",

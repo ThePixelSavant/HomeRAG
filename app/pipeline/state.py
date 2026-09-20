@@ -18,6 +18,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+from app import documents
 from app.config import settings
 
 SCHEMA = """
@@ -60,10 +61,27 @@ CREATE TABLE IF NOT EXISTS documents (
     mtime         REAL,
     size_bytes    INTEGER,
     last_seen_run TEXT,
-    indexed_at    TEXT
+    indexed_at    TEXT,
+    -- Lifecycle is SEPARATE from `status` above. `status` says whether the
+    -- pipeline could read the file; lifecycle says whether its contents should
+    -- still be believed. Merging them would make "extractable" and "true" the
+    -- same question.
+    lifecycle        TEXT NOT NULL DEFAULT 'active',
+    lifecycle_reason TEXT,
+    lifecycle_set_at TEXT,
+    effective_date   TEXT,
+    review_after     TEXT,
+    supersedes       TEXT,
+    superseded_by    TEXT,
+    -- Pages whose layout could not be decided from whitespace alone. Recorded
+    -- rather than guessed silently: this is the Phase 2 VLM pass's work queue.
+    flagged_pages    INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS ix_documents_source ON documents(source_id);
 CREATE INDEX IF NOT EXISTS ix_documents_status ON documents(status);
+-- ix_documents_lifecycle is created in _migrate, not here. On an existing
+-- database CREATE TABLE IF NOT EXISTS is a no-op, so the column above does
+-- not exist yet and indexing it here would fail the whole script.
 
 CREATE TABLE IF NOT EXISTS quarantine (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -78,6 +96,20 @@ CREATE TABLE IF NOT EXISTS quarantine (
 );
 CREATE INDEX IF NOT EXISTS ix_quarantine_open ON quarantine(resolved_at);
 """
+
+# Columns added after the first release. `CREATE TABLE IF NOT EXISTS` is a
+# no-op against an existing file, so a new column in SCHEMA above never reaches
+# a database that already exists -- it has to be added explicitly.
+_ADDED_COLUMNS: dict[str, str] = {
+    "lifecycle": "TEXT NOT NULL DEFAULT 'active'",
+    "lifecycle_reason": "TEXT",
+    "lifecycle_set_at": "TEXT",
+    "effective_date": "TEXT",
+    "review_after": "TEXT",
+    "supersedes": "TEXT",
+    "superseded_by": "TEXT",
+    "flagged_pages": "INTEGER NOT NULL DEFAULT 0",
+}
 
 # Document statuses.
 INDEXED = "indexed"
@@ -118,11 +150,23 @@ def _connect(path: Path, *, read_only: bool) -> sqlite3.Connection:
     return conn
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Add columns missing from an older `documents` table."""
+    have = {row["name"] for row in conn.execute("PRAGMA table_info(documents)")}
+    if not have:
+        return
+    for column, decl in _ADDED_COLUMNS.items():
+        if column not in have:
+            conn.execute(f"ALTER TABLE documents ADD COLUMN {column} {decl}")
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_documents_lifecycle ON documents(lifecycle)")
+
+
 @contextmanager
 def writer(path: Path | None = None):
     conn = _connect(path or settings.state_db_path, read_only=False)
     try:
         conn.executescript(SCHEMA)
+        _migrate(conn)
         yield conn
         conn.commit()
     except Exception:
@@ -276,15 +320,128 @@ def delete_document(conn: sqlite3.Connection, doc_id: str) -> None:
 def documents_missing_run(
     conn: sqlite3.Connection, source_id: str, run_id: str
 ) -> list[sqlite3.Row]:
+    """Rows this run did not touch -- excluding tombstones.
+
+    A retracted document is deliberately skipped before extraction, so it never
+    gets this run's marker. Without the exclusion the sweep would delete the
+    very row that keeps it out, and the next run would index it again.
+    """
+    placeholders = ",".join("?" for _ in documents.TOMBSTONED)
     return conn.execute(
-        "SELECT * FROM documents WHERE source_id=? AND (last_seen_run IS NULL OR last_seen_run<>?)",
-        (source_id, run_id),
+        f"SELECT * FROM documents WHERE source_id=? "
+        f"AND (last_seen_run IS NULL OR last_seen_run<>?) "
+        f"AND lifecycle NOT IN ({placeholders})",
+        (source_id, run_id, *sorted(documents.TOMBSTONED)),
     ).fetchall()
 
 
 def count_by_status(conn: sqlite3.Connection) -> dict[str, int]:
     rows = conn.execute("SELECT status, COUNT(*) n FROM documents GROUP BY status").fetchall()
     return {r["status"]: r["n"] for r in rows}
+
+
+def count_by_lifecycle(conn: sqlite3.Connection) -> dict[str, int]:
+    """Counts per lifecycle, or {} against a database predating the column.
+
+    Readers cannot migrate: the MCP servers mount data/state read-only on
+    purpose, so they would crash on a schema the ingestion worker has not
+    caught up to yet. Degrading is the only safe direction -- the alternative
+    is a server that will not start until an unrelated container has run.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT lifecycle, COUNT(*) n FROM documents GROUP BY lifecycle"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return {}
+    return {r["lifecycle"]: r["n"] for r in rows}
+
+
+# --------------------------------------------------------------------------
+# Lifecycle
+# --------------------------------------------------------------------------
+
+
+def find_by_uri(conn: sqlite3.Connection, uri: str, domain: str | None = None) -> list[sqlite3.Row]:
+    """Documents whose uri matches exactly, or ends with `uri` as a path suffix.
+
+    The CLI takes the path the user actually typed, which is usually the tail
+    of a longer rel_uri.
+    """
+    sql = "SELECT * FROM documents WHERE (uri=? OR uri LIKE ?)"
+    params: list = [uri, f"%/{uri}"]
+    if domain:
+        sql += " AND domain=?"
+        params.append(domain)
+    return conn.execute(sql + " ORDER BY uri", params).fetchall()
+
+
+def set_lifecycle(
+    conn: sqlite3.Connection,
+    doc_id: str,
+    lifecycle: str,
+    *,
+    reason: str | None = None,
+    superseded_by: str | None = None,
+    supersedes: str | None = None,
+    review_after: str | None = None,
+) -> None:
+    documents.validate(lifecycle)
+    conn.execute(
+        """UPDATE documents SET lifecycle=?, lifecycle_reason=?, lifecycle_set_at=?,
+                  superseded_by=COALESCE(?, superseded_by),
+                  supersedes=COALESCE(?, supersedes),
+                  review_after=COALESCE(?, review_after)
+           WHERE doc_id=?""",
+        (lifecycle, reason, utcnow(), superseded_by, supersedes, review_after, doc_id),
+    )
+
+
+def schedule_review(conn: sqlite3.Connection, doc_id: str, review_after: str) -> None:
+    """Set only the review date.
+
+    Deliberately NOT set_lifecycle with an unchanged lifecycle: that overwrites
+    `lifecycle_reason` with whatever was passed, so scheduling a review on an
+    already-flagged document would erase the note saying why it was flagged.
+    """
+    conn.execute(
+        "UPDATE documents SET review_after=? WHERE doc_id=?", (review_after, doc_id)
+    )
+
+
+def clear_review(conn: sqlite3.Connection, doc_id: str) -> None:
+    conn.execute("UPDATE documents SET review_after=NULL WHERE doc_id=?", (doc_id,))
+
+
+def tombstones(conn: sqlite3.Connection, source_id: str | None = None) -> dict[str, sqlite3.Row]:
+    """{doc_id: row} for documents that must not be re-indexed."""
+    placeholders = ",".join("?" for _ in documents.TOMBSTONED)
+    sql = f"SELECT * FROM documents WHERE lifecycle IN ({placeholders})"
+    params: list = list(sorted(documents.TOMBSTONED))
+    if source_id:
+        sql += " AND source_id=?"
+        params.append(source_id)
+    return {row["doc_id"]: row for row in conn.execute(sql, params)}
+
+
+def flagged_pages(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Documents with pages whose layout could not be decided."""
+    try:
+        return conn.execute(
+            "SELECT uri, domain, flagged_pages FROM documents WHERE flagged_pages > 0 "
+            "ORDER BY flagged_pages DESC"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+
+def due_for_review(conn: sqlite3.Connection, today: str) -> list[sqlite3.Row]:
+    """Active documents whose review date has passed."""
+    return conn.execute(
+        "SELECT * FROM documents WHERE lifecycle=? AND review_after IS NOT NULL "
+        "AND review_after <= ?",
+        (documents.ACTIVE, today),
+    ).fetchall()
 
 
 # --------------------------------------------------------------------------

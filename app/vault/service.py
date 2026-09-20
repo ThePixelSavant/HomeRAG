@@ -18,6 +18,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from app import documents
 from app.config import settings
 from app.domains import Tier, UnknownDomainError, domains_in, tier_of
 from app.pipeline import embedder
@@ -140,18 +141,32 @@ def _gate(ctx: Context, tool: str, payload: str) -> tuple[str, str]:
 
 
 def search(
-    query: str, *, domains: list[str] | None = None, limit: int = 5, ctx: Context | None = None
+    query: str,
+    *,
+    domains: list[str] | None = None,
+    limit: int = 5,
+    include_superseded: bool = False,
+    include_stale: bool = False,
+    ctx: Context | None = None,
 ) -> list[dict]:
     ctx = ctx or Context()
     resolved = _resolve_domains(domains)
-    principal, qhash = _gate(ctx, "search_vault", f"{query}|{','.join(resolved)}|{limit}")
+    lifecycles = documents.visible_lifecycles(
+        include_superseded=include_superseded, include_stale=include_stale
+    )
+    principal, qhash = _gate(
+        ctx, "search_vault", f"{query}|{','.join(resolved)}|{limit}|{','.join(lifecycles)}"
+    )
 
     conn = _conn()
     try:
         dense = store.search_semantic(
-            conn, embedder.embed_query(query), domains=resolved, limit=limit
+            conn, embedder.embed_query(query), domains=resolved, limit=limit,
+            lifecycles=lifecycles,
         )
-        keyword = store.search_keyword(conn, query, domains=resolved, limit=limit)
+        keyword = store.search_keyword(
+            conn, query, domains=resolved, limit=limit, lifecycles=lifecycles
+        )
         merged: dict[str, dict] = {}
         for rank, hit in enumerate(dense):
             merged[hit["doc_id"] + str(hit["chunk_index"])] = {**hit, "_rr": 1 / (60 + rank)}
@@ -177,6 +192,44 @@ def search(
             rows_returned=len(results),
         )
         return results
+    finally:
+        conn.close()
+
+
+def fetch_context(
+    doc_id: str,
+    chunk_index: int,
+    *,
+    before: int = 1,
+    after: int = 1,
+    ctx: Context | None = None,
+) -> list[dict]:
+    """Neighbouring chunks of a vault hit.
+
+    Gated exactly like `search`, and for the same reason: this returns vault
+    chunk text. A context-fetch that skipped the gates because it "only" widens
+    an already-approved hit would be a hole straight through the boundary --
+    a model could walk an entire document one neighbour at a time off the back
+    of a single approval, or off none at all.
+    """
+    ctx = ctx or Context()
+    principal, qhash = _gate(ctx, "fetch_context", f"{doc_id}|{chunk_index}|{before}|{after}")
+
+    conn = _conn()
+    try:
+        rows = store.context_chunks(conn, doc_id, chunk_index, before=before, after=after)
+        audit.record(
+            conn,
+            tool="fetch_context",
+            decision=audit.ALLOWED,
+            transport=ctx.transport,
+            principal=principal,
+            chat_id=ctx.chat_id,
+            message_id=ctx.message_id,
+            query_hash=qhash,
+            rows_returned=len(rows),
+        )
+        return rows
     finally:
         conn.close()
 
@@ -270,6 +323,46 @@ def query_ledger(
         conn.close()
 
 
+def set_lifecycle(
+    uri: str,
+    lifecycle: str,
+    *,
+    domain: str | None = None,
+    reason: str | None = None,
+    superseded_by: str | None = None,
+    review_after: str | None = None,
+) -> list[str]:
+    """Flag a vault document. CLI only -- there is no MCP tool for this.
+
+    A model may not change what counts as true. Retraction additionally drops
+    the chunks, their vectors and the encrypted original.
+    """
+    documents.validate(lifecycle)
+    if not AGENT.is_unlocked():
+        raise VaultSealed("Vault is sealed. Run `make unlock` at a terminal first.")
+
+    conn = _conn()
+    try:
+        rows = store.find_by_uri(conn, uri, domain)
+        if not rows:
+            raise LookupError(f"No vault document matches {uri!r}.")
+        touched = []
+        for row in rows:
+            if lifecycle == documents.RETRACTED:
+                store.retract(conn, row["doc_id"], reason or "retracted")
+                blobs.delete(conn, row["doc_id"])
+            else:
+                store.set_lifecycle(
+                    conn, row["doc_id"], lifecycle, reason=reason,
+                    superseded_by=superseded_by, review_after=review_after,
+                )
+            touched.append(row["uri"])
+        conn.commit()
+        return touched
+    finally:
+        conn.close()
+
+
 def status() -> dict:
     """Deliberately readable while sealed -- it reveals no vault content."""
     unlocked = AGENT.is_unlocked()
@@ -304,8 +397,10 @@ __all__ = [
     "VaultSealed",
     "audit",
     "blobs",
+    "fetch_context",
     "query_ledger",
     "search",
+    "set_lifecycle",
     "status",
     "store",
 ]

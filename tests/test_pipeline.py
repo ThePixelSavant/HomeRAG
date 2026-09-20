@@ -245,3 +245,325 @@ def test_sync_sets_the_source_relative_uri(tmp_path):
         doc.rel_uri = str(path.relative_to(source.path))
         uris.add(doc.rel_uri)
     assert uris == {"RAG/CLAUDE.md", "LLM/CLAUDE.md"}
+
+
+# --- table-aware chunking --------------------------------------------------
+
+TORQUE_TABLE = (
+    "# Specs\n\n## Torque\n\nUse a calibrated wrench.\n\n"
+    "| Fastener | Torque | Notes |\n|---|---|---|\n"
+    + "\n".join(
+        f"| Bolt M{n} | {n * 2} ft-lb | tighten in a cross pattern, re-check after warm-up |"
+        for n in range(8, 60)
+    )
+    + "\n\nDone.\n"
+)
+
+
+def test_split_table_repeats_its_header_on_every_chunk():
+    """A continuation chunk of `| Bolt M27 | 54 ft-lb |` with no column labels
+    cannot tell the reader which number is the torque."""
+    chunks = chunker.chunk_markdown(TORQUE_TABLE)
+    assert len(chunks) > 1
+    for chunk in chunks:
+        assert "| Fastener | Torque | Notes |" in chunk.text
+
+
+def test_repeated_header_is_charged_to_the_budget():
+    for chunk in chunker.chunk_markdown(TORQUE_TABLE):
+        assert chunk.token_count <= settings.chunk_max_tokens
+
+
+def test_small_table_is_not_given_a_duplicate_header():
+    chunks = chunker.chunk_markdown("| A | B |\n|---|---|\n| 1 | 2 |\n")
+    assert len(chunks) == 1
+    assert chunks[0].text.count("| A | B |") == 1
+
+
+def test_prose_containing_a_dash_is_not_treated_as_a_table():
+    """A strict separator test matters: mistaking prose for a table would
+    prepend a nonsense 'header' to every following chunk."""
+    assert chunker.find_tables("Some text | with a pipe\n--- and a dash\nmore\n") == []
+
+
+# --- locators --------------------------------------------------------------
+
+
+def test_text_chunks_report_their_line_range():
+    chunks = chunker.chunk_text(LOREM)
+    lines = chunks[0].extra["locator"]["lines"]
+    assert lines[0] == 1 and lines[1] >= lines[0]
+
+
+def test_markdown_locator_lines_are_relative_to_the_whole_file():
+    md = "# One\n\nAlpha.\n\n# Two\n\nBravo.\n"
+    second = chunker.chunk_markdown(md)[1]
+    assert second.heading_path == ["Two"]
+    # "Bravo." is on line 7 of the document, not line 1 of its section.
+    assert second.extra["locator"]["lines"] == [7, 7]
+
+
+def test_chunk_spanning_two_pages_keeps_both():
+    """dict.update keeps only the last block's page, so a chunk built from
+    pages 11 and 12 would cite 12 -- and send the reader past the answer."""
+    blocks = [
+        TextBlock(text="First page text.", kind="page", extra={"page": 11}),
+        TextBlock(text="Second page text.", kind="page", extra={"page": 12}),
+    ]
+    chunk = chunker.chunk_blocks(blocks)[0]
+    assert chunk.extra["locator"] == {"page": 11, "pages": [11, 12]}
+
+
+def test_citations_name_the_first_page_of_a_range():
+    from app.documents import format_citation
+
+    assert format_citation("pump.pdf", {"page": 12, "pages": [12]}) == "pump.pdf, page 12"
+    assert format_citation("pump.pdf", {"page": 11, "pages": [11, 12]}) == "pump.pdf, pages 11-12"
+    assert format_citation("net.md", {"lines": [40, 58]}) == "net.md, lines 40-58"
+    assert format_citation("net.md", {"lines": [7, 7]}) == "net.md, line 7"
+    assert format_citation("docs", {"anchor": "install"}) == "docs#install"
+    assert format_citation("receipt.jpg", {}) == "receipt.jpg"
+
+
+# --- PDF page layout classification ----------------------------------------
+
+
+def test_numbered_steps_are_read_as_rows():
+    """`1  Turn on the computer.` must stay on one line; reading order splits
+    the step number onto its own."""
+    from app.pipeline.extract.pdf import ROWS, _classify_page
+
+    page = "\n".join(f"   {n}    Step number {n} of the procedure." for n in range(1, 8))
+    verdict, median = _classify_page(page)
+    assert verdict == ROWS
+    assert median <= 5
+
+
+def test_two_column_prose_is_read_in_reading_order():
+    from app.pipeline.extract.pdf import COLUMNS, _classify_page
+
+    left = "This guide provides important installation and maintenance detail"
+    page = "\n".join(f"{left}     Warning {n}: do not open the enclosure." for n in range(1, 8))
+    assert _classify_page(page)[0] == COLUMNS
+
+
+def test_a_page_with_no_gutters_is_prose():
+    from app.pipeline.extract.pdf import PROSE, _classify_page
+
+    verdict, median = _classify_page("Ordinary paragraph text.\nAnother line of it.\n")
+    assert verdict == PROSE
+    assert median is None
+
+
+def test_undecidable_pages_are_flagged_not_guessed():
+    """Between the thresholds the whitespace genuinely cannot tell a data table
+    from two-column prose. Recording it gives the Phase 2 VLM pass a work
+    queue instead of a silent coin flip."""
+    from app.pipeline.extract.pdf import AMBIGUOUS, LEFT_COLUMNS_MIN, LEFT_ROWS_MAX, _classify_page
+
+    width = (LEFT_ROWS_MAX + LEFT_COLUMNS_MIN) // 2
+    page = "\n".join(f"{'x' * width}     right hand column {n}" for n in range(1, 8))
+    assert _classify_page(page)[0] == AMBIGUOUS
+
+
+# --- document lifecycle ----------------------------------------------------
+
+
+@pytest.fixture
+def state_db(tmp_path, monkeypatch):
+    from app.pipeline import state
+
+    monkeypatch.setattr(settings, "state_db_path", tmp_path / "rag.db")
+    state.init()
+    return tmp_path / "rag.db"
+
+
+def _doc(conn, doc_id="d1", uri="topology.md", **kw):
+    from app.pipeline import state
+
+    fields = dict(
+        doc_id=doc_id, source_id="s", domain="notes", tier=Tier.OPEN.value, uri=uri,
+        title=uri, content_hash="h", chunk_count=3, extractor="text",
+        status=state.INDEXED, last_seen_run="r1",
+    )
+    fields.update(kw)
+    state.upsert_document(conn, **fields)
+
+
+def test_lifecycle_defaults_to_active(state_db):
+    from app.documents import ACTIVE
+    from app.pipeline import state
+
+    with state.writer() as conn:
+        _doc(conn)
+        assert state.get_document(conn, "d1")["lifecycle"] == ACTIVE
+
+
+def test_lifecycle_is_separate_from_pipeline_status(state_db):
+    """`status` says whether the file could be read; `lifecycle` says whether
+    its contents should be believed. One column cannot answer both."""
+    from app.documents import STALE
+    from app.pipeline import state
+
+    with state.writer() as conn:
+        _doc(conn)
+        state.set_lifecycle(conn, "d1", STALE, reason="hardware retired")
+        row = state.get_document(conn, "d1")
+        assert row["status"] == state.INDEXED
+        assert row["lifecycle"] == STALE
+
+
+def test_reindexing_does_not_reset_lifecycle(state_db):
+    """Editing a superseded file must not quietly make it current again."""
+    from app.documents import SUPERSEDED
+    from app.pipeline import state
+
+    with state.writer() as conn:
+        _doc(conn)
+        state.set_lifecycle(conn, "d1", SUPERSEDED, superseded_by="topology-v2.md")
+        _doc(conn, content_hash="changed")  # a re-ingest of the same doc_id
+        row = state.get_document(conn, "d1")
+        assert row["content_hash"] == "changed"
+        assert row["lifecycle"] == SUPERSEDED
+
+
+def test_tombstones_survive_the_disappearance_sweep(state_db):
+    """A retracted document is skipped before extraction, so it never gets the
+    run marker. If the sweep collected it, the row that keeps it out would go
+    and the next run would index it again."""
+    from app.documents import RETRACTED
+    from app.pipeline import state
+
+    with state.writer() as conn:
+        _doc(conn, doc_id="keep", uri="retracted.md")
+        _doc(conn, doc_id="drop", uri="deleted.md")
+        state.set_lifecycle(conn, "keep", RETRACTED, reason="wrong")
+
+        missing = {r["doc_id"] for r in state.documents_missing_run(conn, "s", "r2")}
+        assert missing == {"drop"}
+        assert "keep" in state.tombstones(conn, "s")
+
+
+def test_retracted_documents_have_no_opt_in():
+    from app import documents
+
+    every = documents.visible_lifecycles(include_superseded=True, include_stale=True)
+    assert documents.RETRACTED not in every
+    assert set(every) == {documents.ACTIVE, documents.STALE, documents.SUPERSEDED}
+
+
+def test_default_search_shows_only_active():
+    from app import documents
+
+    assert documents.visible_lifecycles() == [documents.ACTIVE]
+
+
+def test_review_date_flips_only_when_past(state_db):
+    import datetime as dt
+
+    from app.documents import ACTIVE
+    from app.pipeline import state
+
+    today = dt.date.today()
+    with state.writer() as conn:
+        _doc(conn, doc_id="past", uri="old.md")
+        _doc(conn, doc_id="future", uri="new.md")
+        state.set_lifecycle(
+            conn, "past", ACTIVE, review_after=str(today - dt.timedelta(days=1))
+        )
+        state.set_lifecycle(
+            conn, "future", ACTIVE, review_after=str(today + dt.timedelta(days=1))
+        )
+        due = {r["doc_id"] for r in state.due_for_review(conn, today.isoformat())}
+    assert due == {"past"}
+
+
+def test_stale_banner_is_not_stored_in_the_content(state_db):
+    """It is applied at read time, so flipping a flag stays a payload update
+    and never becomes a re-embed."""
+    from app import documents
+    from app.pipeline import qdrant_store
+
+    payload = {
+        "content": "Torque to 18 ft-lb.", "uri": "pump.md", "lifecycle": documents.STALE,
+        "lifecycle_reason": "superseded hardware", "lifecycle_set_at": "2026-01-01",
+        "locator": {"lines": [3, 3]},
+    }
+    hit = qdrant_store._hit(dict(payload), 0.9)
+    assert hit["content"].startswith("[STALE since 2026-01-01: superseded hardware]")
+    assert "Torque to 18 ft-lb." in hit["content"]
+    assert payload["content"] == "Torque to 18 ft-lb."
+    assert hit["citation"] == "pump.md, line 3"
+
+
+def test_periodic_documents_are_not_flagged_as_versions():
+    """A March statement does not retire February's. Auto-detecting would
+    silently retire live financial records."""
+    from app.pipeline.sync import similar_documents
+
+    rows = [
+        {"uri": "statement-2026-02.pdf", "lifecycle": "active"},
+        {"uri": "statement-2026-03.pdf", "lifecycle": "active"},
+    ]
+    assert similar_documents(rows) == []
+
+
+def test_versioned_filenames_are_offered_as_a_candidate_pair():
+    from app.pipeline.sync import similar_documents
+
+    rows = [
+        {"uri": "network-topology-v1.md", "lifecycle": "active"},
+        {"uri": "network-topology-v2.md", "lifecycle": "active"},
+    ]
+    assert similar_documents(rows) == [("network-topology-v1.md", "network-topology-v2.md")]
+
+
+def test_same_named_files_in_different_directories_are_not_versions():
+    """Every source tree has many CLAUDE.md and README.md files. Matching on
+    the bare filename warns about all of them on every run, and a warning
+    nobody reads is worse than none."""
+    from app.pipeline.sync import similar_documents
+
+    rows = [
+        {"uri": "RAG/CLAUDE.md", "lifecycle": "active"},
+        {"uri": "LLM/CLAUDE.md", "lifecycle": "active"},
+        {"uri": "RAG/README.md", "lifecycle": "active"},
+        {"uri": "SupercellWx/scwx-qt/res/README.md", "lifecycle": "active"},
+    ]
+    assert similar_documents(rows) == []
+
+
+def test_versions_in_the_same_directory_are_still_found():
+    from app.pipeline.sync import similar_documents
+
+    rows = [
+        {"uri": "infra/topology-v1.md", "lifecycle": "active"},
+        {"uri": "infra/topology-v2.md", "lifecycle": "active"},
+    ]
+    assert similar_documents(rows) == [("infra/topology-v1.md", "infra/topology-v2.md")]
+
+
+def test_superseded_documents_are_not_re_suggested():
+    from app.pipeline.sync import similar_documents
+
+    rows = [
+        {"uri": "infra/topology-v1.md", "lifecycle": "superseded"},
+        {"uri": "infra/topology-v2.md", "lifecycle": "active"},
+    ]
+    assert similar_documents(rows) == []
+
+
+def test_scheduling_a_review_does_not_erase_the_existing_reason(state_db):
+    """set_lifecycle overwrites lifecycle_reason unconditionally, so reusing it
+    to set only a date wiped the note saying why a document was flagged."""
+    from app.documents import STALE
+    from app.pipeline import state
+
+    with state.writer() as conn:
+        _doc(conn)
+        state.set_lifecycle(conn, "d1", STALE, reason="hardware decommissioned")
+        state.schedule_review(conn, "d1", "2027-01-01")
+        row = state.get_document(conn, "d1")
+    assert row["lifecycle_reason"] == "hardware decommissioned"
+    assert row["review_after"] == "2027-01-01"
+    assert row["lifecycle"] == STALE

@@ -73,16 +73,23 @@ quietly became open-tier would publish a plaintext vector you cannot un-publish.
 make doctor                      # preflight: reachability, paths, fingerprint, backlogs
 make ingest [SOURCE=id] [DOMAIN=d] [FORCE=1]
 make add FILE=x.pdf DOMAIN=manuals [MOVE=1]
-make query Q="..." [DOMAINS=a,b] [LIMIT=5]
+make query Q="..." [DOMAINS=a,b] [LIMIT=5] [SUPERSEDED=1] [STALE=1]
 make status [JSON=1]
 make reindex SOURCE=id
 make rebuild-index               # after changing EMBED_MODEL/EMBED_DIM
 make review-quarantine           # documents the sensitivity scan held back
 
+make lifecycle                   # documents that are not plainly active
+make supersede OLD=<uri> NEW=<uri>
+make stale URI=<uri> [AFTER=YYYY-MM-DD] [REASON="..."]
+make retract URI=<uri> REASON="..."
+make restore URI=<uri>           # then: make ingest
+
 make unlock [TTL=900]            # prompts; key lives in memory only
 make lock
 make vault-status
 make vault-query Q="..."         # human path: no approval needed
+make vault-lifecycle URI=<uri> STATE=<state> [REASON="..."]
 make approve [CODE=123456]       # release one pending model request
 make vault-audit [N=50]
 
@@ -108,6 +115,39 @@ make add FILE=data/quarantine/statement.pdf DOMAIN=financial
 Card numbers are Luhn-checked so ordinary order numbers don't flood the queue
 into noise. This catches formatted identifiers, not "my password is hunter2" in
 prose — it is a backstop for misfiling, not a classifier.
+
+## When a document stops being true
+
+Deleting the file is not enough — a copy elsewhere in the tree, or a restored
+backup, is re-indexed on the next `make ingest`. Four states cover the cases:
+
+| State | Meaning | Retrieval |
+|---|---|---|
+| `active` | Default | Returned |
+| `superseded` | A *named* newer document replaced it | `SUPERSEDED=1` |
+| `stale` | Out of date, nothing replaced it | `STALE=1`, with a warning in the text |
+| `retracted` | Wrong, or should not be here | Never — the vectors are deleted |
+
+```bash
+make supersede OLD=topology-v1.md NEW=topology-v2.md
+make stale URI=rack-plan.md REASON="hardware decommissioned"
+make stale URI=firmware-notes.md AFTER=2027-01-01   # flips on that date
+make retract URI=bad-spec.md REASON="torque figure was wrong"
+make restore URI=bad-spec.md && make ingest         # undo
+```
+
+Retraction deletes the chunks and leaves a **tombstone** in the state database.
+That row is what keeps the document out of later runs, and it survives the
+disappearance sweep on purpose. `make restore` clears it; because the vectors
+are gone, the document only comes back on the next ingest.
+
+Citations come back with every hit (`pump.pdf, page 21`, `CLAUDE.md, lines
+92-102`), so a torque figure can be checked rather than trusted.
+
+**Versions are never guessed.** Ingest points out filenames in the same folder
+that look like versions of each other and leaves the decision to you — a March
+statement is not a newer version of February's, and auto-retiring it would take
+a live financial record out of reach.
 
 ## The vault
 
@@ -248,6 +288,14 @@ bge-base, nomic-v1.5, gte-base and arctic-m are all 768-dim.
 - **Receipts** are Phase 2: the VLM extractor, ledger and `query_ledger`.
 - **git and web sources** are Phase 2 (Crawl4AI pulls Playwright, ingest image
   only).
+- **Some PDF pages have an undecided layout.** Each page is extracted both
+  layout-preserving and in reading order, and kept whichever fits — but where
+  whitespace cannot tell a data table from two columns, the page takes reading
+  order and is counted by `make status` under "pages with undecided layout".
+  Prose from them is fine; a table on one may have lost its row structure. The
+  Phase 2 vision model transcribes exactly these pages.
+- **Whitespace-aligned tables in PDFs** are not detected as tables, for the same
+  reason. Markdown tables are, and keep their header across chunks.
 
 ## Logs
 

@@ -13,6 +13,7 @@ import uuid
 from qdrant_client import QdrantClient
 from qdrant_client import models as qm
 
+from app import documents
 from app.config import settings
 from app.domains import POINT_NAMESPACE
 from app.pipeline import embedder
@@ -23,7 +24,7 @@ DENSE = "dense"
 SPARSE = "bm25"
 
 # Payload fields that get an index. Each one costs RAM, and this box shares
-# memory with a resident llama-server, so the list stays short: these five are
+# memory with a resident llama-server, so the list stays short: these six are
 # the ones actually filtered on.
 INDEXED_FIELDS: dict[str, qm.PayloadSchemaType] = {
     "domain": qm.PayloadSchemaType.KEYWORD,
@@ -31,6 +32,7 @@ INDEXED_FIELDS: dict[str, qm.PayloadSchemaType] = {
     "doc_id": qm.PayloadSchemaType.KEYWORD,
     "last_seen_run": qm.PayloadSchemaType.KEYWORD,
     "chunk_index": qm.PayloadSchemaType.INTEGER,
+    "lifecycle": qm.PayloadSchemaType.KEYWORD,
 }
 
 # Refuse to delete more than this fraction of a source in one sweep without an
@@ -176,6 +178,7 @@ def build_filter(
     domains: list[str] | None = None,
     source_id: str | None = None,
     doc_id: str | None = None,
+    lifecycles: list[str] | None = None,
 ) -> qm.Filter | None:
     must: list[qm.Condition] = []
     if domains:
@@ -184,6 +187,12 @@ def build_filter(
         must.append(qm.FieldCondition(key="source_id", match=qm.MatchValue(value=source_id)))
     if doc_id:
         must.append(qm.FieldCondition(key="doc_id", match=qm.MatchValue(value=doc_id)))
+    if lifecycles:
+        # Points written before SCHEMA_VERSION 2 have no `lifecycle` key at
+        # all. `IsEmpty` would let them through as a separate `should` branch,
+        # but the fingerprint guard forces a rebuild on the version bump, so
+        # every point in a readable collection carries the field.
+        must.append(qm.FieldCondition(key="lifecycle", match=qm.MatchAny(any=list(lifecycles))))
     return qm.Filter(must=must) if must else None
 
 
@@ -256,6 +265,21 @@ def touch_doc(doc_id: str, run_id: str) -> None:
     get_client().set_payload(
         collection_name=settings.collection_name,
         payload={"last_seen_run": run_id},
+        points=build_filter(doc_id=doc_id),
+        wait=True,
+    )
+
+
+def set_lifecycle(doc_id: str, fields: dict) -> None:
+    """Stamp lifecycle fields onto every chunk of a document.
+
+    A payload update, never a re-embed: the chunk text is unchanged, so the
+    vectors are still correct. Marking a 300-page manual superseded costs one
+    round trip rather than a re-encode.
+    """
+    get_client().set_payload(
+        collection_name=settings.collection_name,
+        payload=fields,
         points=build_filter(doc_id=doc_id),
         wait=True,
     )
@@ -348,6 +372,66 @@ def sweep_source(
 # --------------------------------------------------------------------------
 
 
+def _hit(payload: dict, score: float | None = None) -> dict:
+    """One result row, with its citation resolved.
+
+    The stale banner is attached HERE rather than stored, so a lifecycle change
+    is a payload update and never a re-embed.
+    """
+    content = payload.get("content", "")
+    lifecycle = payload.get("lifecycle", documents.ACTIVE)
+    if lifecycle == documents.STALE:
+        banner = documents.stale_banner(
+            payload.get("lifecycle_reason"), payload.get("lifecycle_set_at")
+        )
+        content = f"{banner}\n{content}"
+
+    locator = payload.get("locator") or {}
+    uri = payload.get("uri", "")
+    return {
+        "score": score,
+        "content": content,
+        "title": payload.get("title", ""),
+        "uri": uri,
+        "domain": payload.get("domain", ""),
+        "source_id": payload.get("source_id", ""),
+        "doc_id": payload.get("doc_id", ""),
+        "chunk_index": payload.get("chunk_index"),
+        "heading_path": payload.get("heading_path", []),
+        "indexed_at": payload.get("indexed_at", ""),
+        "locator": locator,
+        "citation": documents.format_citation(uri, locator),
+        "lifecycle": lifecycle,
+        "superseded_by": payload.get("superseded_by"),
+    }
+
+
+def fetch_context(doc_id: str, chunk_index: int, *, before: int = 1, after: int = 1) -> list[dict]:
+    """Neighbouring chunks of one hit, in order.
+
+    A retrieved chunk often ends mid-procedure; the step that completes it is
+    the next chunk, which scored too low to be returned on its own. No vector
+    search happens here -- it is a filtered scroll over a known document.
+    """
+    low = max(0, chunk_index - max(0, before))
+    high = chunk_index + max(0, after)
+    query_filter = qm.Filter(
+        must=[
+            qm.FieldCondition(key="doc_id", match=qm.MatchValue(value=doc_id)),
+            qm.FieldCondition(key="chunk_index", range=qm.Range(gte=low, lte=high)),
+        ]
+    )
+    points, _ = get_client().scroll(
+        collection_name=settings.collection_name,
+        scroll_filter=query_filter,
+        with_payload=True,
+        with_vectors=False,
+        limit=high - low + 1,
+    )
+    rows = [_hit(point.payload or {}) for point in points]
+    return sorted(rows, key=lambda r: r["chunk_index"] if r["chunk_index"] is not None else 0)
+
+
 def search(
     query: str,
     *,
@@ -356,6 +440,8 @@ def search(
     source_id: str | None = None,
     hybrid: bool = True,
     candidates: int = 40,
+    include_superseded: bool = False,
+    include_stale: bool = False,
 ) -> list[dict]:
     """Retrieve open-tier chunks.
 
@@ -364,9 +450,18 @@ def search(
     asked of a manual or an SDK doc. BM25 is strong there, and fusing the two
     covers both. `client.search()` no longer exists in qdrant-client >= 1.12;
     `query_points` is the replacement and returns a response object.
+
+    Superseded and stale documents are excluded by default. Retracted ones
+    cannot be included at all -- their points are gone.
     """
     client = get_client()
-    query_filter = build_filter(domains=domains, source_id=source_id)
+    query_filter = build_filter(
+        domains=domains,
+        source_id=source_id,
+        lifecycles=documents.visible_lifecycles(
+            include_superseded=include_superseded, include_stale=include_stale
+        ),
+    )
     dense = embedder.embed_query(query)
 
     if hybrid:
@@ -399,21 +494,4 @@ def search(
             with_payload=True,
         )
 
-    results = []
-    for hit in response.points:
-        payload = hit.payload or {}
-        results.append(
-            {
-                "score": hit.score,
-                "content": payload.get("content", ""),
-                "title": payload.get("title", ""),
-                "uri": payload.get("uri", ""),
-                "domain": payload.get("domain", ""),
-                "source_id": payload.get("source_id", ""),
-                "doc_id": payload.get("doc_id", ""),
-                "chunk_index": payload.get("chunk_index"),
-                "heading_path": payload.get("heading_path", []),
-                "indexed_at": payload.get("indexed_at", ""),
-            }
-        )
-    return results
+    return [_hit(hit.payload or {}, hit.score) for hit in response.points]

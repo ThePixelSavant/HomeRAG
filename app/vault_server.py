@@ -50,9 +50,26 @@ def _denied(exc: Exception, kind: str) -> dict:
     return {"error": kind, "detail": str(exc)}
 
 
+def _pending(exc: grants.PendingApproval) -> dict:
+    return {
+        "error": "PENDING_APPROVAL",
+        "code": exc.grant.code,
+        "detail": (
+            f"Approval required. The account holder must run "
+            f"`make approve CODE={exc.grant.code}` at a terminal. "
+            "This grant covers only this request and expires shortly."
+        ),
+    }
+
+
 @mcp.tool()
 def search_vault(
-    query: str, domains: list[str] | None = None, limit: int = 5, ctx: Context | None = None
+    query: str,
+    domains: list[str] | None = None,
+    limit: int = 5,
+    include_superseded: bool = False,
+    include_stale: bool = False,
+    ctx: Context | None = None,
 ) -> dict:
     """Search encrypted personal and financial documents.
 
@@ -60,26 +77,65 @@ def search_vault(
     that a human grants at a terminal. The first call returns an approval code
     rather than data; call again after it is approved.
 
+    Each result carries a `citation`. Quote figures -- amounts, dates, account
+    references -- EXACTLY as they appear and cite them; do not restate them in
+    your own words. For sums across many records use `query_ledger`, which adds
+    integer cents in SQL, rather than adding up numbers you read here.
+
     Args:
         query: What to look for.
         domains: Restrict to specific vault domains.
         limit: Maximum results (default 5).
+        include_superseded: Also return documents a newer version replaced.
+        include_stale: Also return documents marked out of date. Their content
+            arrives prefixed with a `[STALE ...]` warning; pass it on.
     """
     try:
-        rows = service.search(query, domains=domains, limit=limit, ctx=_context(ctx))
+        rows = service.search(
+            query,
+            domains=domains,
+            limit=limit,
+            include_superseded=include_superseded,
+            include_stale=include_stale,
+            ctx=_context(ctx),
+        )
         return {"results": rows, "count": len(rows)}
     except VaultSealed as exc:
         return _denied(exc, "VAULT_SEALED")
     except grants.PendingApproval as exc:
-        return {
-            "error": "PENDING_APPROVAL",
-            "code": exc.grant.code,
-            "detail": (
-                f"Approval required. The account holder must run "
-                f"`make approve CODE={exc.grant.code}` at a terminal. "
-                "This grant covers only this request and expires shortly."
-            ),
-        }
+        return _pending(exc)
+    except identity.IdentityError as exc:
+        return _denied(exc, "IDENTITY_REJECTED")
+    except PermissionError as exc:
+        return _denied(exc, "NOT_PERMITTED")
+
+
+@mcp.tool()
+def fetch_context(
+    doc_id: str, chunk_index: int, before: int = 1, after: int = 1, ctx: Context | None = None
+) -> dict:
+    """Return the chunks either side of a vault search result, in order.
+
+    This returns vault content, so it passes the same three gates as
+    `search_vault` and needs its own approval. An earlier approval for the
+    search does not carry over -- otherwise a whole document could be walked
+    out one neighbour at a time on the strength of a single grant.
+
+    Args:
+        doc_id: From a `search_vault` result.
+        chunk_index: From the same result.
+        before: Chunks to include before it (default 1).
+        after: Chunks to include after it (default 1).
+    """
+    try:
+        rows = service.fetch_context(
+            doc_id, chunk_index, before=before, after=after, ctx=_context(ctx)
+        )
+        return {"results": rows, "count": len(rows)}
+    except VaultSealed as exc:
+        return _denied(exc, "VAULT_SEALED")
+    except grants.PendingApproval as exc:
+        return _pending(exc)
     except identity.IdentityError as exc:
         return _denied(exc, "IDENTITY_REJECTED")
     except PermissionError as exc:
@@ -122,11 +178,7 @@ def query_ledger(
     except VaultSealed as exc:
         return _denied(exc, "VAULT_SEALED")
     except grants.PendingApproval as exc:
-        return {
-            "error": "PENDING_APPROVAL",
-            "code": exc.grant.code,
-            "detail": f"Approval required. Run `make approve CODE={exc.grant.code}` at a terminal.",
-        }
+        return _pending(exc)
     except identity.IdentityError as exc:
         return _denied(exc, "IDENTITY_REJECTED")
     except ValueError as exc:
