@@ -33,7 +33,7 @@ from app import documents
 from app.config import settings
 from app.domains import Tier
 from app.pipeline import chunker, classify, embedder, extract, parse_worker, qdrant_store, state
-from app.pipeline.extract.base import OCR_REQUIRED, OK, doc_id_for
+from app.pipeline.extract.base import EMPTY, OCR_REQUIRED, OK, doc_id_for
 from app.sources import INBOX, LOCAL, TRANSCRIPTS, Source
 from app.vault import blobs as vault_blobs
 from app.vault import store as vault_store
@@ -67,6 +67,10 @@ class SourceResult:
     ocr_required: int = 0
     queued_sealed: int = 0
     skipped_retracted: int = 0
+    # Extracted fine, contained nothing worth indexing. NOT a failure: a
+    # subagent transcript that is all tool bookkeeping is empty every run, and
+    # counting it as failed makes `failed` mean nothing.
+    docs_empty: int = 0
     flagged_pages: int = 0
     failed: int = 0
     enumeration_complete: bool = False
@@ -411,7 +415,7 @@ def _write_vault_record(vconn, source: Source, record: dict, run_id: str, result
         result.docs_skipped += 1
         return
     if outcome == parse_worker.SKIPPED_EMPTY:
-        result.docs_skipped += 1
+        result.docs_empty += 1
         return
     if outcome == parse_worker.OCR:
         # Vault-tier OCR candidates are counted but not recorded: an unindexed
@@ -566,8 +570,14 @@ def sync_source(source: Source, run_id: str, *, force: bool = False, dry_run: bo
                         size_bytes=doc.size_bytes, last_seen_run=run_id,
                     )
                     continue
-                if doc.status != OK or not doc.usable:
+                if doc.status == EMPTY or not doc.usable:
+                    result.docs_empty += 1
+                    continue
+                if doc.status != OK:
                     result.failed += 1
+                    result.notes.append(
+                        f"{doc.rel_uri}: {doc.status_detail or doc.status}"
+                    )
                     continue
 
                 try:

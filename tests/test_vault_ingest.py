@@ -220,3 +220,27 @@ def test_blank_passphrase_skips_without_unlocking(monkeypatch, unlocked):
     monkeypatch.setattr(ingest.getpass, "getpass", lambda *a, **kw: "")
     ingest._unlock_for_vault_sources(_vault_sources())
     assert not AGENT.is_unlocked()
+
+
+def test_empty_document_is_not_a_failure(unlocked, tmp_path, monkeypatch):
+    """A transcript with no conversational content is empty, not broken.
+
+    Subagent transcripts are often entirely tool bookkeeping. They extract
+    cleanly and contain nothing to index, and they will do so on every run --
+    counting them as failures makes `failed` a number nobody can act on.
+    """
+    from app.config import settings
+
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "real.md").write_text("# Spend\n\nPaid the plumber 240 on the 3rd.\n")
+    (docs / "hollow.md").write_text("   \n\n   \n")
+    monkeypatch.setattr(settings, "state_db_path", tmp_path / "state.db")
+    monkeypatch.setattr(settings, "data_root", tmp_path)
+    state.init()
+
+    result = _sync(Source(id="s-vault", type=LOCAL, domain="receipts", path=docs))
+
+    assert result.docs_indexed == 1
+    assert result.docs_empty == 1
+    assert result.failed == 0, f"empty document counted as failed: {result.notes}"

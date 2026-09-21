@@ -229,6 +229,7 @@ def _run(sources: list[Source], *, force: bool, dry_run: bool) -> int:
         for label, count in (("quarantined", result.quarantined), ("ocr_required", result.ocr_required),
                              ("queued(sealed)", result.queued_sealed),
                              ("skipped(retracted)", result.skipped_retracted),
+                             ("empty (nothing to index)", result.docs_empty),
                              ("pages flagged for review", result.flagged_pages),
                              ("failed", result.failed)):
             if count:

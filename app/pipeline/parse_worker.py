@@ -36,7 +36,7 @@ import sys
 from pathlib import Path
 
 from app.pipeline import classify, embedder, extract
-from app.pipeline.extract.base import OCR_REQUIRED, OK, doc_id_for
+from app.pipeline.extract.base import EMPTY, OCR_REQUIRED, OK, doc_id_for
 from app.sources import TRANSCRIPTS
 from app.vault import store as vault_store
 
@@ -74,7 +74,13 @@ def _parse_one(source: dict, rel_uri: str, known_hash: str | None) -> dict:
         record["outcome"] = OCR
         record["status_detail"] = doc.status_detail
         return record
-    if doc.status != OK or not doc.usable:
+    if doc.status == EMPTY or not doc.usable:
+        # Extracted cleanly, had nothing in it. A subagent transcript that is
+        # all tool bookkeeping lands here every run; it is not a failure.
+        record["outcome"] = SKIPPED_EMPTY
+        record["detail"] = doc.status_detail
+        return record
+    if doc.status != OK:
         record["outcome"] = FAILED
         record["error"] = doc.status_detail or f"status={doc.status}"
         return record
