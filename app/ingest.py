@@ -10,6 +10,7 @@ it still works when the servers are down.
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import logging
 import shutil
@@ -21,6 +22,8 @@ from app.config import settings
 from app.domains import DOMAIN_TIERS, Tier, UnknownDomainError, domains_in, tier_of
 from app.pipeline import embedder, qdrant_store, state, sync
 from app.sources import Source, SourceConfigError, all_sources
+from app.vault.crypto import WrongPassphrase
+from app.vault.keyagent import AGENT
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("ingest")
@@ -154,7 +157,51 @@ def _select(args) -> list[Source]:
     return sources
 
 
+def _unlock_for_vault_sources(sources: list[Source]) -> None:
+    """Derive the vault key in this process, from a passphrase typed here.
+
+    The worker runs as its own container, so `make unlock` -- which reaches the
+    vault *server* over the control socket -- leaves this process's key agent
+    empty. Without this, a vault-tier source queues as sealed no matter what
+    the server knows.
+
+    The passphrase is prompted for rather than fetched, on purpose. The key
+    never travels over the socket, so nothing that can open that socket gains
+    the ability to decrypt the vault, and the rule that holds the whole design
+    up still holds: a passphrase is typed at a terminal, and a model has no
+    terminal.
+
+    The cost is that vault-tier sources cannot be ingested by a scheduled run.
+    They queue, and the next interactive `make ingest` picks them up. Open-tier
+    sources are unaffected and still run unattended.
+    """
+    if not any(s.is_vault for s in sources):
+        return
+    if AGENT.is_unlocked():
+        return
+    if not sys.stdin.isatty():
+        logger.info(
+            "Vault-tier sources present but no terminal to unlock with; they will queue. "
+            "Run `make ingest` interactively to take them."
+        )
+        return
+
+    vault_ids = ", ".join(s.id for s in sources if s.is_vault)
+    print(f"Vault-tier sources in this run: {vault_ids}")
+    passphrase = getpass.getpass("Vault passphrase (blank to skip and queue them): ")
+    if not passphrase:
+        print("Skipped. Vault sources will queue.")
+        return
+    try:
+        AGENT.unlock(passphrase)
+    except WrongPassphrase as exc:
+        raise SystemExit(str(exc)) from None
+
+
 def _run(sources: list[Source], *, force: bool, dry_run: bool) -> int:
+    if not dry_run:
+        _unlock_for_vault_sources(sources)
+
     run_id = state.new_run_id()
     qdrant_store.init_collection()
 

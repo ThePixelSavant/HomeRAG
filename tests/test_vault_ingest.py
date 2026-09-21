@@ -152,3 +152,71 @@ def test_parse_worker_failure_surfaces_as_an_error(vault_source, monkeypatch):
     monkeypatch.setattr(sync, "_run_parse_worker", boom)
     with pytest.raises(sync.ParseWorkerFailed):
         _sync(vault_source)
+
+
+# --- how the worker gets a key --------------------------------------------
+
+
+def _vault_sources():
+    return [Source(id="s-vault", type=LOCAL, domain="receipts", path=None)]
+
+
+def test_no_terminal_queues_instead_of_prompting(monkeypatch, vault_dir):
+    """A scheduled run has no TTY. It must queue quietly, not hang or crash.
+
+    The passphrase is never read from a flag, a file or the environment: that
+    is the mechanism that stops a model unlocking the vault, since a model has
+    no terminal.
+    """
+    from app import ingest
+
+    monkeypatch.setattr(ingest.sys.stdin, "isatty", lambda: False, raising=False)
+
+    def fail(*a, **kw):
+        raise AssertionError("prompted for a passphrase without a terminal")
+
+    monkeypatch.setattr(ingest.getpass, "getpass", fail)
+    ingest._unlock_for_vault_sources(_vault_sources())
+    assert not AGENT.is_unlocked()
+
+
+def test_already_unlocked_does_not_prompt(monkeypatch, unlocked):
+    from app import ingest
+
+    def fail(*a, **kw):
+        raise AssertionError("prompted although the key was already held")
+
+    monkeypatch.setattr(ingest.getpass, "getpass", fail)
+    ingest._unlock_for_vault_sources(_vault_sources())
+    assert AGENT.is_unlocked()
+
+
+def test_open_tier_only_never_prompts(monkeypatch, vault_dir):
+    from app import ingest
+
+    def fail(*a, **kw):
+        raise AssertionError("prompted for an open-tier-only run")
+
+    monkeypatch.setattr(ingest.getpass, "getpass", fail)
+    monkeypatch.setattr(ingest.sys.stdin, "isatty", lambda: True, raising=False)
+    ingest._unlock_for_vault_sources([Source(id="s-open", type=LOCAL, domain="manuals", path=None)])
+
+
+def test_wrong_passphrase_aborts_the_run(monkeypatch, unlocked):
+    from app import ingest
+
+    AGENT.lock()
+    monkeypatch.setattr(ingest.sys.stdin, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(ingest.getpass, "getpass", lambda *a, **kw: "not the passphrase")
+    with pytest.raises(SystemExit):
+        ingest._unlock_for_vault_sources(_vault_sources())
+
+
+def test_blank_passphrase_skips_without_unlocking(monkeypatch, unlocked):
+    from app import ingest
+
+    AGENT.lock()
+    monkeypatch.setattr(ingest.sys.stdin, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(ingest.getpass, "getpass", lambda *a, **kw: "")
+    ingest._unlock_for_vault_sources(_vault_sources())
+    assert not AGENT.is_unlocked()

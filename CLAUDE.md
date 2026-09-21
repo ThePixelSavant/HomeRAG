@@ -195,6 +195,15 @@ identity → per-request approval bound to `(subject, chat_id,
 query_hash)`, single-use. CLI skips only gate 3. **Claude Code gets no
 exemption** — it is a model.
 
+**Vault extraction must never run in a process holding the key.**
+`app/pipeline/parse_worker.py` parses, redacts, chunks and embeds with no key;
+`sync.py` holds the key and writes. Do not import `sync` from `parse_worker`
+(it pulls in `keyagent`), do not switch the transport to `multiprocessing`
+(fork inherits the key) or to `pickle` (the child is the untrusted half). The
+shared chunking helper lives at `extract.base.chunks_for` for exactly this
+reason. `make ingest` prompts for the passphrase; it is never read from a
+flag, a file or the environment.
+
 `fetch_context` runs the same three gates as `search`, and an approval for one
 does not release the other. Otherwise a whole document could be walked out one
 neighbour at a time on the strength of a single approved search. There is

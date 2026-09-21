@@ -26,6 +26,7 @@ Defended against:
 | Forged `X-OpenWebUI-User-*` headers | Identity comes from a signed HS256 assertion, not plaintext headers |
 | An approval replayed for a second query | Grants are single-use and bound to `(subject, chat_id, query_hash)` |
 | A model walking a document out one chunk at a time | `fetch_context` is gated separately from `search` |
+| A malicious PDF or transcript exploiting a parser to reach the key | Vault extraction runs in a child process that holds no key; only the parent writes |
 
 **Not** defended against, and you should know it:
 
@@ -42,6 +43,32 @@ Defended against:
   hash, which reveals timing and volume.
 - **The open tier.** It is plaintext by design. Anything in `manuals`,
   `sdk-docs`, `notes` or `infra` is readable by any model with MCP access.
+
+### Ingestion runs across a process boundary
+
+Vault-tier extraction happens in `app/pipeline/parse_worker.py`, a child
+process that never opens `vault.db` and holds no key. The parent
+(`app/pipeline/sync.py`) holds the key, does the SQLCipher writes, and calls no
+extractor.
+
+The reason is that parsers are the largest attack surface here -- they read
+whatever lands in `data/inbox/receipts/` -- while the key decrypts every
+document ever stored. Sharing a process between them turns a parser exploit
+into total vault disclosure. Split, it costs the one document being parsed.
+
+The transport is JSON over pipes. `multiprocessing` would `fork` and inherit
+the parent's address space, key included; `pickle` would let a compromised
+child execute code in the parent on the way back. A test asserts in a fresh
+interpreter that `parse_worker` imports neither `keyagent` nor `crypto`.
+
+**The worker gets its key from a passphrase typed at the terminal**, not from
+the control socket. `make ingest` prompts when a vault-tier source is in the
+run. A `key` action on the socket would have kept the scheduled cadence
+working for vault sources, but it would make the socket key-equivalent --
+anything able to open it could decrypt the vault without a human. The rule
+that holds the design up is that a passphrase is typed at a terminal and a
+model has no terminal, so vault-tier sources simply do not ingest unattended.
+They queue until someone runs `make ingest` interactively.
 
 ### Network segmentation
 

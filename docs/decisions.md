@@ -364,3 +364,72 @@ terminal.
 `test_model_cannot_change_what_counts_as_true` asserts the vault server exposes
 no lifecycle function, so this cannot regress by someone adding a convenient
 tool.
+
+---
+
+## ADR-019: Vault extraction runs in a process that holds no key
+
+**Chosen:** Split vault-tier ingestion in two. `app/pipeline/parse_worker.py`
+extracts, redacts, chunks and embeds; `app/pipeline/sync.py` holds the key and
+does the SQLCipher writes. They communicate with JSON over pipes.
+
+**Rejected:** Extracting in the same process that holds the key, which is what
+the code did.
+
+Every parser in this pipeline reads attacker-influenced bytes -- a PDF, a
+transcript, whatever lands in `data/inbox/receipts/` -- and those libraries are
+the largest attack surface in the project. The key decrypts *every document
+ever stored*, so an exploit in a parser that shares a process with it
+escalates from "leak the document being parsed" to "leak the whole vault,
+including at rest". Keeping the two apart makes the blast radius one document.
+
+`subprocess` rather than `multiprocessing`: a `fork` inherits the parent's
+address space, key included, which is the entire thing being avoided. `exec`
+gives a clean interpreter.
+
+JSON rather than `pickle`: the child is the half assumed to be compromised,
+and unpickling its output would let it execute code in the process that holds
+the key -- reintroducing the vulnerability through the mitigation.
+
+`_chunks_for` moved to `extract.base.chunks_for` because both halves need it
+and neither may import the other. A duplicated copy would eventually chunk
+vault documents differently from open-tier ones, silently.
+
+**Revisit if:** extraction moves out of Python, or the writes move into
+`mcp-vault` (which would remove the need for the worker to hold a key at all).
+
+---
+
+## ADR-020: The ingestion worker prompts for the passphrase
+
+**Chosen:** `make ingest` prompts at the terminal when a vault-tier source is
+in the run. The worker derives the key itself.
+
+**Rejected:** A `key` action on the control socket, which would hand the
+derived key to any caller that can open it.
+
+`AGENT` is a per-process singleton, and `make unlock` is
+`docker exec … mcp-vault` -- it unlocks the vault *server*, in a different
+container. The ingestion worker's agent is therefore always empty, which is
+why vault-tier ingestion silently queued as sealed no matter what the server
+reported. Something had to put a key in the worker.
+
+Exporting it over the socket would have kept the `0 */4 * * *` cadence working
+for vault sources, and the socket is not a bad place for a privileged
+operation -- mode 0600, never a network endpoint, and `mcp-server` mounts only
+`./data/state` so it cannot reach it. But it makes the socket key-equivalent:
+anything that can open it can decrypt the vault, forever, without a human.
+
+Prompting keeps the property the whole design rests on. The passphrase is
+never accepted from a flag, a file or an environment variable, and a model has
+no terminal. Nothing gains the ability to decrypt the vault that did not
+already have it.
+
+**The cost is real and is accepted:** vault-tier sources cannot be ingested by
+a scheduled run. They queue, and the next interactive `make ingest` takes
+them. Open-tier sources are unaffected and still run unattended. A run with no
+TTY says so in the log and queues rather than hanging.
+
+**Revisit if:** the writes move into `mcp-vault` (see ADR-019), which would let
+a scheduled worker ship records to the process that already holds the key,
+with no export and no prompt.

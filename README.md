@@ -65,6 +65,12 @@ make ingest
 make query Q="how do I prime the pump"
 ```
 
+Vault-tier domains need you present: `make ingest` prompts for the vault
+passphrase when the run includes one, because the worker derives the key
+itself rather than being handed one. A scheduled run has no terminal, so it
+queues those sources and says so -- the next interactive `make ingest` takes
+them. Open-tier sources ingest unattended as usual.
+
 `data/inbox/<domain>/` **is** the classification — the directory name is the
 domain. `make add FILE=x.pdf DOMAIN=manuals` does the same thing explicitly. An
 unrecognised domain is an error rather than a default, because a typo that
