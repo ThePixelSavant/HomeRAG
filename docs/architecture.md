@@ -30,8 +30,15 @@ the Makefile.
    make unlock ──▶ unix socket ──▶ mcp-vault (the process holding the key)
 ```
 
-Three containers plus a one-shot worker. `llm-net` is an external network owned
-by `~/Dev/LLM`; this stack joins it rather than creating it.
+Three containers plus a one-shot worker, on two external networks owned by
+`~/Dev/LLM`; this stack joins them rather than creating them.
+
+- `llm-net` — `qdrant` and `mcp-server`, alongside `open-webui` and
+  `llama-server`.
+- `vault-net` — `mcp-vault` and `open-webui`, and nothing else. `mcp-server`
+  parses untrusted documents and is deliberately not in the broadcast domain
+  the identity assertion travels through. See
+  [security-model.md](security-model.md#network-segmentation).
 
 ## Control plane and query plane
 
@@ -202,11 +209,18 @@ a boilerplate paragraph.
 
 ## Container boundaries
 
-| Container | Qdrant | state.db | vault.db | Key in memory |
+| Container / process | Qdrant | state.db | vault.db | Key in memory |
 |---|---|---|---|---|
-| `ingestion-worker` | read-write | read-write | read-write (if unlocked) | no |
+| `ingestion-worker` (parent) | read-write | read-write | read-write | **yes**, from a passphrase typed at the terminal |
+| ↳ `parse_worker` child | no | no | **never opened** | **no** — and it imports nothing that could hold one |
 | `mcp-server` | read | **read-only mount** | **not mounted** | no |
 | `mcp-vault` | not installed | read-only mount | read-write | **yes** |
+
+The worker's parent holds a key because it writes the encrypted store, so
+extraction was moved out of it: every parser reads attacker-influenced bytes,
+and a key that decrypts every document ever stored has no business sharing a
+process with them. See
+[ADR-019](decisions.md#adr-019-vault-extraction-runs-in-a-process-that-holds-no-key).
 
 `mcp-server` has no vault mount at all — a compromise there cannot reach
 `vault.db` regardless of what the process does. The read-only mount on

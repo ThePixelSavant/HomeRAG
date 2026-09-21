@@ -235,10 +235,42 @@ generates. A shorter window expires mid-turn on a long prompt and surfaces as
 an intermittent `IDENTITY_REJECTED` that looks exactly like a mismatched
 secret.
 
-Then **Admin Settings → External Tools → MCP → Add Server**:
+Then **Admin Panel → Settings → Tools**, adding each as **Connection type:
+MCP**:
 
 - Open tier: `http://mcp-server:8000/mcp`
-- Vault: `http://mcp-vault:8001/mcp` (attach to the Finance preset only)
+- Vault: `http://mcp-vault:8001/mcp`
+
+Container names, not `localhost` — inside that container `localhost` is itself.
+
+Three settings decide whether this works at all, and getting any of them wrong
+produces a silent failure that looks like the model simply choosing not to
+search:
+
+- **Auth: None.** The dialog defaults to Bearer. Left blank, Open WebUI sends
+  `Authorization: Bearer ` — an empty header value, which `h11` rejects. The
+  connection dies before a byte is sent, so **the MCP server logs nothing at
+  all**, indistinguishable from never being called.
+- **Connection type: MCP, not OpenAPI.** OpenAPI is the dialog default and is
+  dispatched through a path that `ENABLE_PLUGINS=false` has already emptied.
+  The symptom is `GET /mcp/openapi.json → 404` in the server log.
+- **Turn off the model preset's `builtin_tools` capability** — the master
+  switch, not a category under it. Otherwise ~15 of Open WebUI's own tools
+  compete with these 8, and the model will search its (empty) Knowledge feature
+  and report finding nothing.
+
+Attach the **vault** server only to the local model's preset. No forwarded
+header carries a model identifier, so the vault cannot tell a local caller from
+a hosted one; which model may reach it is a configuration control enforced
+there, backstopped by the per-request approval.
+
+Selecting the raw base model instead of the preset gives you a bare LLM —
+`tool_ids` lives on presets only.
+
+**Verifying a tool actually ran:** a fluent answer is not evidence. Watch
+`journalctl -t mcp-server -t mcp-vault -f`. Four requests on connect
+(`initialize`, `notifications/initialized`, the SSE `GET`, `tools/list`) mean
+the tools were *offered*; only a fifth `POST /mcp` proves one was *called*.
 
 ## Claude Desktop / Claude Code
 

@@ -1,9 +1,15 @@
 """Gate 2: who is asking.
 
-Open WebUI mints a signed HS256 JWT per tool call when
-FORWARD_USER_INFO_HEADER_JWT_SECRET is set, carrying sub, email, name, role,
-iss and exp. Verified in the running 0.11.0 image at utils/tools.py:178, on the
-tool-call path specifically. Because it is signed with a secret only Open WebUI
+Open WebUI mints a signed HS256 JWT carrying sub, email, name, role, iss and
+exp when FORWARD_USER_INFO_HEADER_JWT_SECRET is set.
+
+It is minted ONCE PER TURN, not per tool call: `connect_mcp_server` opens the
+MCP session inside `process_chat_payload` and hands the token to
+`httpx.AsyncClient` as a static default header, reused for every call in that
+turn. The clock therefore starts before the model prefills or generates a
+single token, which is why the assertion's lifetime is left at its 300s default
+-- a shorter window expires mid-turn on a long prompt and looks exactly like a
+mismatched secret. Verified against the running 0.11.0 image. Because it is signed with a secret only Open WebUI
 and this service share, it cannot be forged by anything else that can reach the
 port -- unlike the plaintext X-OpenWebUI-User-* headers, which anyone could set.
 
