@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
+from app.pipeline import chunker
 from app.pipeline.chunker import TextBlock
 
 # Chunking strategies a document can ask for.
@@ -87,3 +88,19 @@ def is_binary(path: Path, probe: int = 2048) -> bool:
         return b"\x00" in path.open("rb").read(probe)
     except OSError:
         return True
+
+
+def chunks_for(doc: "RawDoc", prefix: str = "") -> list[chunker.Chunk]:
+    """Chunk a document according to its extraction strategy.
+
+    Lives here rather than in the pipeline because two processes need it and
+    must not share one: `sync` holds the vault key, `parse_worker` deliberately
+    does not, so neither may import the other. Duplicating it was the
+    alternative, and a drifted copy would silently chunk vault documents
+    differently from open-tier ones.
+    """
+    if doc.strategy == MARKDOWN:
+        return chunker.chunk_markdown(doc.text, extra=doc.extra)
+    if doc.strategy == BLOCKS:
+        return chunker.chunk_blocks(doc.blocks, extra=doc.extra, prefix=prefix)
+    return chunker.chunk_text(doc.text, extra=doc.extra, prefix=prefix)

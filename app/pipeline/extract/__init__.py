@@ -14,6 +14,7 @@ from app.pipeline.extract.base import (
     TEXT,
     Extractor,
     RawDoc,
+    chunks_for,
     doc_id_for,
 )
 from app.pipeline.extract.pdf import PdfExtractor

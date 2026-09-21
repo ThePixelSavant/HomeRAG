@@ -16,11 +16,15 @@ import datetime as dt
 import difflib
 import fcntl
 import fnmatch
+import base64
 import hashlib
 import json
 import logging
+import os
 import re
 import shutil
+import subprocess
+import sys
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -28,7 +32,7 @@ from pathlib import Path
 from app import documents
 from app.config import settings
 from app.domains import Tier
-from app.pipeline import chunker, classify, embedder, extract, qdrant_store, state
+from app.pipeline import chunker, classify, embedder, extract, parse_worker, qdrant_store, state
 from app.pipeline.extract.base import OCR_REQUIRED, OK, doc_id_for
 from app.sources import INBOX, LOCAL, TRANSCRIPTS, Source
 from app.vault import blobs as vault_blobs
@@ -39,6 +43,10 @@ from app.vault.keyagent import AGENT
 logger = logging.getLogger(__name__)
 
 LOCK_NAME = ".sync.lock"
+
+
+class ParseWorkerFailed(RuntimeError):
+    """The keyless extraction child did not return a usable result."""
 
 # Noise that is never worth indexing, whatever the source. This does NOT cover
 # large scanned PDFs -- those are kept out by not pointing a source at them,
@@ -139,11 +147,9 @@ def enumerate_files(source: Source) -> tuple[list[Path], bool]:
 
 
 def _chunks_for(doc: extract.RawDoc, prefix: str = "") -> list[chunker.Chunk]:
-    if doc.strategy == extract.MARKDOWN:
-        return chunker.chunk_markdown(doc.text, extra=doc.extra)
-    if doc.strategy == extract.BLOCKS:
-        return chunker.chunk_blocks(doc.blocks, extra=doc.extra, prefix=prefix)
-    return chunker.chunk_text(doc.text, extra=doc.extra, prefix=prefix)
+    # Shared with app.pipeline.parse_worker, which cannot import this module --
+    # see extract.base.chunks_for.
+    return extract.chunks_for(doc, prefix=prefix)
 
 
 # Version-ish decoration in a filename: v2, rev3, -2, (1), _final.
@@ -343,65 +349,136 @@ def _sync_open_doc(conn, source: Source, path: Path, doc, run_id: str, result: S
 # --------------------------------------------------------------------------
 
 
-def _sync_vault_doc(vconn, source: Source, path: Path, doc, run_id: str, result: SourceResult) -> None:
-    doc_id = doc_id_for(source.id, doc.rel_uri)
+def _run_parse_worker(source: Source, files: list[Path], known: dict, tombstoned) -> list[dict]:
+    """Extract, chunk and embed in a child process that holds no vault key.
 
-    # Redaction before embedding: the vault is encrypted anyway, but a secret
-    # that never enters a vector is one fewer thing to reason about.
-    if doc.strategy == extract.BLOCKS:
-        for block in doc.blocks:
-            block.text = classify.redact(block.text)
-    else:
-        doc.text = classify.redact(doc.text)
+    Every parser here reads attacker-influenced bytes, and this process holds
+    the key to every document ever stored. Keeping the two apart means a
+    parser exploit costs one document rather than the whole vault.
 
-    content_hash = doc.content_hash()
-    previous = vault_store.get_document(vconn, doc_id)
-    if previous and previous["content_hash"] == content_hash:
+    `subprocess` rather than `multiprocessing`: fork would inherit this
+    address space, key included. JSON rather than pickle: the child is the
+    half assumed to be compromised, and pickle would let it execute code here
+    on the way back.
+    """
+    job = {
+        "source": {
+            "id": source.id,
+            "type": source.type,
+            "domain": source.domain,
+            "path": str(source.path),
+        },
+        "files": [str(p.relative_to(source.path)) for p in files],
+        "known_hashes": known,
+        "tombstoned": sorted(tombstoned),
+    }
+    proc = subprocess.run(
+        [sys.executable, "-m", "app.pipeline.parse_worker"],
+        input=json.dumps(job),
+        capture_output=True,
+        text=True,
+        # The key is never in argv or the environment, so an inherited env is
+        # not a leak -- but the child gets no reason to look, either.
+        env={k: v for k, v in os.environ.items()},
+    )
+    if proc.returncode != 0 or not proc.stdout.strip():
+        raise ParseWorkerFailed(
+            f"parse worker exited {proc.returncode}: {(proc.stderr or '').strip()[-500:]}"
+        )
+    payload = json.loads(proc.stdout)
+    if "error" in payload:
+        raise ParseWorkerFailed(payload["error"])
+    if proc.stderr.strip():
+        logger.debug("parse worker stderr: %s", proc.stderr.strip()[-2000:])
+    return payload.get("records") or []
+
+
+def _write_vault_record(vconn, source: Source, record: dict, run_id: str, result: SourceResult) -> None:
+    """Write one parsed record into the encrypted store.
+
+    This half never calls an extractor. Everything it touches arrived as JSON
+    from `parse_worker`, so the only parsing here is `json.loads`.
+    """
+    doc_id = record["doc_id"]
+    outcome = record.get("outcome")
+    result.flagged_pages += record.get("flagged_pages", 0)
+
+    if outcome == parse_worker.SKIPPED_RETRACTED:
+        result.skipped_retracted += 1
+        return
+    if outcome == parse_worker.SKIPPED_UNCHANGED:
         vault_store.touch_document(vconn, doc_id, run_id)
         result.docs_skipped += 1
         return
-
-    title = doc.title or path.stem
-    # Mid-session chunks are contextless without the session title.
-    prefix = f"{title}\n\n" if source.type == TRANSCRIPTS else ""
-    chunks = _chunks_for(doc, prefix=prefix)
-    if not chunks:
+    if outcome == parse_worker.SKIPPED_EMPTY:
         result.docs_skipped += 1
         return
+    if outcome == parse_worker.OCR:
+        # Vault-tier OCR candidates are counted but not recorded: an unindexed
+        # row in the vault would be a document we cannot search and cannot
+        # explain. Open-tier keeps a row because Qdrant is not the record.
+        result.ocr_required += 1
+        return
+    if outcome == parse_worker.FAILED:
+        result.failed += 1
+        result.notes.append(f"{record['rel_uri']}: {record.get('error', 'extraction failed')}")
+        return
+    if outcome != parse_worker.INDEXED:
+        result.failed += 1
+        result.notes.append(f"{record['rel_uri']}: unknown parse outcome {outcome!r}")
+        return
 
+    chunks = record.get("chunks") or []
     vault_store.upsert_document(
         vconn, doc_id=doc_id, source_id=source.id, domain=source.domain,
-        uri=doc.rel_uri, title=title, content_hash=content_hash, chunk_count=len(chunks),
-        extractor=doc.extractor, status="indexed", status_detail=doc.status_detail,
-        raw_extraction=json.dumps(doc.extra, default=str), mtime=doc.mtime,
-        size_bytes=doc.size_bytes, last_seen_run=run_id,
+        uri=record["rel_uri"], title=record["title"], content_hash=record["content_hash"],
+        chunk_count=len(chunks), extractor=record["extractor"], status="indexed",
+        status_detail=record.get("status_detail"), raw_extraction=record.get("raw_extraction"),
+        mtime=record.get("mtime", 0.0), size_bytes=record.get("size_bytes", 0),
+        last_seen_run=run_id,
     )
-
-    texts = [c.text for c in chunks]
-    vectors = embedder.embed_passages(texts)
     vault_store.replace_chunks(
         vconn, doc_id,
         [
             {
-                "chunk_id": f"{doc_id}-{chunk.index}", "doc_id": doc_id, "domain": source.domain,
-                "chunk_index": chunk.index, "text": chunk.text,
-                "content_hash": hashlib.sha256(chunk.text.encode()).hexdigest(),
-                "vector": vault_store.pack_vector(vectors[n]), "token_count": chunk.token_count,
-                "heading_path": json.dumps(chunk.heading_path),
-                "locator": json.dumps(chunk.extra.get("locator", {}), default=str),
+                "chunk_id": f"{doc_id}-{chunk['index']}", "doc_id": doc_id, "domain": source.domain,
+                "chunk_index": chunk["index"], "text": chunk["text"],
+                "content_hash": hashlib.sha256(chunk["text"].encode()).hexdigest(),
+                "vector": base64.b64decode(chunk["vector_b64"]),
+                "token_count": chunk["token_count"],
+                "heading_path": json.dumps(chunk["heading_path"]),
+                "locator": json.dumps(chunk["locator"], default=str),
                 "indexed_at": vault_store.utcnow(),
             }
-            for n, chunk in enumerate(chunks)
+            for chunk in chunks
         ],
     )
 
     # The original is sensitive too. Inbox drops are consumed; sources indexed
     # in place (transcripts, mounted dirs) are left alone -- we do not own them.
     if source.type == INBOX:
-        vault_blobs.consume(vconn, AGENT.key(), doc_id, path)
+        vault_blobs.consume(vconn, AGENT.key(), doc_id, source.path / record["rel_uri"])
 
     result.chunks_upserted += len(chunks)
     result.docs_indexed += 1
+
+
+def _ingest_vault_source(
+    vconn, source: Source, files: list[Path], tombstoned, run_id: str, result: SourceResult
+) -> None:
+    known = {
+        row["doc_id"]: row["content_hash"]
+        for row in vconn.execute(
+            "SELECT doc_id, content_hash FROM documents WHERE source_id=?", (source.id,)
+        )
+    }
+    for record in _run_parse_worker(source, files, known, tombstoned):
+        try:
+            _write_vault_record(vconn, source, record, run_id, result)
+        except Exception as exc:  # noqa: BLE001 - one bad record must not kill the run
+            logger.exception("Failed to store %s", record.get("rel_uri"))
+            result.failed += 1
+            result.notes.append(f"{record.get('rel_uri')}: {type(exc).__name__}: {exc}")
 
 
 # --------------------------------------------------------------------------
@@ -449,9 +526,17 @@ def sync_source(source: Source, run_id: str, *, force: bool = False, dry_run: bo
             # Vault documents are only ever recorded in the vault's own
             # database, so that is where their tombstones live too.
             if source.is_vault:
-                tombstoned = vault_store.tombstones(vconn, source.id)
-            else:
-                tombstoned = state.tombstones(conn, source.id)
+                # Vault-tier extraction happens in a child process that holds
+                # no key -- see app.pipeline.parse_worker. Nothing below this
+                # branch runs an extractor in a process that can decrypt.
+                _ingest_vault_source(
+                    vconn, source, files,
+                    vault_store.tombstones(vconn, source.id), run_id, result,
+                )
+                files = []
+
+            tombstoned = state.tombstones(conn, source.id) if not source.is_vault else {}
+            if not source.is_vault:
                 _apply_review_dates(conn, result)
 
             for path in files:
@@ -472,27 +557,21 @@ def sync_source(source: Source, run_id: str, *, force: bool = False, dry_run: bo
                 result.flagged_pages += len(doc.extra.get("flagged_pages") or ())
                 if doc.status == OCR_REQUIRED:
                     result.ocr_required += 1
-                    if not source.is_vault:
-                        state.upsert_document(
-                            conn, doc_id=doc_id_for(source.id, doc.rel_uri), source_id=source.id,
-                            domain=source.domain, tier=Tier.OPEN.value, uri=doc.rel_uri,
-                            title=doc.title or path.stem, content_hash=doc.content_hash(),
-                            chunk_count=0, extractor=doc.extractor, status=state.OCR_REQUIRED,
-                            status_detail=doc.status_detail, mtime=doc.mtime,
-                            size_bytes=doc.size_bytes, last_seen_run=run_id,
-                        )
+                    state.upsert_document(
+                        conn, doc_id=doc_id_for(source.id, doc.rel_uri), source_id=source.id,
+                        domain=source.domain, tier=Tier.OPEN.value, uri=doc.rel_uri,
+                        title=doc.title or path.stem, content_hash=doc.content_hash(),
+                        chunk_count=0, extractor=doc.extractor, status=state.OCR_REQUIRED,
+                        status_detail=doc.status_detail, mtime=doc.mtime,
+                        size_bytes=doc.size_bytes, last_seen_run=run_id,
+                    )
                     continue
                 if doc.status != OK or not doc.usable:
                     result.failed += 1
                     continue
 
                 try:
-                    if source.is_vault:
-                        _sync_vault_doc(vconn, source, path, doc, run_id, result)
-                    else:
-                        _sync_open_doc(conn, source, path, doc, run_id, result)
-                except VaultSealed:
-                    raise
+                    _sync_open_doc(conn, source, path, doc, run_id, result)
                 except Exception as exc:  # noqa: BLE001 - one bad file must not kill the run
                     logger.exception("Failed on %s", path)
                     result.failed += 1
