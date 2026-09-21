@@ -63,10 +63,21 @@ between a component and its environment.
 | Page classifier measured from column 0, so every indented step scored as "prose" | Synthetic fixtures were unindented |
 | Version warning flagged every `CLAUDE.md` against every other — five false pairs on the first real run | Fixtures had two files, not twenty |
 | `schedule_review` erased `lifecycle_reason` | No test combined a reason with a date |
+| Vault-tier ingestion could never run: `sync` checked its own in-process `AGENT`, but `make unlock` unlocks the vault *server* in another container | Tests unlock in the same process, so the boundary does not exist for them |
+| A grant expired 120s after creation whether or not it was approved, so approvals could not be redeemed in time | Every test approved and redeemed within milliseconds — the gate was fully covered and unusable at the same time |
+| `EMPTY` counted as a failure, so three subagent transcripts reported `failed: 3` on every run | Fixtures had content; nothing exercised a document that legitimately extracts to nothing |
+| An approval binds to the exact argument string, but the model rewords its search each turn, so a legitimate re-ask mints a new grant | Tests pass the same query object twice |
+
+The last two share a shape worth naming: **a test that acts instantly cannot
+catch a window that is too short for a human**, and **a test that reuses one
+input cannot catch a caller that varies its input**. Both passed for months.
+
 
 The common thread is that each involves a real filesystem, a real container, a
-real dependency version, or real data at real scale. When you add a feature,
-budget time to run it against the live stack.
+real dependency version, real data at real scale — or a real human, moving at
+human speed. When you add a feature, budget time to run it against the live
+stack, and if a human is in the loop, walk through it at their pace rather than
+asserting the two ends in one function call.
 
 ## Things that will bite you
 

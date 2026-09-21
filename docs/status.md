@@ -1,6 +1,6 @@
 # Implementation status
 
-As of commit `ccddc0c` on `feat/ingestion-pipeline-and-vault`, 2026-09-20.
+As of commit `37b405c` on `feat/ingestion-pipeline-and-vault`, 2026-09-21.
 
 **Phase 1 is built and running. Phase 2 is designed and not started.**
 
@@ -8,16 +8,14 @@ As of commit `ccddc0c` on `feat/ingestion-pipeline-and-vault`, 2026-09-20.
 
 | | |
 |---|---|
-| Branch | `feat/ingestion-pipeline-and-vault` (11 commits ahead of `master`) |
-| Python | ~7,300 lines across `app/` and `tests/` |
-| Tests | **86 passing** (57 pipeline, 29 security) |
-| Indexed | 18 documents, 449 chunks, 4 open-tier domains |
-| Vault | Schema built and tested; **never unlocked on this machine** |
-| Stack | 3 containers up; `make doctor` reports 10 ok, 7 warn, 0 fail |
+| Branch | `feat/ingestion-pipeline-and-vault` (19 commits ahead of `master`) |
+| Tests | **103 passing** (57 pipeline, 33 security, 13 vault ingest) |
+| Open tier | 18 documents, 449 chunks, 4 domains |
+| Vault | **9 documents, 500 chunks** — unlocked, ingested, all three gates exercised end to end |
+| Stack | 3 containers up; `make doctor` reports 10 ok, 6 warn, 0 fail |
 
-The warnings are six empty inbox domains and an unset `VAULT_JWT_SECRET`. Both
-are expected in the current state; the secret is waiting on a human — see
-[Blocked on you](#blocked-on-you).
+The warnings are six empty inbox domains, which is expected. Nothing is
+waiting on a human any more — see [Blocked on you](#blocked-on-you).
 
 ## Component status
 
@@ -65,9 +63,10 @@ Legend: **done** = built, tested and exercised against real data ·
 | SQLCipher schema + migrations | done | Documents, chunks, FTS5, ledger, audit |
 | Argon2id key derivation | done | Memory-only key with TTL |
 | Unix-socket control channel | done | Never HTTP |
-| Gate 1 — sealed | done | 6 tests |
-| Gate 2 — signed identity | done | 5 tests |
-| Gate 3 — per-request approval | done | 7 tests, including replay and rebinding |
+| Gate 1 — sealed | done | 6 tests; checked first, so a sealed vault reveals nothing about gates 2-3 |
+| Gate 2 — signed identity | done | 5 tests, plus 7 cases driven over real MCP against the running server |
+| Gate 3 — per-request approval | done | 10 tests. Bound to `(subject, chat_id, query_hash)`; two clocks, see [ADR-021](decisions.md#adr-021-two-clocks-on-a-grant-not-one) |
+| Vault-tier ingestion | done | Parses in a keyless child process ([ADR-019](decisions.md#adr-019-vault-extraction-runs-in-a-process-that-holds-no-key)); 13 tests |
 | Brute-force vector search | done | Sub-millisecond at this scale |
 | FTS5 keyword search | done | Malformed queries return empty, not an error |
 | AES-256-GCM blobs | done | `consume()` deletes the plaintext |
@@ -84,7 +83,7 @@ Legend: **done** = built, tested and exercised against real data ·
 | `make doctor` preflight | done | |
 | Open-tier MCP server | done | 4 tools, verified over the wire |
 | Vault MCP server | done | 4 tools, verified to fail closed over the wire |
-| Open WebUI integration | **not verified** | Server side ready; see [Blocked on you](#blocked-on-you) |
+| Open WebUI integration | done | Verified end to end through a real browser session, 2026-09-21 |
 | systemd timers | done | Units written; `croniter` cadences honoured in code |
 
 ## What was verified, and how
@@ -113,6 +112,13 @@ from unit tests.
 | `fetch_context` returns ordered neighbours | Chunks 54, 55, 56 in order, with citations |
 | Vault fails closed over MCP | Both `search_vault` and `fetch_context` return `VAULT_SEALED` over streamable-http |
 | Both servers expose the new tools | `tools/list` over the wire confirms 4 tools each |
+| Gate 2 discriminates, not just denies | 7 cases over real MCP against an unlocked vault: no header, plaintext-only, wrong secret, wrong email, wrong role and expired all `IDENTITY_REJECTED`; valid identity reached gate 3 |
+| The full three-gate path releases data | Audit: `20:57:49 pending_approval` → `make approve` at a TTY → `20:59:08 allowed … rows=5` from Open WebUI, 2026-09-21 |
+| An approval survives into the next turn | Redeemed 79s after being granted, in a later turn with a different `message_id` |
+| An approval does not cross a chat or a query | Same question in a new chat, and a reworded search in the same chat, both minted fresh `PENDING` grants rather than redeeming |
+| Vault ingestion writes real documents | 12 transcripts in: 9 indexed, 500 chunks, 3 empty; `vault: unlocked docs=9` |
+| Extraction holds no key | A fresh interpreter importing `parse_worker` pulls in neither `keyagent` nor `crypto` |
+| `mcp-server` cannot reach the vault | No DNS, and a raw-IP connect to `mcp-vault` times out between bridges |
 
 ## Known gaps
 
@@ -131,54 +137,61 @@ Ordered by how likely they are to bite.
 4. **Scanned PDFs are not indexed at all.** Below 100 chars/page there is no
    text layer; those documents are marked `ocr_required` and reported rather
    than silently making the index look complete.
-5. **Open WebUI integration is unverified end to end.** Every server-side piece
-   is tested, but no real browser session has driven it.
-6. **The similar-document warning only covers documents in one source and
+5. **Redeeming an approval needs the model to repeat its search verbatim.**
+   The grant hashes the tool name plus the full argument string, so an
+   approval only releases the query the human actually read — which is the
+   point. But the model composes those arguments fresh each turn and often
+   rewords them, so a legitimate re-ask frequently mints a new `PENDING`
+   instead of redeeming. Observed twice during the first end-to-end run. The
+   fix is to echo the exact arguments in the `PENDING_APPROVAL` response so
+   the model knows what to repeat; loosening the binding would gut the
+   prompt-injection defence and is not the answer.
+6. **Vault-tier sources do not ingest on a schedule.** The worker derives the
+   key from a passphrase typed at a terminal ([ADR-020](decisions.md#adr-020-the-ingestion-worker-prompts-for-the-passphrase)),
+   so a cron run queues them and says so. Open-tier sources are unaffected.
+7. **The similar-document warning only covers documents in one source and
    domain.** Two versions filed into different domains are not compared.
-7. **Vault lifecycle has no `restore`.** `make vault-lifecycle STATE=active`
+8. **Vault lifecycle has no `restore`.** `make vault-lifecycle STATE=active`
    clears the flag, but a retracted vault document's chunks, vectors and blob
    are destroyed — the original file is gone too, so there is nothing to
    re-ingest. This is intentional but worth knowing before you retract.
-8. **No reranking.** Hybrid RRF only. Deliberately deprioritised behind parsing
+9. **No reranking.** Hybrid RRF only. Deliberately deprioritised behind parsing
    quality; see [ADR-011](decisions.md#adr-011-parsing-quality-before-retrieval-tuning).
 
 ## Blocked on you
 
-Nothing in this list can be done from inside the repo.
+Nothing is blocking the system any more. What remains is optional.
 
-1. **Unlock the vault once.** It has never been unlocked on this machine, so
-   the vault path has never run against real data. Needs a passphrase typed at
-   your terminal:
-   ```bash
-   make unlock
-   make ingest            # the 11 queued transcripts will then ingest
-   ```
-2. **Set `VAULT_JWT_SECRET`** in `.env` to the same value as
-   `FORWARD_USER_INFO_HEADER_JWT_SECRET` in `~/Dev/LLM/.env`. Until then every
-   model-initiated vault call is denied. Generate with `openssl rand -hex 32`.
-3. **Configure Open WebUI** (`~/Dev/LLM`): auth is currently **off**, so there
-   is no identity to sign and gate 2 cannot pass. Full step-by-step instructions,
-   verified against the running 0.11.0 image, are in
-   **`~/Dev/LLM/HANDOFF-rag-integration.md`**. In short: enable `WEBUI_AUTH`,
-   pin `WEBUI_SECRET_KEY`, set `ENABLE_FORWARD_USER_INFO_HEADERS=true` alongside
-   the secret, provision an admin account whose email matches
-   `VAULT_ALLOWED_EMAILS`, and register both MCP servers as tool servers.
-4. **Swap in a vision model** — Qwen3-VL-30B-A3B-Instruct Q4_K_M plus its
-   mmproj, ~18.6 GB — which Phase 2's receipt extraction depends on.
-5. **Decide on the orphaned Docker volumes.** `rag_qdrant-data` and
+1. **Swap in a vision model** — Qwen3-VL-30B-A3B-Instruct Q4_K_M plus its
+   mmproj, ~18.6 GB — which Phase 2's receipt extraction depends on. It would
+   also clear the 5 undecided PDF pages in gap 2.
+2. **Decide on the orphaned Docker volumes.** `rag_qdrant-data` and
    `rag_ollama-data` are left over from the pre-bind-mount layout, and there is
    an 8 GB ollama image unused by this stack. All three are untouched pending
    your say-so.
-6. **Two real manuals are indexed** (`intelliflo3-pro3-vsf-install-guide.pdf`
+3. **Two real manuals are indexed** (`intelliflo3-pro3-vsf-install-guide.pdf`
    and `xps-8700-owners-manual.pdf`, 139 chunks). They were copied into
    `data/inbox/manuals/` to verify PDF extraction against real documents and
    left there because they are legitimate content for that domain. Remove them
    with `make retract` if you would rather start clean.
+4. **Re-ingest vault sources by hand as they change.** `claude-sessions` has a
+   4-hourly cadence that will keep queueing; take it with an interactive
+   `make ingest` when you want the newer transcripts.
+
+Resolved on 2026-09-21: the vault has been unlocked and ingested,
+`VAULT_JWT_SECRET` is set and matching, and Open WebUI is configured and
+verified end to end.
 
 ## History
 
 | Commit | What |
 |---|---|
+| `37b405c` | Restart the grant clock on approval |
+| `5545cd2` | An empty document is not a failed one |
+| `c4763b0` | Prompt for the vault passphrase instead of exporting the key |
+| `a94ea60` | Parse vault documents in a process that holds no key |
+| `3b0eacf` | Isolate mcp-vault on its own bridge, drop NET_RAW |
+| `6a772c0` | Bind grants to the chat, not the message |
 | `ccddc0c` | Adaptive PDF extraction, table headers, citations, lifecycle |
 | `b9e41fb` | Fix doc_id collisions between same-named files in different directories |
 | `ea56506` | Split the vault CLI and fix read-only state access |
