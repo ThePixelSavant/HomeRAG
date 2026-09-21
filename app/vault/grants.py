@@ -48,9 +48,23 @@ class Grant:
     created_at: float
     approved: bool = False
     redeemed: bool = False
+    approved_at: float | None = None
 
-    def expires_at(self, ttl: int) -> float:
-        return self.created_at + ttl
+    def expires_at(self) -> float:
+        """When this grant stops being usable.
+
+        Two windows, because they do different jobs. Before approval the clock
+        runs from creation and is deliberately short. After approval it
+        restarts, because the owner has now made a decision and needs time to
+        act on it -- go back to the chat, re-ask, and wait for the model.
+
+        Running one short clock from creation made approvals unredeemable in
+        practice: by the time `make approve` had been read and confirmed,
+        there was not enough of the window left to re-ask in.
+        """
+        if self.approved and self.approved_at is not None:
+            return self.approved_at + settings.vault_redeem_ttl_seconds
+        return self.created_at + settings.vault_grant_ttl_seconds
 
 
 class PendingApproval(Exception):
@@ -69,12 +83,9 @@ class GrantRegistry:
         self._lock = threading.Lock()
         self._grants: dict[str, Grant] = {}
 
-    def _ttl(self) -> int:
-        return settings.vault_grant_ttl_seconds
-
     def _prune_locked(self) -> None:
         now = time.time()
-        for code in [c for c, g in self._grants.items() if now > g.expires_at(self._ttl())]:
+        for code in [c for c, g in self._grants.items() if now > g.expires_at()]:
             del self._grants[code]
 
     def request(
@@ -143,6 +154,7 @@ class GrantRegistry:
             if grant.approved:
                 raise ValueError(f"Request {code} was already approved.")
             grant.approved = True
+            grant.approved_at = time.time()
             return grant
 
     def clear(self) -> None:

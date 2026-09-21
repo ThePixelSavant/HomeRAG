@@ -158,6 +158,17 @@ The first call returns an approval code instead of data:
 make approve CODE=123456
 ```
 
+The grant runs on two clocks. Before approval it expires in
+`VAULT_GRANT_TTL_SECONDS` (120s) -- short on purpose, so a request a human has
+not looked at does not sit around waiting to be rubber-stamped. Once approved,
+the clock restarts for `VAULT_REDEEM_TTL_SECONDS` (300s), because the owner has
+now made a decision and needs time to act on it.
+
+A single clock from creation made approvals unredeemable in practice: by the
+time the confirmation prompt had been read and `yes` typed, too little of the
+window remained to re-ask in, and the grant expired between the approval and
+the redemption.
+
 You approve, then ask again in the same chat and that turn is released. The
 binding stops at the chat deliberately: Open WebUI mints a new `message_id`
 every turn, and the approval is typed after the turn that triggered it has

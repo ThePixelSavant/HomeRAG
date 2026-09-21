@@ -332,3 +332,62 @@ def test_retracting_a_vault_document_destroys_its_chunks(unlocked):
         assert not store.search_keyword(conn, "Distinctive", domains=["receipts"])
     finally:
         conn.close()
+
+
+def test_approved_grant_survives_the_pending_window(unlocked, token, monkeypatch):
+    """The clock must restart on approval, or approvals are unredeemable.
+
+    Measured from creation, the window had to cover reading the chat, running
+    `make approve`, reading the confirmation, typing `yes`, returning to the
+    chat, re-asking, and the local model prefilling and generating. It did not,
+    and the first real end-to-end attempt expired between the approval and the
+    re-ask.
+    """
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "vault_grant_ttl_seconds", 1)
+    monkeypatch.setattr(settings, "vault_redeem_ttl_seconds", 600)
+    grants.REGISTRY.clear()
+    tok = token()
+
+    with pytest.raises(grants.PendingApproval) as excinfo:
+        service.search("receipts", ctx=mcp_ctx(tok, message="m1"))
+    grants.REGISTRY.approve(excinfo.value.grant.code)
+
+    time.sleep(1.2)  # past the pending window, well inside the redeem window
+    service.search("receipts", ctx=mcp_ctx(tok, message="m2"))  # released
+
+
+def test_unapproved_grant_still_expires_fast(unlocked, token, monkeypatch):
+    """The short window is the point for anything a human has NOT approved."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "vault_grant_ttl_seconds", 1)
+    monkeypatch.setattr(settings, "vault_redeem_ttl_seconds", 600)
+    grants.REGISTRY.clear()
+
+    with pytest.raises(grants.PendingApproval) as excinfo:
+        service.search("receipts", ctx=mcp_ctx(token()))
+    code = excinfo.value.grant.code
+
+    time.sleep(1.2)
+    with pytest.raises(KeyError):
+        grants.REGISTRY.approve(code)
+
+
+def test_approved_grant_does_eventually_expire(unlocked, token, monkeypatch):
+    """Restarting the clock must not mean never expiring."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "vault_grant_ttl_seconds", 60)
+    monkeypatch.setattr(settings, "vault_redeem_ttl_seconds", 1)
+    grants.REGISTRY.clear()
+    tok = token()
+
+    with pytest.raises(grants.PendingApproval) as excinfo:
+        service.search("receipts", ctx=mcp_ctx(tok, message="m1"))
+    grants.REGISTRY.approve(excinfo.value.grant.code)
+
+    time.sleep(1.2)
+    with pytest.raises(grants.PendingApproval):
+        service.search("receipts", ctx=mcp_ctx(tok, message="m2"))

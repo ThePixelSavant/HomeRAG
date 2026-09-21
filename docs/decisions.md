@@ -433,3 +433,34 @@ TTY says so in the log and queues rather than hanging.
 **Revisit if:** the writes move into `mcp-vault` (see ADR-019), which would let
 a scheduled worker ship records to the process that already holds the key,
 with no export and no prompt.
+
+---
+
+## ADR-021: Two clocks on a grant, not one
+
+**Chosen:** An unapproved grant expires `VAULT_GRANT_TTL_SECONDS` (120s) after
+creation. An approved one expires `VAULT_REDEEM_TTL_SECONDS` (300s) after the
+*approval*.
+
+**Rejected:** One window measured from creation, which is what shipped.
+
+The two windows are doing different jobs and a single value cannot serve both.
+
+Before approval, short is the point: a request a human has not examined --
+possibly one a prompt-injected model made -- should not linger waiting for a
+distracted rubber stamp.
+
+After approval the constraint inverts. The owner has to read the confirmation
+prompt, type `yes` in full, return to the chat, re-ask, and wait for the local
+model to prefill and generate before the call goes out. At ~15 t/s that does
+not fit in what remains of a 120s window that started before any of it.
+
+This was found the first time the full path was exercised end to end: the
+approval succeeded and the grant expired before the re-ask could redeem it,
+leaving a `pending_approval` in the audit log with no `allowed` after it.
+
+Restarting the clock does not mean never expiring -- an approved grant still
+expires, and a test asserts it.
+
+**Revisit if:** generation gets fast enough that the redeem window stops
+mattering, or if approval moves into the chat itself rather than a terminal.

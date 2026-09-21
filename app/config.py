@@ -60,7 +60,15 @@ class Settings(BaseSettings):
     vault_allowed_emails: str = ""
     vault_allowed_roles: str = "admin"
     vault_key_ttl_seconds: int = 900
+    # How long an UNapproved request waits for a human. Short on purpose: a
+    # prompt-injected request should not sit around hoping for a distracted
+    # rubber stamp.
     vault_grant_ttl_seconds: int = 120
+    # How long an APPROVED grant stays redeemable, measured from the approval.
+    # This covers the human returning to the chat, re-asking, and the local
+    # model prefilling and generating before the call goes out -- which at
+    # ~15 t/s does not fit in the window above.
+    vault_redeem_ttl_seconds: int = 300
     vault_kdf_time_cost: int = 3
     vault_kdf_memory_kib: int = 262144
     vault_kdf_parallelism: int = 4
