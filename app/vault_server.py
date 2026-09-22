@@ -51,13 +51,31 @@ def _denied(exc: Exception, kind: str) -> dict:
 
 
 def _pending(exc: grants.PendingApproval) -> dict:
+    """Hand back the approval code AND the exact call it covers.
+
+    The grant is bound to a hash of these arguments, which is the whole point
+    -- a human approved one specific query and nothing else. But the hash is
+    opaque, so without echoing the arguments the caller has to guess what it
+    asked a turn ago. Models reword between turns, and a reworded retry mints
+    a fresh PENDING instead of redeeming the approval the owner just gave.
+    Observed twice on the first end-to-end run.
+
+    Echoing the arguments loosens nothing: the binding, the single use and the
+    chat scope are unchanged, and the owner still reads the real query before
+    approving. It only removes the guessing.
+    """
     return {
         "error": "PENDING_APPROVAL",
         "code": exc.grant.code,
+        "retry_with": exc.grant.arguments,
         "detail": (
             f"Approval required. The account holder must run "
             f"`make approve CODE={exc.grant.code}` at a terminal. "
-            "This grant covers only this request and expires shortly."
+            "Once they confirm, call this tool AGAIN with exactly the arguments in "
+            "`retry_with`, unchanged. The approval is bound to those exact arguments: "
+            "rewording the query, or altering any value, creates a NEW request that "
+            "needs its own approval rather than redeeming this one. "
+            "Do not retry until the owner says they have approved it."
         ),
     }
 

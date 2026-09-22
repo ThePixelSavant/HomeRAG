@@ -82,6 +82,7 @@ def _handle(request: dict) -> dict:
                     "chat_id": g.chat_id,
                     "message_id": g.message_id,
                     "query_preview": g.query_preview,
+                    "arguments": g.arguments,
                 }
                 for g in grants.REGISTRY.pending()
             ],
@@ -100,6 +101,7 @@ def _handle(request: dict) -> dict:
                 "tool": grant.tool,
                 "chat_id": grant.chat_id,
                 "query_preview": grant.query_preview,
+                "arguments": grant.arguments,
             },
         }
 

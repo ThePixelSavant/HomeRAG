@@ -464,3 +464,47 @@ expires, and a test asserts it.
 
 **Revisit if:** generation gets fast enough that the redeem window stops
 mattering, or if approval moves into the chat itself rather than a terminal.
+
+---
+
+## ADR-022: The pending response echoes the call it covers
+
+**Chosen:** `PENDING_APPROVAL` returns `retry_with` — the exact arguments the
+grant is bound to, in the tool's own parameter names — and tells the caller to
+re-send them unchanged.
+
+**Rejected:** Loosening the binding to a fuzzy or semantic match so that a
+reworded retry redeems anyway.
+
+The grant hashes the arguments because a human approved *one* query and nothing
+else. That is the prompt-injection defence, and it has to stay exact.
+
+But the hash is opaque, so before this the caller had no way to know what it
+had been approved for. Models compose their tool arguments fresh each turn and
+reword freely, so a perfectly legitimate re-ask would arrive with a different
+string, miss the grant, and mint a second `PENDING` — leaving the owner to
+approve the same request repeatedly and wonder why nothing was being released.
+Observed twice on the first end-to-end run.
+
+Echoing the arguments fixes that without touching the binding. The hash, the
+single use, the chat scope and the two clocks are all unchanged; the owner
+still reads the real query before approving. The only thing removed is the
+guessing.
+
+Two normalisations go with it, both of which make redemption robust without
+widening what a grant covers:
+
+- **`canonical()` drops keys whose value is None**, so omitting an optional
+  argument and passing it as `null` are one request. They mean the same thing
+  to every one of these tools. `False` and `0` are kept — `include_stale:
+  false` is a real choice.
+- **`_gate` receives resolved arguments**, so `domains: null` and an explicit
+  list of every vault domain hash alike. Both are literally the same query.
+
+The arguments are hashed in the tool's own parameter names rather than as a
+pre-joined payload string, which is what makes them replayable. A string like
+`f"{query}|{','.join(domains)}|{limit}"` hashes perfectly well and tells the
+caller nothing about how to reconstruct the call.
+
+**Revisit if:** approval moves into the chat itself, where the approved call
+could be replayed by the server rather than by the model.

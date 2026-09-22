@@ -114,6 +114,26 @@ def cmd_lifecycle(args) -> int:
     return 0
 
 
+# Shown first when rendering a request, whatever the tool. The approver is
+# deciding on the basis of what was ASKED; the rest is scope around it. Sorted
+# JSON would bury `query` behind `domains` and `include_*`, which is exactly
+# the field someone skimming needs to read.
+_LEAD_ARGS = ("query", "doc_id", "start_date", "merchant")
+
+
+def _render_arguments(grant: dict, indent: str = "     ") -> list[str]:
+    """Human-readable lines for what a grant would release."""
+    arguments = grant.get("arguments") or {}
+    if not arguments:
+        # Older vault server, or a tool that takes none.
+        return [f"{indent}query: {grant.get('query_preview', '')}"]
+
+    keys = [k for k in _LEAD_ARGS if k in arguments]
+    keys += [k for k in sorted(arguments) if k not in keys]
+    width = max(len(k) for k in keys)
+    return [f"{indent}{k:<{width}} : {arguments[k]!r}" for k in keys]
+
+
 def cmd_approve(args) -> int:
     pending = _send({"action": "pending"}).get("pending", [])
     if not args.code:
@@ -123,7 +143,7 @@ def cmd_approve(args) -> int:
         for grant in pending:
             print(f"  code={grant['code']}  {grant['tool']}  by {grant['principal']}")
             print(f"     chat={grant['chat_id']} message={grant['message_id']}")
-            print(f"     query: {grant['query_preview']}\n")
+            print("\n".join(_render_arguments(grant)) + "\n")
         return 0
 
     match = next((g for g in pending if g["code"] == args.code), None)
@@ -137,7 +157,8 @@ def cmd_approve(args) -> int:
     print(f"  principal : {match['principal']}")
     print(f"  tool      : {match['tool']}")
     print(f"  chat      : {match['chat_id']}  message: {match['message_id']}")
-    print(f"  query     : {match['query_preview']}\n")
+    print("  arguments :")
+    print("\n".join(_render_arguments(match, indent="      ")) + "\n")
     print("  Confirm the model in that chat is the local one. A frontier model would")
     print("  send these results off this machine.\n")
     if not sys.stdin.isatty():

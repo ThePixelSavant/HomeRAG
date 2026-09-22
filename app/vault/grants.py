@@ -23,16 +23,35 @@ the safe direction.
 from __future__ import annotations
 
 import hashlib
+import json
 import secrets
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from app.config import settings
 
 
-def query_hash(tool: str, payload: str) -> str:
-    return hashlib.sha256(f"{tool}\x00{payload}".encode()).hexdigest()
+def canonical(arguments: dict) -> str:
+    """Stable serialisation of a tool call's arguments.
+
+    Keys are sorted so argument order cannot change the hash, and keys whose
+    value is None are dropped so that omitting an optional argument and
+    passing it as null are the same request. Without that, a model that
+    re-sends `merchant: null` where it first sent nothing gets a fresh
+    PENDING instead of redeeming its approval -- a mismatch that protects
+    nothing, because both calls mean exactly the same thing.
+
+    False and 0 are NOT dropped. `include_stale: false` is a real choice and
+    differs from `include_stale: true`.
+    """
+    pruned = {k: v for k, v in arguments.items() if v is not None}
+    return json.dumps(pruned, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def query_hash(tool: str, arguments: dict) -> str:
+    """Bind an approval to one tool called with one exact set of arguments."""
+    return hashlib.sha256(f"{tool}\x00{canonical(arguments)}".encode()).hexdigest()
 
 
 @dataclass
@@ -46,6 +65,12 @@ class Grant:
     query_hash: str
     query_preview: str
     created_at: float
+    # The exact arguments this grant covers, in the tool's own parameter
+    # names. Echoed back in the PENDING_APPROVAL response so the caller knows
+    # what to re-send verbatim -- the hash above is opaque, and a model that
+    # rewords its query on the retry mints a new request instead of redeeming
+    # the one a human just approved.
+    arguments: dict = field(default_factory=dict)
     approved: bool = False
     redeemed: bool = False
     approved_at: float | None = None
@@ -98,6 +123,7 @@ class GrantRegistry:
         message_id: str,
         qhash: str,
         query_preview: str,
+        arguments: dict | None = None,
     ) -> Grant:
         """Find an approved, unredeemed grant for this exact request, or create
         a pending one and raise."""
@@ -130,6 +156,7 @@ class GrantRegistry:
                 message_id=message_id,
                 query_hash=qhash,
                 query_preview=query_preview,
+                arguments=dict(arguments or {}),
                 created_at=time.time(),
             )
             self._grants[grant.code] = grant

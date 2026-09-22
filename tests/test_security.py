@@ -391,3 +391,101 @@ def test_approved_grant_does_eventually_expire(unlocked, token, monkeypatch):
     time.sleep(1.2)
     with pytest.raises(grants.PendingApproval):
         service.search("receipts", ctx=mcp_ctx(tok, message="m2"))
+
+
+# --- an approval must be redeemable in practice ----------------------------
+
+
+def test_pending_response_echoes_the_exact_call_to_retry(unlocked, token):
+    """The grant hashes the arguments, so the caller has to reproduce them.
+    The hash is opaque, so the response has to say what they were -- otherwise
+    redemption depends on the model happening to reword nothing."""
+    import app.vault_server as vault_server
+
+    grants.REGISTRY.clear()
+    with pytest.raises(grants.PendingApproval) as excinfo:
+        service.search("hardware purchases", domains=["receipts"], limit=3,
+                       ctx=mcp_ctx(token()))
+
+    body = vault_server._pending(excinfo.value)
+    assert body["error"] == "PENDING_APPROVAL"
+    retry = body["retry_with"]
+    # Tool-level parameter names, so the caller can hand them straight back.
+    assert retry["query"] == "hardware purchases"
+    assert retry["domains"] == ["receipts"]
+    assert retry["limit"] == 3
+    assert set(retry) == {
+        "query", "domains", "limit", "include_superseded", "include_stale"
+    }
+
+
+def test_retrying_with_the_echoed_arguments_redeems_the_approval(unlocked, token):
+    """The whole point: approve once, re-send retry_with, get data."""
+    import app.vault_server as vault_server
+
+    grants.REGISTRY.clear()
+    tok = token()
+    with pytest.raises(grants.PendingApproval) as excinfo:
+        service.search("hardware purchases", domains=["receipts"], ctx=mcp_ctx(tok))
+
+    retry = vault_server._pending(excinfo.value)["retry_with"]
+    grants.REGISTRY.approve(excinfo.value.grant.code)
+
+    # Exactly what the model was told to send, in a later turn.
+    service.search(**retry, ctx=mcp_ctx(tok, message="m2"))
+
+    # Still single-use.
+    with pytest.raises(grants.PendingApproval):
+        service.search(**retry, ctx=mcp_ctx(tok, message="m3"))
+
+
+def test_a_reworded_retry_still_needs_its_own_approval(unlocked, token):
+    """Echoing the arguments must not have loosened the binding."""
+    grants.REGISTRY.clear()
+    tok = token()
+    with pytest.raises(grants.PendingApproval) as excinfo:
+        service.search("hardware purchases", domains=["receipts"], ctx=mcp_ctx(tok))
+    grants.REGISTRY.approve(excinfo.value.grant.code)
+
+    with pytest.raises(grants.PendingApproval):
+        service.search("purchases of hardware", domains=["receipts"], ctx=mcp_ctx(tok))
+
+
+def test_omitting_an_optional_argument_matches_passing_null(unlocked, token):
+    """canonical() drops None, so `merchant: null` and an absent merchant are
+    one request. They mean the same thing, and treating them as different
+    grants protects nothing while breaking redemption."""
+    grants.REGISTRY.clear()
+    tok = token()
+    with pytest.raises(grants.PendingApproval) as excinfo:
+        service.query_ledger(start_date="2026-01-01", ctx=mcp_ctx(tok))
+    grants.REGISTRY.approve(excinfo.value.grant.code)
+
+    service.query_ledger(
+        start_date="2026-01-01", end_date=None, group_by=None, ctx=mcp_ctx(tok, message="m2")
+    )
+
+
+def test_resolved_domains_make_null_and_explicit_the_same_request(unlocked, token):
+    """`domains: null` resolves to every vault domain, so asking that way and
+    naming them all is one request rather than two approvals."""
+    from app.domains import Tier, domains_in
+
+    grants.REGISTRY.clear()
+    tok = token()
+    with pytest.raises(grants.PendingApproval) as excinfo:
+        service.search("anything", ctx=mcp_ctx(tok))
+    grants.REGISTRY.approve(excinfo.value.grant.code)
+
+    service.search("anything", domains=domains_in(Tier.VAULT), ctx=mcp_ctx(tok, message="m2"))
+
+
+def test_fetch_context_pending_also_echoes_its_arguments(unlocked, token):
+    import app.vault_server as vault_server
+
+    grants.REGISTRY.clear()
+    with pytest.raises(grants.PendingApproval) as excinfo:
+        service.fetch_context("d1", 4, before=2, after=1, ctx=mcp_ctx(token()))
+
+    retry = vault_server._pending(excinfo.value)["retry_with"]
+    assert retry == {"doc_id": "d1", "chunk_index": 4, "before": 2, "after": 1}

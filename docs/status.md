@@ -116,6 +116,7 @@ from unit tests.
 | The full three-gate path releases data | Audit: `20:57:49 pending_approval` → `make approve` at a TTY → `20:59:08 allowed … rows=5` from Open WebUI, 2026-09-21 |
 | An approval survives into the next turn | Redeemed 79s after being granted, in a later turn with a different `message_id` |
 | An approval does not cross a chat or a query | Same question in a new chat, and a reworded search in the same chat, both minted fresh `PENDING` grants rather than redeeming |
+| An approval is redeemable without guesswork | `PENDING_APPROVAL` echoes `retry_with`; re-sending it unchanged redeems, re-sending it reworded does not. Unit-level against the real service layer — the live MCP round-trip needs the vault unlocked |
 | Vault ingestion writes real documents | 12 transcripts in: 9 indexed, 500 chunks, 3 empty; `vault: unlocked docs=9` |
 | Extraction holds no key | A fresh interpreter importing `parse_worker` pulls in neither `keyagent` nor `crypto` |
 | `mcp-server` cannot reach the vault | No DNS, and a raw-IP connect to `mcp-vault` times out between bridges |
@@ -137,25 +138,16 @@ Ordered by how likely they are to bite.
 4. **Scanned PDFs are not indexed at all.** Below 100 chars/page there is no
    text layer; those documents are marked `ocr_required` and reported rather
    than silently making the index look complete.
-5. **Redeeming an approval needs the model to repeat its search verbatim.**
-   The grant hashes the tool name plus the full argument string, so an
-   approval only releases the query the human actually read — which is the
-   point. But the model composes those arguments fresh each turn and often
-   rewords them, so a legitimate re-ask frequently mints a new `PENDING`
-   instead of redeeming. Observed twice during the first end-to-end run. The
-   fix is to echo the exact arguments in the `PENDING_APPROVAL` response so
-   the model knows what to repeat; loosening the binding would gut the
-   prompt-injection defence and is not the answer.
-6. **Vault-tier sources do not ingest on a schedule.** The worker derives the
+5. **Vault-tier sources do not ingest on a schedule.** The worker derives the
    key from a passphrase typed at a terminal ([ADR-020](decisions.md#adr-020-the-ingestion-worker-prompts-for-the-passphrase)),
    so a cron run queues them and says so. Open-tier sources are unaffected.
-7. **The similar-document warning only covers documents in one source and
+6. **The similar-document warning only covers documents in one source and
    domain.** Two versions filed into different domains are not compared.
-8. **Vault lifecycle has no `restore`.** `make vault-lifecycle STATE=active`
+7. **Vault lifecycle has no `restore`.** `make vault-lifecycle STATE=active`
    clears the flag, but a retracted vault document's chunks, vectors and blob
    are destroyed — the original file is gone too, so there is nothing to
    re-ingest. This is intentional but worth knowing before you retract.
-9. **No reranking.** Hybrid RRF only. Deliberately deprioritised behind parsing
+8. **No reranking.** Hybrid RRF only. Deliberately deprioritised behind parsing
    quality; see [ADR-011](decisions.md#adr-011-parsing-quality-before-retrieval-tuning).
 
 ## Blocked on you

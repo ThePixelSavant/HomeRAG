@@ -174,10 +174,19 @@ binding stops at the chat deliberately: Open WebUI mints a new `message_id`
 every turn, and the approval is typed after the turn that triggered it has
 already ended, so a message binding could never be redeemed at all.
 
-The prompt prints the principal, the tool, the chat and message, and the query
-preview, then requires the word `yes` typed in full. A reflexive y/n is no
-defence against a prompt-injected model, which is the one thing this gate
-exists to catch.
+The prompt prints the principal, the tool, the chat and message, and **every
+argument of the call**, with the query first, then requires the word `yes`
+typed in full. A reflexive y/n is no defence against a prompt-injected model,
+which is the one thing this gate exists to catch — and neither is a prompt that
+buries what was asked behind boilerplate, which is why the ordering is
+deliberate rather than alphabetical.
+
+The `PENDING_APPROVAL` response hands the caller those same arguments back as
+`retry_with`, because the hash it is bound to is opaque and a caller that has
+to guess what it asked a turn ago will guess wrong. That echo **widens
+nothing**: the hash, the single use, the chat scope and both clocks are
+unchanged, and a reworded retry still mints a fresh request needing its own
+approval. See [ADR-022](decisions.md#adr-022-the-pending-response-echoes-the-call-it-covers).
 
 The CLI path (`make vault-query`) skips **only** gate 3, because a human is
 already at the terminal. It does not skip gate 1.

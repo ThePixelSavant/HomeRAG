@@ -13,7 +13,6 @@ passes all three, exactly as Open WebUI does.
 
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass, field
 from typing import Any
@@ -71,9 +70,16 @@ def _resolve_domains(requested: list[str] | None) -> list[str]:
     return resolved
 
 
-def _gate(ctx: Context, tool: str, payload: str) -> tuple[str, str]:
-    """Run gates 1-3. Returns (principal_label, query_hash)."""
-    qhash = grants.query_hash(tool, payload)
+def _gate(ctx: Context, tool: str, arguments: dict) -> tuple[str, str]:
+    """Run gates 1-3. Returns (principal_label, query_hash).
+
+    `arguments` is the call in the TOOL's own parameter names, already
+    normalised (domains resolved, defaults filled). Two things depend on that
+    shape: the grant hashes it, and the PENDING_APPROVAL response echoes it
+    back so the caller can re-send the identical call after approval. Passing
+    a pre-joined string here would hash fine and leave the caller guessing.
+    """
+    qhash = grants.query_hash(tool, arguments)
 
     # Gate 1: sealed means sealed. Checked first so a sealed vault never even
     # reveals whether an identity would have been accepted.
@@ -121,7 +127,8 @@ def _gate(ctx: Context, tool: str, payload: str) -> tuple[str, str]:
             chat_id=ctx.chat_id,
             message_id=ctx.message_id,
             qhash=qhash,
-            query_preview=payload[:300],
+            query_preview=grants.canonical(arguments)[:300],
+            arguments=arguments,
         )
     except grants.PendingApproval as pending:
         audit.record_safe(
@@ -154,8 +161,21 @@ def search(
     lifecycles = documents.visible_lifecycles(
         include_superseded=include_superseded, include_stale=include_stale
     )
+    # Resolved domains rather than what was asked for, so `domains: null` and
+    # an explicit list of every vault domain are one request rather than two.
+    # The two booleans are hashed instead of the lifecycles they produce,
+    # because lifecycles is not a tool parameter and the caller could not
+    # re-send it.
     principal, qhash = _gate(
-        ctx, "search_vault", f"{query}|{','.join(resolved)}|{limit}|{','.join(lifecycles)}"
+        ctx,
+        "search_vault",
+        {
+            "query": query,
+            "domains": resolved,
+            "limit": limit,
+            "include_superseded": include_superseded,
+            "include_stale": include_stale,
+        },
     )
 
     conn = _conn()
@@ -213,7 +233,11 @@ def fetch_context(
     of a single approval, or off none at all.
     """
     ctx = ctx or Context()
-    principal, qhash = _gate(ctx, "fetch_context", f"{doc_id}|{chunk_index}|{before}|{after}")
+    principal, qhash = _gate(
+        ctx,
+        "fetch_context",
+        {"doc_id": doc_id, "chunk_index": chunk_index, "before": before, "after": after},
+    )
 
     conn = _conn()
     try:
@@ -255,11 +279,16 @@ def query_ledger(
             f"Unsupported group_by {group_by!r}. Allowed: {', '.join(sorted(LEDGER_GROUPS))}"
         )
 
-    payload = json.dumps(
-        {"start": start_date, "end": end_date, "group": group_by, "filters": filters},
-        sort_keys=True,
+    # Flat, and in the tool's own parameter names, so the whole thing can be
+    # handed back to the caller to re-send. `filters` is spread rather than
+    # nested for the same reason. canonical() drops the None values, so an
+    # omitted merchant and an explicit null merchant are one request.
+    principal, qhash = _gate(
+        ctx,
+        "query_ledger",
+        {"start_date": start_date, "end_date": end_date, "group_by": group_by,
+         "limit": limit, **filters},
     )
-    principal, qhash = _gate(ctx, "query_ledger", payload)
 
     where, params = ["1=1"], []
     if start_date:
