@@ -395,6 +395,63 @@ def cmd_restore(args) -> int:
     return 0
 
 
+def cmd_list(args) -> int:
+    """Every open-tier document, which is the inventory `status` only counts.
+
+    Open tier only, and it says so: vault documents live in the encrypted
+    database and are not readable from here at all. `make vault-list` is their
+    equivalent and needs an unlocked vault.
+    """
+    sql = (
+        "SELECT uri, domain, lifecycle, chunk_count, status, flagged_pages, "
+        "indexed_at, size_bytes FROM documents"
+    )
+    where, params = [], []
+    if args.domain:
+        where.append("domain=?")
+        params.append(args.domain)
+    if args.match:
+        where.append("uri LIKE ?")
+        params.append(f"%{args.match}%")
+    if not args.all:
+        where.append("lifecycle=?")
+        params.append(documents.ACTIVE)
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+
+    with state.reader() as conn:
+        rows = conn.execute(sql + " ORDER BY domain, uri", params).fetchall()
+
+    if args.json:
+        print(json.dumps([dict(r) for r in rows], indent=2, default=str))
+        return 0
+    if not rows:
+        print("No documents match." if (args.domain or args.match) else "Nothing indexed yet.")
+        return 0
+
+    width = min(max(len(r["uri"]) for r in rows), 62)
+    for row in rows:
+        uri = row["uri"] if len(row["uri"]) <= width else "…" + row["uri"][-(width - 1):]
+        # Only annotate what is not the ordinary case, so the exceptions are
+        # what catches the eye rather than a column of "active" on every line.
+        notes = []
+        if row["lifecycle"] != documents.ACTIVE:
+            notes.append(row["lifecycle"].upper())
+        if row["status"] != state.INDEXED:
+            notes.append(row["status"])
+        if row["flagged_pages"]:
+            notes.append(f"{row['flagged_pages']} undecided page(s)")
+        suffix = f"  [{', '.join(notes)}]" if notes else ""
+        print(f"  {uri:<{width}}  {row['domain']:<10} {row['chunk_count']:>4} chunks"
+              f"  {(row['indexed_at'] or '')[:10]}{suffix}")
+
+    total = sum(r["chunk_count"] for r in rows)
+    scope = "" if args.all else " active"
+    print(f"\n  {len(rows)}{scope} document(s), {total} chunks."
+          + ("" if args.all else "  Add --all to include superseded/stale/retracted."))
+    return 0
+
+
 def cmd_lifecycle(args) -> int:
     with state.writer() as conn:
         rows = conn.execute(
@@ -630,6 +687,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("uri")
     p.add_argument("--domain")
     p.set_defaults(func=cmd_restore)
+
+    p = sub.add_parser("list", help="every open-tier document")
+    p.add_argument("--domain")
+    p.add_argument("--match", help="substring of the uri")
+    p.add_argument("--all", action="store_true", help="include superseded/stale/retracted")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_list)
 
     p = sub.add_parser("lifecycle", help="documents that are not plainly active")
     p.add_argument("--json", action="store_true")

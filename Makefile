@@ -10,8 +10,8 @@ VAULTEXEC  = docker exec -it mcp-vault python -m app.vaultctl
 VAULTRUN   = docker exec mcp-vault python -m app.vaultctl
 
 .PHONY: up down logs build doctor warm-cache ingest reindex add query status \
-        rebuild-index review-quarantine supersede stale retract restore lifecycle \
-        unlock lock vault-status vault-query vault-lifecycle \
+        rebuild-index review-quarantine supersede stale retract restore lifecycle list \
+        unlock lock vault-status vault-query vault-list vault-lifecycle \
         approve vault-audit test
 
 ## --- stack ---------------------------------------------------------------
@@ -86,6 +86,10 @@ rebuild-index:
 ## statement does not retire February's, and auto-detecting would silently
 ## retire live financial records.
 
+list:                   ## Every open-tier document: make list [DOMAIN=d] [MATCH=x] [ALL=1]
+	$(WORKER) list $(if $(DOMAIN),--domain $(DOMAIN)) $(if $(MATCH),--match "$(MATCH)") \
+	  $(if $(ALL),--all) $(if $(JSON),--json)
+
 lifecycle:              ## Documents that are not plainly active
 	$(WORKER) lifecycle $(if $(JSON),--json)
 
@@ -123,6 +127,9 @@ lock:                   ## Seal the vault now and wipe the key
 
 vault-status:
 	@$(VAULTRUN) status
+
+vault-list:             ## Every vault document: make vault-list [DOMAIN=d] [ALL=1]
+	@$(VAULTRUN) list $(if $(DOMAIN),--domain $(DOMAIN)) $(if $(ALL),--all) $(if $(JSON),--json)
 
 vault-query:            ## Search the vault as a human: make vault-query Q="..."
 	@test -n "$(Q)" || { echo 'usage: make vault-query Q="..."'; exit 2; }
