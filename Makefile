@@ -43,9 +43,22 @@ reindex:                ## Force a full re-embed of one source: make reindex SOU
 	@test -n "$(SOURCE)" || { echo "usage: make reindex SOURCE=<source-id>"; exit 2; }
 	$(WORKER) reindex $(SOURCE)
 
+# The worker mounts ./data, LOCAL_DOCS_PATH and CLAUDE_PROJECTS_PATH and
+# nothing else, so a file anywhere else on the host -- ~/Documents, ~/Downloads,
+# a USB stick -- is simply not visible inside the container, and `add` failed
+# with a bare "is not a file" that pointed at the path rather than the mount.
+# So bind the file's own directory in for the life of the one command.
+# Read-only unless MOVE=1, which has to delete the original and therefore needs
+# write on the directory holding it.
+#
+# dirname/basename run in the shell, not via make's $(dir)/$(notdir), because
+# make's functions split on whitespace and would mangle any path with a space.
 add:                    ## File a document and ingest it: make add FILE=x.pdf DOMAIN=manuals
-	@test -n "$(FILE)" -a -n "$(DOMAIN)" || { echo "usage: make add FILE=<path> DOMAIN=<domain>"; exit 2; }
-	$(WORKER) add "$(FILE)" --domain $(DOMAIN) $(if $(MOVE),--move)
+	@test -n "$(FILE)" -a -n "$(DOMAIN)" || { echo "usage: make add FILE=<path> DOMAIN=<domain> [MOVE=1]"; exit 2; }
+	@test -f "$(FILE)" || { echo "make add: $(FILE): no such file on the host"; exit 2; }
+	@dir="$$(cd "$$(dirname "$(FILE)")" && pwd)"; base="$$(basename "$(FILE)")"; \
+	 $(COMPOSE) run --rm -v "$$dir:/import$(if $(MOVE),,:ro)" ingestion-worker \
+	   add "/import/$$base" --domain $(DOMAIN) $(if $(MOVE),--move)
 
 query:                  ## Search the open tier: make query Q="priming the pump"
 	@test -n "$(Q)" || { echo 'usage: make query Q="..."'; exit 2; }

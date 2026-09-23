@@ -345,6 +345,11 @@ def _sync_open_doc(conn, source: Source, path: Path, doc, run_id: str, result: S
         status_detail=None, mtime=doc.mtime, size_bytes=doc.size_bytes, last_seen_run=run_id,
         flagged_pages=len(doc.extra.get("flagged_pages") or ()),
     )
+    # Counted here rather than at extraction, so the run summary reports pages
+    # flagged in what this run actually INDEXED. Counting every document that
+    # was merely re-extracted makes an unchanged corpus report the same figure
+    # forever, which reads as new work and is not.
+    result.flagged_pages += len(doc.extra.get("flagged_pages") or ())
     result.docs_indexed += 1
 
 
@@ -405,7 +410,6 @@ def _write_vault_record(vconn, source: Source, record: dict, run_id: str, result
     """
     doc_id = record["doc_id"]
     outcome = record.get("outcome")
-    result.flagged_pages += record.get("flagged_pages", 0)
 
     if outcome == parse_worker.SKIPPED_RETRACTED:
         result.skipped_retracted += 1
@@ -431,6 +435,10 @@ def _write_vault_record(vconn, source: Source, record: dict, run_id: str, result
         result.failed += 1
         result.notes.append(f"{record['rel_uri']}: unknown parse outcome {outcome!r}")
         return
+
+    # Past every skip: this document really is being written, so its flagged
+    # pages are this run's work. See the matching note in _sync_open_doc.
+    result.flagged_pages += record.get("flagged_pages", 0)
 
     chunks = record.get("chunks") or []
     vault_store.upsert_document(
@@ -558,7 +566,6 @@ def sync_source(source: Source, run_id: str, *, force: bool = False, dry_run: bo
                 # CLAUDE.md under a tree collide into one document, each
                 # silently overwriting the last.
                 doc.rel_uri = rel_uri
-                result.flagged_pages += len(doc.extra.get("flagged_pages") or ())
                 if doc.status == OCR_REQUIRED:
                     result.ocr_required += 1
                     state.upsert_document(
