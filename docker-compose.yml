@@ -10,8 +10,17 @@ services:
     image: qdrant/qdrant@sha256:057ee3a8da769fe7310dd3537b4dc7583bf87a95ce8ac43c0af5a46bc580d1fc
     container_name: qdrant
     restart: unless-stopped
+    # Non-root. Third-party image, so this is set here rather than baked in.
+    # Verified: it serves reads and writes as 1000:1000 and the storage tree
+    # comes out owned by the host user instead of root.
+    user: "${RAG_UID:-1000}:${RAG_GID:-1000}"
     volumes:
       - ./data/qdrant:/qdrant/storage
+      # Snapshots were landing in the container's own layer, where a
+      # `compose up` that recreates the container silently discards them --
+      # which is awkward for the one feature whose entire point is surviving a
+      # move to different hardware. They belong in the rsync-able tree.
+      - ./data/qdrant-snapshots:/qdrant/snapshots
     environment:
       # Set once Qdrant is reachable off the local bridge. Unauthenticated is
       # survivable on a private bridge, not on a LAN.
@@ -40,8 +49,12 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.mcp
+      args:
+        RAG_UID: ${RAG_UID:-1000}
+        RAG_GID: ${RAG_GID:-1000}
     container_name: mcp-server
     restart: unless-stopped
+    user: "${RAG_UID:-1000}:${RAG_GID:-1000}"
     ports:
       - "127.0.0.1:${MCP_PORT:-8000}:8000"
     env_file:
@@ -110,7 +123,13 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.ingest
+      args:
+        RAG_UID: ${RAG_UID:-1000}
+        RAG_GID: ${RAG_GID:-1000}
     image: rag-ingestion-worker
+    # Must match the owner of ./data, or every write fails. This is also what
+    # stops `make add` leaving root-owned documents in the inbox.
+    user: "${RAG_UID:-1000}:${RAG_GID:-1000}"
     profiles: ["tools"]
     env_file:
       - .env

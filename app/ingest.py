@@ -126,6 +126,10 @@ def cmd_doctor(args) -> int:
         )
         if not status.get("identity_configured"):
             rows.append((WARN, "VAULT_JWT_SECRET", "unset; every model-initiated vault call will be denied"))
+    except control.ControlForbidden:
+        # Expected: this container is unprivileged and the socket belongs to
+        # the vault server's user. Not a warning -- nothing is wrong.
+        rows.append((OK, "vault", "not readable from here (by design); use `make vault-status`"))
     except Exception as exc:  # noqa: BLE001
         rows.append((WARN, "vault", f"control socket unavailable: {exc}"))
 
@@ -539,6 +543,8 @@ def cmd_status(args) -> int:
         from app.vault import control
 
         payload["vault"] = control.send({"action": "status"}).get("status")
+    except control.ControlForbidden:
+        payload["vault"] = {"unreadable_here": "run `make vault-status`"}
     except Exception as exc:  # noqa: BLE001
         payload["vault"] = {"error": str(exc)}
 
@@ -566,7 +572,10 @@ def cmd_status(args) -> int:
     if payload["quarantined_open"]:
         print(f"  !! {payload['quarantined_open']} quarantined document(s) awaiting review")
     vault = payload.get("vault") or {}
-    if "error" in vault:
+    if "unreadable_here" in vault:
+        print(f"vault: {vault['unreadable_here']}  (its control socket is restricted to "
+              "the vault container, which is the point)")
+    elif "error" in vault:
         print(f"vault: unavailable ({vault['error']})")
     else:
         print(f"vault: {'unlocked' if vault.get('unlocked') else 'SEALED'}  "

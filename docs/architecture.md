@@ -196,12 +196,23 @@ data/state/rag.db      SQLite WAL: runs, sources, documents, quarantine
 data/vault/vault.db    SQLCipher: rows, chunk text, vectors, ledger, audit
 data/vault/blobs/      AES-256-GCM originals
 data/qdrant/           open-tier index (derived; rebuildable)
+data/qdrant-snapshots/ snapshots -- outside data/qdrant so a restore into an
+                       empty storage dir does not have to step around them
 ```
+
+Everything above is owned by the **host user**, not root, because the
+containers that write it run unprivileged. See
+[Who each container runs as](#who-each-container-runs-as).
 
 Qdrant is a **derived index, not the source of truth**. Point IDs are
 `uuid5(POINT_NAMESPACE, "source_id|doc_id|chunk_index")` — deterministic and
 positional — so `make rebuild-index` reconstructs it exactly. Snapshots are an
 optimisation over that, not the recovery plan.
+
+Snapshots used to write into the container's own layer, where a `compose up`
+that recreated the container discarded them silently — awkward for the one
+feature whose purpose is surviving a move to other hardware. They are now bind
+mounted like everything else.
 
 Point IDs are deliberately **not** a hash of chunk content: that makes a
 document's stale chunks unenumerable, and collides whenever two documents share
@@ -226,6 +237,32 @@ process with them. See
 `vault.db` regardless of what the process does. The read-only mount on
 `data/state` is why reader-side helpers must degrade rather than migrate; see
 [development.md](development.md#migrations).
+
+### Who each container runs as
+
+| Container | Runs as | Why |
+|---|---|---|
+| `ingestion-worker` | **1000:1000** | Opens untrusted input, and writes bind-mounted `./data` — as root it left host files nobody could edit without sudo |
+| `mcp-server` | **1000:1000** | The HTTP surface the model talks to |
+| `qdrant` | **1000:1000** | Set in compose, since it is a third-party image |
+| `mcp-vault` | **root** | Not yet migrated — see below |
+
+`RAG_UID`/`RAG_GID` are build args and compose variables, defaulting to
+`1000:1000`. They must match the owner of `./data` or every write fails. On a
+host where you are not uid 1000, set them in `.env` and rebuild.
+
+**`mcp-vault` is still root, deliberately.** It has the strongest case of the
+four — it holds the key — so this is a migration problem, not a design one:
+`vault.salt`, `vault.verifier`, `vault.db` and `control.sock` on the live
+volume are root-owned `0600`, and changing their owner means touching the
+vault's secret material while it is in daily use. That is worth doing on its
+own, with the vault sealed and a backup taken.
+
+One visible consequence: `control.sock` is `0600` and owned by root, so the
+now-unprivileged worker cannot read it. `make status` and `make doctor`
+therefore cannot report vault state and say so, rather than printing a
+permission error that reads like a fault. `make vault-status` runs inside the
+vault container and is unaffected.
 
 `data/state/` and `data/vault/` are separate directories precisely so these
 mounts can differ. Mount directories, never files: Docker creates a *directory*

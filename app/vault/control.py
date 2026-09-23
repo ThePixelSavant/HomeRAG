@@ -168,6 +168,14 @@ class ControlUnavailable(RuntimeError):
     pass
 
 
+class ControlForbidden(ControlUnavailable):
+    """The socket is there; this process is not allowed to use it.
+
+    Its own type because it is the expected answer for every unprivileged
+    container, not a fault. Callers report it differently -- see cmd_doctor.
+    """
+
+
 def send(request: dict, timeout: float = 120.0) -> dict:
     path = socket_path()
     if not path.exists():
@@ -186,6 +194,17 @@ def send(request: dict, timeout: float = 120.0) -> dict:
         if not line:
             raise ControlUnavailable("Vault server closed the connection without replying.")
         return json.loads(line)
+    except PermissionError:
+        # The socket is 0600 and owned by the vault server's user. Every other
+        # container now runs unprivileged, so this is the expected answer from
+        # them rather than a fault -- and a bare "Permission denied" reads like
+        # a bug, which sends people looking in the wrong place.
+        raise ControlForbidden(
+            f"No permission on {path}. The vault control socket is restricted to the "
+            "vault server's own user, so unprivileged containers cannot read vault "
+            "state. This is expected. Use `make vault-status`, which runs inside "
+            "that container."
+        ) from None
     except (ConnectionError, socket.timeout) as exc:
         raise ControlUnavailable(f"Could not reach the vault server: {exc}") from None
     finally:
