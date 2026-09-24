@@ -39,11 +39,18 @@ Consequences you must preserve when changing [app/pipeline/sync.py](app/pipeline
 ```bash
 make build && make up      # llm-net must exist first: cd ~/Dev/LLM && docker compose up -d
 make doctor                # run this before trusting anything
-make ingest / query / status / add / reindex / rebuild-index
+make ingest / query / list / status / add / reindex / rebuild-index
 make lifecycle / supersede / stale / retract / restore
-make unlock / lock / vault-query / vault-lifecycle / approve / vault-audit
+make unlock / lock / vault-list / vault-query / vault-lifecycle / approve / vault-audit
 make test                  # pytest inside the worker image
 ```
+
+[scripts/rag](scripts/rag) forwards all of these from any directory
+(`rag list`, `rag add <file> <domain>`, `rag query "..."`). It is a script
+rather than an alias because an alias cannot resolve a relative path against
+the caller's cwd before make cd's into the repo, and does not exist in cron or
+systemd units. **Full reference: [docs/cli.md](docs/cli.md)** — update it when
+you add a target, along with the README command list.
 
 Local dev without Docker (`.venv` is gitignored):
 

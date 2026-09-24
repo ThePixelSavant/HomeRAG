@@ -94,6 +94,24 @@ asserting the two ends in one function call.
 
 ## Common tasks
 
+### Add a command
+
+1. Add the subcommand in [app/ingest.py](../app/ingest.py) (open tier) or
+   [app/vaultctl.py](../app/vaultctl.py) (vault), with its argparse entry.
+2. Add the Makefile target, and put it in `.PHONY`.
+3. **Document it in three places or it is effectively invisible**:
+   [docs/cli.md](cli.md) (the reference), the command list in
+   [`../README.md`](../README.md), and the terse list in
+   [`../CLAUDE.md`](../CLAUDE.md).
+4. [scripts/rag](../scripts/rag) needs no change — unknown commands pass
+   straight through to make. Add a positional shorthand there only if the
+   command takes a **path**, which has to be resolved against the caller's
+   directory, or if it will be used often enough that `NAME=value` grates.
+
+A target with no `##` comment is missing from `rag help` and from the
+Makefile's own listing, which is the usual reason a command exists but nobody
+knows about it.
+
 ### Add a domain
 
 1. Add it to `DOMAIN_TIERS` in [app/domains.py](../app/domains.py) with an

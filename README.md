@@ -7,7 +7,8 @@ Documents go in from the command line. You query them from Open WebUI. Anything
 sensitive is encrypted, sealed by default, and reachable by a model only with
 your explicit per-request approval.
 
-> Developer documentation is in **[docs/](docs/)** — design, security model,
+> Developer documentation is in **[docs/](docs/)** — the full
+> [command reference](docs/cli.md), design, security model,
 > [implementation status](docs/status.md) and the [roadmap](docs/roadmap.md).
 
 ```
@@ -57,56 +58,77 @@ make up
 make doctor              # everything should be green before you ingest
 ```
 
+Install the `rag` command so you can drive it from any directory:
+
+```bash
+ln -s ~/Dev/RAG/scripts/rag ~/.local/bin/rag     # needs ~/.local/bin on PATH
+```
+
 Drop a document in and search for it:
 
 ```bash
-cp ~/Downloads/pump-manual.pdf data/inbox/manuals/
-make ingest
-make query Q="how do I prime the pump"
+rag add ~/Downloads/pump-manual.pdf manuals
+rag query "how do I prime the pump"
+rag list
 ```
 
-Vault-tier domains need you present: `make ingest` prompts for the vault
+Every `rag` command is a Makefile target underneath, so the two forms are
+interchangeable — `rag list` and `make list` do the same thing, and `rag`
+simply works from outside the repo. Full reference: **[docs/cli.md](docs/cli.md)**.
+
+Vault-tier domains need you present: `rag ingest` prompts for the vault
 passphrase when the run includes one, because the worker derives the key
 itself rather than being handed one. A scheduled run has no terminal, so it
-queues those sources and says so -- the next interactive `make ingest` takes
+queues those sources and says so -- the next interactive `rag ingest` takes
 them. Open-tier sources ingest unattended as usual.
 
 `data/inbox/<domain>/` **is** the classification — the directory name is the
-domain. `make add FILE=x.pdf DOMAIN=manuals` does the same thing explicitly. An
+domain. `rag add x.pdf manuals` does the same thing explicitly. An
 unrecognised domain is an error rather than a default, because a typo that
 quietly became open-tier would publish a plaintext vector you cannot un-publish.
 
 ## Commands
 
+Shown as `rag`; every one also works as `make` from inside the repo.
+
 ```bash
-make doctor                      # preflight: reachability, paths, fingerprint, backlogs
-make ingest [SOURCE=id] [DOMAIN=d] [FORCE=1]
-make add FILE=x.pdf DOMAIN=manuals [MOVE=1]
-make query Q="..." [DOMAINS=a,b] [LIMIT=5] [SUPERSEDED=1] [STALE=1]
-make status [JSON=1]
-make reindex SOURCE=id
-make rebuild-index               # after changing EMBED_MODEL/EMBED_DIM
-make review-quarantine           # documents the sensitivity scan held back
+rag up / down / logs / build     # stack control (start ~/Dev/LLM first)
+rag doctor                       # preflight: reachability, paths, fingerprint, backlogs
+rag warm-cache                   # download and load the embedding models
 
-make lifecycle                   # documents that are not plainly active
-make supersede OLD=<uri> NEW=<uri>
-make stale URI=<uri> [AFTER=YYYY-MM-DD] [REASON="..."]
-make retract URI=<uri> REASON="..."
-make restore URI=<uri>           # then: make ingest
+rag add <file> <domain> [--move]
+rag ingest [SOURCE=id] [DOMAIN=d] [FORCE=1]
+rag reindex SOURCE=id
+rag list [--domain d] [--match x] [--all]
+rag query "..." [--limit N] [--domain d] [--stale] [--superseded] [--dense]
+rag status [JSON=1]
+rag rebuild-index YES=1          # after changing EMBED_MODEL/EMBED_DIM
+rag review-quarantine            # documents the sensitivity scan held back
 
-make unlock [TTL=900]            # prompts; key lives in memory only
-make lock
-make vault-status
-make vault-query Q="..."         # human path: no approval needed
-make vault-lifecycle URI=<uri> STATE=<state> [REASON="..."]
-make approve [CODE=123456]       # release one pending model request
-make vault-audit [N=50]
+rag lifecycle                    # documents that are not plainly active
+rag remove <uri> "<reason>"      # retract: deletes vectors, leaves a tombstone
+rag restore <uri>                # then: rag ingest
+rag supersede OLD=<uri> NEW=<uri>
+rag stale URI=<uri> [AFTER=YYYY-MM-DD] [REASON="..."]
 
-make test
+rag unlock [TTL=900]             # prompts; key lives in memory only
+rag lock
+rag vault-status
+rag vault-list [DOMAIN=d] [ALL=1]
+rag vault-query Q="..."          # human path: no approval needed
+rag vault-lifecycle URI=<uri> STATE=<state> [REASON="..."]
+rag approve [CODE=123456]        # release one pending model request
+rag vault-audit [N=50]
+
+rag test
+rag help                         # shorthands plus every Makefile target
 ```
 
-`make query` talks to Qdrant directly rather than through MCP, so it still works
-with the servers down.
+`rag query` talks to Qdrant directly rather than through MCP, so it still works
+with the servers down — which is what makes it useful for telling a retrieval
+problem apart from a transport one.
+
+Every flag and the reasoning behind each command: **[docs/cli.md](docs/cli.md)**.
 
 ## Quarantine
 
@@ -117,8 +139,8 @@ means **quarantine, not index** — the file moves to `data/quarantine/` and
 nothing is embedded until you decide:
 
 ```bash
-make review-quarantine
-make add FILE=data/quarantine/statement.pdf DOMAIN=financial
+rag review-quarantine
+rag add data/quarantine/statement.pdf financial
 ```
 
 Card numbers are Luhn-checked so ordinary order numbers don't flood the queue
@@ -128,26 +150,26 @@ prose — it is a backstop for misfiling, not a classifier.
 ## When a document stops being true
 
 Deleting the file is not enough — a copy elsewhere in the tree, or a restored
-backup, is re-indexed on the next `make ingest`. Four states cover the cases:
+backup, is re-indexed on the next `rag ingest`. Four states cover the cases:
 
 | State | Meaning | Retrieval |
 |---|---|---|
 | `active` | Default | Returned |
-| `superseded` | A *named* newer document replaced it | `SUPERSEDED=1` |
-| `stale` | Out of date, nothing replaced it | `STALE=1`, with a warning in the text |
+| `superseded` | A *named* newer document replaced it | `--superseded` |
+| `stale` | Out of date, nothing replaced it | `--stale`, with a warning in the text |
 | `retracted` | Wrong, or should not be here | Never — the vectors are deleted |
 
 ```bash
-make supersede OLD=topology-v1.md NEW=topology-v2.md
-make stale URI=rack-plan.md REASON="hardware decommissioned"
-make stale URI=firmware-notes.md AFTER=2027-01-01   # flips on that date
-make retract URI=bad-spec.md REASON="torque figure was wrong"
-make restore URI=bad-spec.md && make ingest         # undo
+rag supersede OLD=topology-v1.md NEW=topology-v2.md
+rag stale URI=rack-plan.md REASON="hardware decommissioned"
+rag stale URI=firmware-notes.md AFTER=2027-01-01    # flips on that date
+rag remove bad-spec.md "torque figure was wrong"
+rag restore bad-spec.md && rag ingest               # undo
 ```
 
 Retraction deletes the chunks and leaves a **tombstone** in the state database.
 That row is what keeps the document out of later runs, and it survives the
-disappearance sweep on purpose. `make restore` clears it; because the vectors
+disappearance sweep on purpose. `rag restore` clears it; because the vectors
 are gone, the document only comes back on the next ingest.
 
 Citations come back with every hit (`pump.pdf, page 21`, `CLAUDE.md, lines

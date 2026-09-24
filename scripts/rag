@@ -22,17 +22,23 @@ usage() {
     cat <<'EOF'
 rag -- RAG knowledge base, from any directory
 
-  rag add <file> <domain> [--move]   file a document and ingest it
-  rag query <text> [--limit N]       search the open tier
-  rag list [--domain d] [--all]      every indexed document
-  rag remove <uri> <reason>          retract: delete vectors, keep it out
-  rag <target> [VAR=value ...]       anything else in the Makefile
+  rag add <file> <domain> [--move]       file a document and ingest it
+  rag query <text> [--limit N]           search the open tier
+            [--domain d] [--stale]
+            [--superseded] [--dense]
+  rag list [--domain d] [--match x]      every indexed document
+           [--all]
+  rag remove <uri> "<reason>"            retract: delete vectors, keep it out
+  rag restore <uri>                      clear a flag (then: rag ingest)
+  rag <target> [VAR=value ...]           anything else in the Makefile
 
 Common targets: status, doctor, ingest, lifecycle, unlock, vault-list,
-vault-query, restore, supersede, stale. `rag help` lists them all.
+vault-query, vault-audit, approve, supersede, stale, rebuild-index.
 
 The domain on `add` decides whether a document is stored in the clear or in
 the encrypted vault, so it is always required and never guessed.
+
+Full reference: docs/cli.md
 EOF
 }
 
@@ -86,6 +92,7 @@ query|q)
         --domain|--domains) domain="$2"; shift 2 ;;
         --stale) extra+=(STALE=1); shift ;;
         --superseded) extra+=(SUPERSEDED=1); shift ;;
+        --dense) extra+=(ARGS=--dense); shift ;;
         *) echo "rag query: unexpected argument '$1'" >&2; exit 2 ;;
         esac
     done
