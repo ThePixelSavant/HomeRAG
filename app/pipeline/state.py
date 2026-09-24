@@ -1,7 +1,8 @@
 """Open-tier operational state.
 
 One SQLite file, one writer (the ingestion worker) and N readers (the MCP
-servers) -- precisely what WAL is designed for.
+servers). It uses the default rollback journal, not WAL, because the readers
+mount data/state read-only -- see `_connect`.
 
 This owns only what Qdrant cannot answer cheaply: run history, per-source
 status, per-document content hashes, and the quarantine queue. Chunk counts are
@@ -12,6 +13,7 @@ lies about what is actually retrievable.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -20,6 +22,8 @@ from pathlib import Path
 
 from app import documents
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -141,11 +145,15 @@ def _connect(path: Path, *, read_only: bool) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), timeout=10.0)
     conn.row_factory = sqlite3.Row
-    # WAL needs a real local filesystem for its shared-memory file. A Docker
-    # bind mount on ext4 qualifies; NFS would not.
-    conn.execute("PRAGMA journal_mode=WAL")
+    # Rollback journal, NOT WAL. A WAL file can only be opened read-only if its
+    # -wal/-shm files exist or can be created, and the worker deletes them when
+    # it exits -- after which the MCP servers' `:ro` mount cannot recreate them
+    # and every state read fails. With one occasional writer, WAL's concurrent
+    # reads buy nothing a 5s busy timeout doesn't. Set on every open because the
+    # mode is persisted in the file: this is what converts an old WAL database.
+    # synchronous stays at its default, FULL: NORMAL is only safe under WAL.
+    conn.execute("PRAGMA journal_mode=DELETE")
     conn.execute("PRAGMA busy_timeout=5000")
-    conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
@@ -187,10 +195,19 @@ def reader(path: Path | None = None):
     server that reports it.
     """
     target = path or settings.state_db_path
-    try:
-        conn = _connect(target, read_only=True) if target.exists() else None
-    except sqlite3.OperationalError:
-        conn = None
+    conn = None
+    if target.exists():
+        try:
+            conn = _connect(target, read_only=True)
+            # sqlite3.connect() opens lazily; a file that cannot actually be
+            # read (not a database, or a hot journal left by a crashed writer
+            # that a read-only handle cannot roll back) only fails here.
+            conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+        except sqlite3.DatabaseError:
+            logger.warning("state db %s is unreadable; reporting it as empty", target)
+            if conn is not None:
+                conn.close()
+            conn = None
 
     if conn is None:
         conn = sqlite3.connect(":memory:")

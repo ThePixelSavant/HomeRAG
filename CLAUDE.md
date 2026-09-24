@@ -247,6 +247,7 @@ frontier presets is configuration, and the approval prompt is the backstop.
 | Glob matching | `fnmatch("a.md", "**/*")` is **False** — `**/` needs a literal slash. `_matches` handles the prefix; an empty `include` means everything. |
 | Bind-mounted files | Docker creates a *directory* when a bind-mounted file is missing. Mount directories: `data/state/` and `data/vault/` are separate so `mcp-server` gets state read-only and no vault mount at all. |
 | Fingerprint guard | Dimension alone cannot detect a model swap — bge-base, nomic-v1.5, gte-base and arctic-m are all 768-dim. |
+| `rag.db` journal mode | **Not WAL.** A WAL file opens read-only only if its `-wal`/`-shm` exist or can be created; the worker deletes them on exit and the readers' `:ro` mount can't recreate them, so every MCP state read failed. `_connect` sets `DELETE` on each write open, which also converts an old file. |
 
 ## Storage layout
 
@@ -256,7 +257,7 @@ Everything under `data/` as bind mounts, so the stack is one rsync-able tree
 ```
 data/inbox/<domain>/   the drop folder; directory name IS the domain
 data/quarantine/       held back by the sensitivity scan
-data/state/rag.db      SQLite WAL: runs, sources, documents, quarantine
+data/state/rag.db      SQLite (rollback journal): runs, sources, documents, quarantine
 data/vault/vault.db    SQLCipher: rows, chunk text, vectors, ledger, audit
 data/vault/blobs/      AES-256-GCM originals
 data/qdrant/           open-tier index (derived; rebuildable)

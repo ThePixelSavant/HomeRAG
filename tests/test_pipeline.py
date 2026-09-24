@@ -408,6 +408,63 @@ def test_undecidable_pages_are_flagged_not_guessed():
     assert _classify_page(page)[0] == AMBIGUOUS
 
 
+# --- state database --------------------------------------------------------
+
+
+@pytest.fixture
+def read_only_state_dir(tmp_path):
+    """data/state as the MCP servers see it: a directory they cannot write."""
+    directory = tmp_path / "state"
+    directory.mkdir()
+    yield directory
+    directory.chmod(0o755)
+
+
+def test_reader_works_on_a_read_only_mount(read_only_state_dir):
+    """The writer's file must stay readable after it exits.
+
+    A WAL-mode file cannot be opened read-only once its -wal/-shm files are
+    gone and the directory refuses to recreate them, which is exactly the
+    MCP servers' `:ro` mount after the one-shot worker exits.
+    """
+    from app.pipeline import state
+
+    path = read_only_state_dir / "rag.db"
+    with state.writer(path) as conn:
+        conn.execute(
+            "INSERT INTO sources (source_id, domain, source_type) VALUES ('inbox:notes', 'notes', 'inbox')"
+        )
+    read_only_state_dir.chmod(0o555)
+
+    with state.reader(path) as conn:
+        assert [r["source_id"] for r in state.all_sources(conn)] == ["inbox:notes"]
+
+
+def test_writer_converts_an_existing_wal_database(tmp_path):
+    import sqlite3
+
+    from app.pipeline import state
+
+    path = tmp_path / "rag.db"
+    legacy = sqlite3.connect(path)
+    legacy.execute("PRAGMA journal_mode=WAL")
+    legacy.close()
+
+    with state.writer(path) as conn:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+
+
+def test_reader_degrades_when_the_file_cannot_be_read(read_only_state_dir):
+    from app.pipeline import state
+
+    path = read_only_state_dir / "rag.db"
+    path.write_bytes(b"not a database")
+    read_only_state_dir.chmod(0o555)
+
+    with state.reader(path) as conn:
+        assert state.all_sources(conn) == []
+
+
 # --- document lifecycle ----------------------------------------------------
 
 

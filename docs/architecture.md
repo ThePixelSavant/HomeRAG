@@ -192,7 +192,7 @@ the stack to new hardware unnecessarily painful.
 ```
 data/inbox/<domain>/   the drop folder; directory name IS the domain
 data/quarantine/       held back by the sensitivity scan
-data/state/rag.db      SQLite WAL: runs, sources, documents, quarantine
+data/state/rag.db      SQLite (rollback journal): runs, sources, documents, quarantine
 data/vault/vault.db    SQLCipher: rows, chunk text, vectors, ledger, audit
 data/vault/blobs/      AES-256-GCM originals
 data/qdrant/           open-tier index (derived; rebuildable)
