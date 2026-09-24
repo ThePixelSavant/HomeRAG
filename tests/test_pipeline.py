@@ -325,6 +325,48 @@ def test_citations_name_the_first_page_of_a_range():
     assert format_citation("receipt.jpg", {}) == "receipt.jpg"
 
 
+def _full_hit(**overrides):
+    hit = {
+        "score": 0.571428, "content": "MIDI channel: 1 (default)", "title": "TB-03",
+        "uri": "tb03.pdf", "domain": "manuals", "source_id": "inbox:manuals",
+        "doc_id": "d1", "chunk_index": 4, "heading_path": [], "indexed_at": "2026-09-24",
+        "locator": {"page": 3, "pages": [3]}, "citation": "tb03.pdf, page 3",
+        "lifecycle": "active", "superseded_by": None,
+    }
+    return {**hit, **overrides}
+
+
+def test_model_view_keeps_what_the_model_uses():
+    from app.documents import for_model
+
+    assert for_model(_full_hit()) == {
+        "content": "MIDI channel: 1 (default)",
+        "citation": "tb03.pdf, page 3",
+        "doc_id": "d1",
+        "chunk_index": 4,
+        "score": 0.571,
+    }
+
+
+def test_model_view_reports_lifecycle_only_when_it_is_news():
+    from app.documents import for_model
+
+    old = for_model(_full_hit(lifecycle="superseded", superseded_by="tb03-v2.pdf"))
+    assert old["lifecycle"] == "superseded" and old["superseded_by"] == "tb03-v2.pdf"
+    # The stale banner rides in the content, which is passed through untouched.
+    stale = for_model(_full_hit(lifecycle="stale", content="[STALE: old]\nbody"))
+    assert stale["lifecycle"] == "stale" and stale["content"].startswith("[STALE")
+
+
+def test_model_view_passes_errors_and_context_rows_through():
+    from app.documents import for_model
+
+    error = {"error": "Unknown domain 'manual'.", "valid_domains": ["manuals"]}
+    assert for_model(error) is error
+    # fetch_context rows have no score.
+    assert "score" not in for_model(_full_hit(score=None))
+
+
 # --- PDF page layout classification ----------------------------------------
 
 

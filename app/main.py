@@ -14,6 +14,7 @@ import logging
 
 from mcp.server.mcpserver import MCPServer
 
+from app import documents
 from app.config import settings
 from app.domains import DOMAIN_TIERS, Tier, UnknownDomainError, domains_in, tier_of
 from app.pipeline import qdrant_store, state
@@ -28,7 +29,7 @@ mcp = MCPServer("rag-docs")
 @mcp.tool()
 def search_docs(
     query: str,
-    limit: int = 5,
+    limit: int = 3,
     domains: list[str] | None = None,
     source_id: str | None = None,
     hybrid: bool = True,
@@ -52,13 +53,15 @@ def search_docs(
 
     Args:
         query: Natural language question, or an exact term like a part number.
-        limit: Maximum results (default 5).
+        limit: Maximum results (default 3). Raise it when the first results
+            are near misses rather than rephrasing the same query.
         domains: Restrict to these domains. Defaults to every open-tier domain.
         source_id: Restrict to a single configured source.
         hybrid: Fuse semantic and keyword matching (default). Exact identifiers
             rely on the keyword half, so leave this on unless comparing.
         include_superseded: Also return documents a newer version replaced.
-            Off by default; `superseded_by` on a result names the replacement.
+            Off by default; such a result carries `lifecycle` and
+            `superseded_by`, which names the replacement.
         include_stale: Also return documents marked out of date. Off by default.
             Their content arrives prefixed with a `[STALE ...]` warning, which
             you must pass on rather than strip.
@@ -94,7 +97,7 @@ def search_docs(
     else:
         selected = open_domains
 
-    return qdrant_store.search(
+    hits = qdrant_store.search(
         query,
         limit=limit,
         domains=selected,
@@ -103,6 +106,7 @@ def search_docs(
         include_superseded=include_superseded,
         include_stale=include_stale,
     )
+    return [documents.for_model(h) for h in hits]
 
 
 @mcp.tool()
@@ -135,7 +139,8 @@ def fetch_context(doc_id: str, chunk_index: int, before: int = 1, after: int = 1
                 "hint": "Use the vault tool server; it needs an unlocked vault and an approval.",
             }
         ]
-    return qdrant_store.fetch_context(doc_id, chunk_index, before=before, after=after)
+    rows = qdrant_store.fetch_context(doc_id, chunk_index, before=before, after=after)
+    return [documents.for_model(r) for r in rows]
 
 
 @mcp.tool()

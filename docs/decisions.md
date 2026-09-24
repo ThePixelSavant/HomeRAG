@@ -508,3 +508,30 @@ caller nothing about how to reconstruct the call.
 
 **Revisit if:** approval moves into the chat itself, where the approved call
 could be replayed by the server rather than by the model.
+
+## ADR-023: The model gets a trimmed result row
+
+**Chosen:** Both MCP servers pass every row through `documents.for_model`,
+which keeps `content`, `citation`, `doc_id`, `chunk_index` and `score`, and adds
+`lifecycle`/`superseded_by` only when the document is not `active`.
+`search_docs` defaults to 3 results.
+
+**Rejected:** Sending the full row, as `make query` prints it.
+
+On the CPU-only llama-server a question's latency is dominated by prefilling
+the tool result, at 60–100 tokens/s. Measured on a TB-03 manual query, the
+five-hit result was 3,331 tokens, of which 1,247 were metadata: `locator`,
+`uri` and `title` restate the citation, `heading_path` is already the first
+line of a markdown chunk, and `source_id`, `indexed_at` and `domain` are
+bookkeeping the model has no use for. That was ~17s of a ~75s answer. Two of
+the five hits were from a different device's manual, so the default limit
+drops to 3; the docstring tells the model to raise it rather than rephrase.
+
+`search_vault` keeps its default of 5. There a follow-up search costs the owner
+another approval at a terminal, which is dearer than the prefill.
+
+The trim happens at the MCP boundary, not in `_hit`, so the CLI and the tests
+still see the full row.
+
+**Revisit if:** inference moves to a GPU, where prefill is cheap enough that
+recall is worth more than the tokens.

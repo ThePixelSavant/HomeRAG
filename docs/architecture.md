@@ -59,7 +59,7 @@ deletes, retracts or unlocks.
 | Module | Role |
 |---|---|
 | [app/domains.py](../app/domains.py) | The domain→tier map. Also the frozen `POINT_NAMESPACE` and `SCHEMA_VERSION`. |
-| [app/documents.py](../app/documents.py) | Lifecycle states and citation formatting. Dependency-free — both tiers need it and neither may import the other. |
+| [app/documents.py](../app/documents.py) | Lifecycle states, citation formatting, and the trimmed result row the MCP servers send a model (`for_model`). Dependency-free — both tiers need it and neither may import the other. |
 | [app/config.py](../app/config.py) | Settings from the environment. |
 | [app/sources.py](../app/sources.py) | The source manifest plus implicit inbox sources. |
 | [app/pipeline/embedder.py](../app/pipeline/embedder.py) | **The only module that imports fastembed.** |

@@ -137,6 +137,13 @@ sources need no second rebuild. `search()` returns it plus a prebuilt
 specs verbatim and cite — ugly-but-checkable beats fluent-but-wrong for a
 torque figure.
 
+The MCP servers do **not** send that full row: `documents.for_model` cuts it
+to content, citation, `doc_id`/`chunk_index` and score, plus lifecycle only
+when it isn't `active`. Every tool-result token is prefilled on a CPU-only
+llama-server at ~70 tokens/s, and the dropped fields were 37% of a search
+result. `search_docs` defaults to 3 hits; `search_vault` keeps 5 because a
+follow-up costs the owner another approval. The CLI still prints everything.
+
 ### Document lifecycle
 
 `documents.lifecycle` is **separate from `documents.status`**. `status` is

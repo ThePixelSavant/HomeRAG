@@ -1,4 +1,5 @@
-"""Document-level concepts shared by both tiers: lifecycle and citations.
+"""Document-level concepts shared by both tiers: lifecycle, citations, and the
+shape of a result row as a model sees it.
 
 Deliberately dependency-free, like app/domains.py. The vault image does not
 install qdrant-client and the open MCP server cannot import app/vault/, so
@@ -101,3 +102,35 @@ def format_citation(uri: str, locator: dict | None) -> str:
         return f"{uri}#{anchor}"
 
     return uri
+
+
+def for_model(hit: dict) -> dict:
+    """The fields of a result row that are worth a model's context window.
+
+    Every token of a tool result is prefilled before the model writes a word,
+    and on the CPU-only llama-server that is ~70 tokens/s. The full row spent
+    ~250 tokens per hit on metadata the model cannot use: `locator`, `uri` and
+    `title` restate the citation, `heading_path` is already the first line of a
+    markdown chunk's content, and the ids and timestamps are bookkeeping.
+
+    Kept: the content, the citation to quote, and the `doc_id`/`chunk_index`
+    pair `fetch_context` needs. Lifecycle is sent only when it is news -- a
+    default search returns nothing but `active`. The CLI keeps the full row.
+
+    Rows that are not hits (an `error` from a rejected request) pass through.
+    """
+    if "content" not in hit:
+        return hit
+    out = {
+        "content": hit["content"],
+        "citation": hit.get("citation", ""),
+        "doc_id": hit.get("doc_id", ""),
+        "chunk_index": hit.get("chunk_index"),
+    }
+    if hit.get("score") is not None:
+        out["score"] = round(hit["score"], 3)
+    if hit.get("lifecycle", ACTIVE) != ACTIVE:
+        out["lifecycle"] = hit["lifecycle"]
+    if hit.get("superseded_by"):
+        out["superseded_by"] = hit["superseded_by"]
+    return out
