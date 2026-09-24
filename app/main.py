@@ -18,7 +18,7 @@ from app import documents
 from app.config import settings
 from app.domains import DOMAIN_TIERS, Tier, UnknownDomainError, domains_in, tier_of
 from app.pipeline import qdrant_store, state
-from app.sources import SourceConfigError, all_sources
+from app.sources import Source, SourceConfigError, all_sources, load_sources
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -147,15 +147,29 @@ def fetch_context(doc_id: str, chunk_index: int, before: int = 1, after: int = 1
 def list_sources() -> list[dict]:
     """List configured sources with their domain, tier and last sync status."""
     try:
-        configured = {s.id: s for s in all_sources()}
+        sources = {s.id: s for s in all_sources()}
+        disabled = {s.id for s in load_sources() if not s.enabled}
     except SourceConfigError as exc:
         return [{"error": str(exc)}]
 
     with state.reader() as conn:
         recorded = {r["source_id"]: dict(r) for r in state.all_sources(conn)}
 
+    # This server has no inbox mount, so the inbox sources -- one per
+    # directory -- cannot be enumerated here, and they are where most documents
+    # live. The worker records every source it syncs, so fill them in from
+    # that. A source disabled in sources.yaml stays hidden.
+    for source_id, row in recorded.items():
+        if source_id in sources or source_id in disabled:
+            continue
+        try:
+            tier_of(row["domain"])
+        except UnknownDomainError:
+            continue
+        sources[source_id] = Source(id=source_id, type=row["source_type"], domain=row["domain"])
+
     out = []
-    for source_id, source in configured.items():
+    for source_id, source in sources.items():
         row = recorded.get(source_id, {})
         entry = {
             "source_id": source_id,

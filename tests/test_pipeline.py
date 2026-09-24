@@ -465,6 +465,35 @@ def test_reader_degrades_when_the_file_cannot_be_read(read_only_state_dir):
         assert state.all_sources(conn) == []
 
 
+def test_list_sources_includes_inbox_sources_it_cannot_see(tmp_path, monkeypatch):
+    """mcp-server has no inbox mount, so inbox sources come from the state db."""
+    from app import main
+    from app.pipeline import qdrant_store, state
+
+    monkeypatch.setattr(settings, "state_db_path", tmp_path / "rag.db")
+    monkeypatch.setattr(settings, "inbox_path", tmp_path / "not-mounted")
+    monkeypatch.setattr(settings, "sources_file", tmp_path / "sources.yaml")
+    monkeypatch.setattr(qdrant_store, "count_points", lambda *a, **kw: 7)
+    (tmp_path / "sources.yaml").write_text(
+        "sources:\n"
+        "  - {id: dev-notes, type: local, domain: notes, path: /tmp}\n"
+        "  - {id: old-notes, type: local, domain: notes, path: /tmp, enabled: false}\n"
+    )
+    with state.writer() as conn:
+        for source_id, domain, kind in [
+            ("inbox:manuals", "manuals", "inbox"),
+            ("dev-notes", "notes", "local"),
+            ("old-notes", "notes", "local"),
+        ]:
+            state.record_source_start(conn, source_id, domain, kind, "run-1")
+
+    listed = {s["source_id"]: s for s in main.list_sources()}
+    assert sorted(listed) == ["dev-notes", "inbox:manuals"]
+    assert listed["inbox:manuals"]["domain"] == "manuals"
+    assert listed["inbox:manuals"]["tier"] == "open"
+    assert listed["inbox:manuals"]["chunks"] == 7
+
+
 # --- document lifecycle ----------------------------------------------------
 
 
