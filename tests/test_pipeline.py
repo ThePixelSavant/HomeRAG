@@ -358,6 +358,22 @@ def test_model_view_reports_lifecycle_only_when_it_is_news():
     assert stale["lifecycle"] == "stale" and stale["content"].startswith("[STALE")
 
 
+def test_fetch_context_caps_the_window(tmp_path, monkeypatch):
+    from app import main
+    from app.pipeline import qdrant_store
+
+    monkeypatch.setattr(settings, "state_db_path", tmp_path / "absent.db")
+    asked = {}
+    monkeypatch.setattr(
+        qdrant_store, "fetch_context", lambda doc_id, idx, **kw: asked.update(kw) or []
+    )
+
+    main.fetch_context("d1", 11, before=5, after=5)
+    assert asked == {"before": 2, "after": 2}
+    main.fetch_context("d1", 11)
+    assert asked == {"before": 1, "after": 1}
+
+
 def test_model_view_passes_errors_and_context_rows_through():
     from app.documents import for_model
 

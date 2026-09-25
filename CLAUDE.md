@@ -142,7 +142,8 @@ to content, citation, `doc_id`/`chunk_index` and score, plus lifecycle only
 when it isn't `active`. Every tool-result token is prefilled on a CPU-only
 llama-server at ~70 tokens/s, and the dropped fields were 37% of a search
 result. `search_docs` defaults to 3 hits; `search_vault` keeps 5 because a
-follow-up costs the owner another approval. The CLI still prints everything.
+follow-up costs the owner another approval. The open `fetch_context` caps its
+window at 2 either side. The CLI still prints everything.
 
 ### Document lifecycle
 

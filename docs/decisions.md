@@ -530,6 +530,12 @@ drops to 3; the docstring tells the model to raise it rather than rephrase.
 `search_vault` keeps its default of 5. There a follow-up search costs the owner
 another approval at a terminal, which is dearer than the prefill.
 
+`fetch_context` is capped at 2 chunks either side. Asked an SH-01A question,
+the model requested 5 either side; prefilling those 11 chunks (5,165 tokens)
+took 85s of a 3.5-minute answer, and the detail was in the adjacent chunk. It
+can call again from the last chunk returned. The vault's `fetch_context` is
+not capped: each call there is approved by a human who sees the arguments.
+
 The trim happens at the MCP boundary, not in `_hit`, so the CLI and the tests
 still see the full row.
 

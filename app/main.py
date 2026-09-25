@@ -25,6 +25,9 @@ logger = logging.getLogger(__name__)
 
 mcp = MCPServer("rag-docs")
 
+# Per side. Every chunk returned is prefilled before the model writes a word.
+MAX_CONTEXT_CHUNKS = 2
+
 
 @mcp.tool()
 def search_docs(
@@ -49,7 +52,9 @@ def search_docs(
     the citation is what lets the reader check it.
 
     If a result looks like it stops mid-procedure, call `fetch_context` on its
-    `doc_id` and `chunk_index` rather than guessing the rest.
+    `doc_id` and `chunk_index` rather than guessing the rest. Do the same when
+    the results already come from the right document but miss the detail:
+    searching again with different words usually returns the same chunks.
 
     Args:
         query: Natural language question, or an exact term like a part number.
@@ -124,9 +129,16 @@ def fetch_context(doc_id: str, chunk_index: int, before: int = 1, after: int = 1
     Args:
         doc_id: From a `search_docs` result.
         chunk_index: From the same result.
-        before: Chunks to include before it (default 1).
-        after: Chunks to include after it (default 1).
+        before: Chunks to include before it (default 1, at most 2).
+        after: Chunks to include after it (default 1, at most 2). Call again
+            from the last chunk returned if you need to read further.
     """
+    # Capped because the model's instinct is to ask for plenty: an SH-01A
+    # question asked for 5 either side, and prefilling those 11 chunks took
+    # 85s of a 3.5-minute answer. The detail sat in the adjacent chunk.
+    before = min(before, MAX_CONTEXT_CHUNKS)
+    after = min(after, MAX_CONTEXT_CHUNKS)
+
     # The real guarantee is structural: Qdrant holds no vault points, so a
     # vault doc_id finds nothing here whatever this check does. The check is
     # here to say so out loud rather than return a confusing empty list.
