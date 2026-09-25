@@ -14,21 +14,25 @@ import logging
 
 from mcp.server.mcpserver import MCPServer
 
+from app import documents
 from app.config import settings
 from app.domains import DOMAIN_TIERS, Tier, UnknownDomainError, domains_in, tier_of
 from app.pipeline import qdrant_store, state
-from app.sources import SourceConfigError, all_sources
+from app.sources import Source, SourceConfigError, all_sources, load_sources
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 mcp = MCPServer("rag-docs")
 
+# Per side. Every chunk returned is prefilled before the model writes a word.
+MAX_CONTEXT_CHUNKS = 2
+
 
 @mcp.tool()
 def search_docs(
     query: str,
-    limit: int = 5,
+    limit: int = 3,
     domains: list[str] | None = None,
     source_id: str | None = None,
     hybrid: bool = True,
@@ -48,17 +52,21 @@ def search_docs(
     the citation is what lets the reader check it.
 
     If a result looks like it stops mid-procedure, call `fetch_context` on its
-    `doc_id` and `chunk_index` rather than guessing the rest.
+    `doc_id` and `chunk_index` rather than guessing the rest. Do the same when
+    the results already come from the right document but miss the detail:
+    searching again with different words usually returns the same chunks.
 
     Args:
         query: Natural language question, or an exact term like a part number.
-        limit: Maximum results (default 5).
+        limit: Maximum results (default 3). Raise it when the first results
+            are near misses rather than rephrasing the same query.
         domains: Restrict to these domains. Defaults to every open-tier domain.
         source_id: Restrict to a single configured source.
         hybrid: Fuse semantic and keyword matching (default). Exact identifiers
             rely on the keyword half, so leave this on unless comparing.
         include_superseded: Also return documents a newer version replaced.
-            Off by default; `superseded_by` on a result names the replacement.
+            Off by default; such a result carries `lifecycle` and
+            `superseded_by`, which names the replacement.
         include_stale: Also return documents marked out of date. Off by default.
             Their content arrives prefixed with a `[STALE ...]` warning, which
             you must pass on rather than strip.
@@ -94,7 +102,7 @@ def search_docs(
     else:
         selected = open_domains
 
-    return qdrant_store.search(
+    hits = qdrant_store.search(
         query,
         limit=limit,
         domains=selected,
@@ -103,6 +111,7 @@ def search_docs(
         include_superseded=include_superseded,
         include_stale=include_stale,
     )
+    return [documents.for_model(h) for h in hits]
 
 
 @mcp.tool()
@@ -120,9 +129,16 @@ def fetch_context(doc_id: str, chunk_index: int, before: int = 1, after: int = 1
     Args:
         doc_id: From a `search_docs` result.
         chunk_index: From the same result.
-        before: Chunks to include before it (default 1).
-        after: Chunks to include after it (default 1).
+        before: Chunks to include before it (default 1, at most 2).
+        after: Chunks to include after it (default 1, at most 2). Call again
+            from the last chunk returned if you need to read further.
     """
+    # Capped because the model's instinct is to ask for plenty: an SH-01A
+    # question asked for 5 either side, and prefilling those 11 chunks took
+    # 85s of a 3.5-minute answer. The detail sat in the adjacent chunk.
+    before = min(before, MAX_CONTEXT_CHUNKS)
+    after = min(after, MAX_CONTEXT_CHUNKS)
+
     # The real guarantee is structural: Qdrant holds no vault points, so a
     # vault doc_id finds nothing here whatever this check does. The check is
     # here to say so out loud rather than return a confusing empty list.
@@ -135,22 +151,37 @@ def fetch_context(doc_id: str, chunk_index: int, before: int = 1, after: int = 1
                 "hint": "Use the vault tool server; it needs an unlocked vault and an approval.",
             }
         ]
-    return qdrant_store.fetch_context(doc_id, chunk_index, before=before, after=after)
+    rows = qdrant_store.fetch_context(doc_id, chunk_index, before=before, after=after)
+    return [documents.for_model(r) for r in rows]
 
 
 @mcp.tool()
 def list_sources() -> list[dict]:
     """List configured sources with their domain, tier and last sync status."""
     try:
-        configured = {s.id: s for s in all_sources()}
+        sources = {s.id: s for s in all_sources()}
+        disabled = {s.id for s in load_sources() if not s.enabled}
     except SourceConfigError as exc:
         return [{"error": str(exc)}]
 
     with state.reader() as conn:
         recorded = {r["source_id"]: dict(r) for r in state.all_sources(conn)}
 
+    # This server has no inbox mount, so the inbox sources -- one per
+    # directory -- cannot be enumerated here, and they are where most documents
+    # live. The worker records every source it syncs, so fill them in from
+    # that. A source disabled in sources.yaml stays hidden.
+    for source_id, row in recorded.items():
+        if source_id in sources or source_id in disabled:
+            continue
+        try:
+            tier_of(row["domain"])
+        except UnknownDomainError:
+            continue
+        sources[source_id] = Source(id=source_id, type=row["source_type"], domain=row["domain"])
+
     out = []
-    for source_id, source in configured.items():
+    for source_id, source in sources.items():
         row = recorded.get(source_id, {})
         entry = {
             "source_id": source_id,
@@ -198,10 +229,10 @@ def get_index_status() -> dict:
         # Surfaced rather than hidden: an index that silently omits scanned
         # PDFs looks complete when it is not.
         "ocr_required_count": by_status.get(state.OCR_REQUIRED, 0),
-        # Pages whose layout could not be decided from whitespace alone. Text
-        # from them is in reading order, which is right for prose and wrong for
-        # a table, so treat figures quoted from these documents with care.
-        "undecided_layout_pages": sum(r["flagged_pages"] for r in flagged),
+        # Pages an extractor flagged as possibly misread. Treat figures quoted
+        # from these documents with care. The PDF extractor no longer flags
+        # any (see extract/pdf.py); the count stays for whatever does next.
+        "pages_flagged_for_review": sum(r["flagged_pages"] for r in flagged),
         "quarantined_count": quarantined,
         "vault_domains": domains_in(Tier.VAULT),
         "note": "Vault domains are served by the separate vault tool server.",

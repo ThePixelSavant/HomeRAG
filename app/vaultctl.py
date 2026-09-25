@@ -88,6 +88,50 @@ def cmd_ledger(args) -> int:
     return 0
 
 
+def cmd_list(args) -> int:
+    """Every vault document. Needs an unlocked vault: the inventory is inside
+    the encrypted database, so listing it is reading it."""
+    from app import documents
+    from app.vault import service
+    from app.vault.keyagent import AGENT
+
+    if not AGENT.is_unlocked():
+        raise SystemExit("Vault is sealed. Run `make unlock` at a terminal first.")
+
+    conn = AGENT.connect()
+    try:
+        sql = ("SELECT uri, domain, lifecycle, chunk_count, status, indexed_at "
+               "FROM documents")
+        where, params = [], []
+        if args.domain:
+            where.append("domain=?")
+            params.append(args.domain)
+        if not args.all:
+            where.append("lifecycle=?")
+            params.append(documents.ACTIVE)
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        rows = conn.execute(sql + " ORDER BY domain, uri", params).fetchall()
+    finally:
+        conn.close()
+
+    if args.json:
+        print(json.dumps([dict(r) for r in rows], indent=2, default=str))
+        return 0
+    if not rows:
+        print("No vault documents match.")
+        return 0
+
+    width = min(max(len(r["uri"]) for r in rows), 62)
+    for row in rows:
+        uri = row["uri"] if len(row["uri"]) <= width else "…" + row["uri"][-(width - 1):]
+        flag = "" if row["lifecycle"] == documents.ACTIVE else f"  [{row['lifecycle'].upper()}]"
+        print(f"  {uri:<{width}}  {row['domain']:<12} {row['chunk_count']:>4} chunks"
+              f"  {(row['indexed_at'] or '')[:10]}{flag}")
+    print(f"\n  {len(rows)} document(s), {sum(r['chunk_count'] for r in rows)} chunks.")
+    return 0
+
+
 def cmd_lifecycle(args) -> int:
     from app import documents
     from app.vault import service
@@ -218,6 +262,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--group-by", dest="group_by")
     p.add_argument("--limit", type=int, default=100)
     p.set_defaults(func=cmd_ledger)
+
+    p = sub.add_parser("list", help="every vault document (needs an unlocked vault)")
+    p.add_argument("--domain")
+    p.add_argument("--all", action="store_true", help="include superseded/stale/retracted")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_list)
 
     # Lifecycle. CLI only, and there is deliberately no MCP tool for it: a
     # model may not decide what counts as true.

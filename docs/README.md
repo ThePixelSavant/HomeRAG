@@ -8,6 +8,7 @@ first and [status.md](status.md) second.
 
 | Document | Answers |
 |---|---|
+| [cli.md](cli.md) | Every command — `rag` and `make` — with syntax, flags and why each behaves as it does |
 | [architecture.md](architecture.md) | How the system is put together and how a document flows through it |
 | [security-model.md](security-model.md) | What the vault protects against, what it does not, and why each gate exists |
 | [status.md](status.md) | What is built, what is verified, what is known-broken, what is waiting on a human |
@@ -15,7 +16,10 @@ first and [status.md](status.md) second.
 | [decisions.md](decisions.md) | Why each significant choice was made, and what was rejected |
 | [development.md](development.md) | Running tests, adding an extractor or a domain, writing a migration |
 
-Three other files matter and are **not** in this folder:
+Four other things matter and are **not** in this folder:
+
+- [`../scripts/rag`](../scripts/rag) — the command wrapper. Symlink it into
+  `~/.local/bin` and the whole control plane works from any directory.
 
 - [`../README.md`](../README.md) — user-facing setup and day-to-day commands.
 - [`../CLAUDE.md`](../CLAUDE.md) — the invariants and gotchas a model must not

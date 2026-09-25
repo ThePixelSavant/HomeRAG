@@ -1,5 +1,19 @@
 FROM python:3.12-slim
 
+# Runs as a normal user, not root. This container opens untrusted input --
+# PDFs from the internet, transcripts, anything dropped in the inbox -- so it
+# is the last one that should have root inside its namespace.
+#
+# It also writes to bind-mounted ./data, and a root process there produces
+# root-owned files on the HOST. That is what made documents copied in by
+# `make add` uneditable without sudo.
+#
+# RAG_UID/RAG_GID must match the host user that owns ./data, or the writes
+# fail. 1000:1000 is the first regular user on most systems; override at build
+# time if yours differs:  docker compose build --build-arg RAG_UID=$(id -u)
+ARG RAG_UID=1000
+ARG RAG_GID=1000
+
 WORKDIR /app
 
 ENV FASTEMBED_CACHE_PATH=/models
@@ -19,6 +33,17 @@ COPY sources.yaml .
 # `make test` runs the suite in this image, so it needs the tests.
 COPY tests/ tests/
 COPY pyproject.toml .
+
+# Create the user and hand it the two directories it writes to: /app (pytest
+# drops its cache there) and /models (the embedding cache). Done before the
+# model download so the cached files are owned by the user that will read
+# them, rather than by root.
+RUN groupadd -g "$RAG_GID" app \
+    && useradd -u "$RAG_UID" -g "$RAG_GID" -m -s /usr/sbin/nologin app \
+    && mkdir -p /models \
+    && chown -R "$RAG_UID:$RAG_GID" /app /models
+
+USER app
 
 RUN python -c "from app.pipeline.embedder import warm_cache; warm_cache()"
 

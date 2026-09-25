@@ -1,5 +1,19 @@
 FROM python:3.12-slim
 
+# DELIBERATELY still root, unlike Dockerfile.ingest and Dockerfile.mcp.
+#
+# Not an oversight and not a judgement that root is fine here -- this is the
+# process holding the key, so it has the strongest case of the three. The
+# blocker is migration, not design: vault.salt, vault.verifier, vault.db and
+# control.sock on the live volume are root-owned 0600, and switching the user
+# means chown'ing files that are the vault's secret material while the thing
+# is in daily use. That is a change to make deliberately, with the vault
+# sealed and a backup taken, not as a side effect of tidying file ownership.
+#
+# To do it later: seal the vault, back up ./data/vault, chown -R to RAG_UID,
+# add the same groupadd/useradd/USER block as Dockerfile.mcp, and confirm
+# `make unlock` still derives the key and the control socket is still
+# reachable from `docker exec`.
 WORKDIR /app
 
 ENV FASTEMBED_CACHE_PATH=/models

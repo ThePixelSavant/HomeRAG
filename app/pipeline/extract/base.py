@@ -102,5 +102,5 @@ def chunks_for(doc: "RawDoc", prefix: str = "") -> list[chunker.Chunk]:
     if doc.strategy == MARKDOWN:
         return chunker.chunk_markdown(doc.text, extra=doc.extra)
     if doc.strategy == BLOCKS:
-        return chunker.chunk_blocks(doc.blocks, extra=doc.extra, prefix=prefix)
+        return chunker.chunk_blocks(doc.blocks, extra=doc.extra, prefix=prefix, crumb_root=doc.title)
     return chunker.chunk_text(doc.text, extra=doc.extra, prefix=prefix)

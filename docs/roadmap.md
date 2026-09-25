@@ -51,6 +51,10 @@ extracted both ways and classified by the shape of its text.
 | XPS p86 (numbered steps) | 1 | rows | `-layout` |
 | TPM guide p1–2 (pure prose) | no gutters | prose | reading order |
 
+*Since replaced:* the classifier kept `-layout` for Roland's dense A3 sheets,
+which scrambled them. Every page is now `pdftotext -raw`, re-spaced from
+reading order — [ADR-024](decisions.md#adr-024-pdf-pages-use--raw-re-spaced-from-reading-order).
+
 ### 2. Table-aware chunking
 
 A split markdown table repeats its header on every continuation chunk. The
@@ -69,6 +73,20 @@ numeric specs verbatim and cite them.
 `active` / `superseded` / `stale` / `retracted`, plus tombstones, scheduled
 review dates, and a same-directory version-candidate warning that never acts on
 its own.
+
+## Phase 1.6 — measured retrieval · **done** (commits `3c203df`–`70c9720`)
+
+Prompted by Open WebUI answers taking 75 s to 3.5 min on the CPU-only
+llama-server, where nearly all of that is prefilling tool results.
+
+- **Trimmed results** — the model gets content, citation and ids, 3 hits by
+  default ([ADR-023](decisions.md#adr-023-the-model-gets-a-trimmed-result-row)).
+- **`fetch_context` capped** at 2 chunks either side.
+- **`pdftotext -raw`**, re-spaced from reading order, replacing the per-page
+  classifier ([ADR-024](decisions.md#adr-024-pdf-pages-use--raw-re-spaced-from-reading-order)).
+- **A chunk per PDF section**, headings found by font size ([ADR-025](decisions.md#adr-025-pdf-chunks-follow-section-headings)).
+- **`make eval`**, the evaluation harness Phase 3 called for, built first so
+  each of the above could be measured rather than assumed.
 
 ## Phase 2 — vision, aggregation and more sources · **not started**
 
@@ -103,9 +121,10 @@ ask for markdown, feed the result to the table chunker from Phase 1.5.
 One mechanism fixes column scrambling, broken tables, and scanned pages with no
 text layer at once.
 
-Scope it to pages that need it: those flagged ambiguous, those classified
-table-heavy, and those marked `ocr_required`. On the XPS manual that is roughly
-4 pages of 86 — about 2 minutes of CPU inference rather than 45.
+Scope it to pages that need it. `-raw` extraction (ADR-024) fixed the column
+scrambling this was first meant for, and the extractor no longer flags pages,
+so the queue is now pages marked `ocr_required` plus whitespace-aligned tables,
+which still need a detector.
 
 ### c. Tesseract, in a narrower role
 
@@ -138,7 +157,7 @@ Distinct from supersession. Same merchant + date + total is probably the same
 transaction photographed twice, and double-counting it corrupts every sum the
 ledger produces. Flag, do not auto-merge.
 
-## Phase 3 — retrieval tuning · **not started, deliberately last**
+## Phase 3 — retrieval tuning · **harness built; the rest not started**
 
 - **Cross-encoder reranking.** Moved *behind* Phase 2's parsing work. Reranking
   cannot recover a chunk whose column headers were discarded or whose two
@@ -149,10 +168,13 @@ ledger produces. Flag, do not auto-merge.
   torque figure is mistyped is the wrong tool. Today's mitigation is the
   verbatim-citation rule: a cited figure can be checked. A real fix needs a
   per-chunk annotation surfaced at read time, like the stale banner.
-- **Evaluation harness.** A fixed question set with known-correct answers and
-  citations, so a retrieval change can be shown to help rather than assumed to.
-  Arguably this should come *first* in Phase 3, since the rest cannot be judged
-  without it.
+- **Evaluation harness** · *done* — `make eval` over
+  `tests/retrieval/questions.yaml`. Grow the set whenever a real question comes
+  back wrong; 15 questions is enough to catch a regression, not to tune on.
+- **A larger embedding model.** bge-small misses synonyms ("polysynth" for
+  "Polyphonic"); bge-base is the first thing to measure. It needs
+  `rag rebuild-index` (384 to 768 dimensions; the fingerprint guard refuses
+  the old collection until then).
 
 ## Explicitly not planned
 

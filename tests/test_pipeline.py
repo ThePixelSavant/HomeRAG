@@ -314,6 +314,24 @@ def test_chunk_spanning_two_pages_keeps_both():
     assert chunk.extra["locator"] == {"page": 11, "pages": [11, 12]}
 
 
+def test_tied_search_results_come_back_in_a_fixed_order():
+    """RRF ties are common; which tied hit makes the cut must not vary."""
+    from types import SimpleNamespace
+
+    from app.pipeline.qdrant_store import _stable_top
+
+    def point(score, uri, idx):
+        return SimpleNamespace(score=score, payload={"uri": uri, "chunk_index": idx})
+
+    shuffled = [point(0.5, "b.pdf", 3), point(0.6429, "tb03.pdf", 9), point(0.5, "a.pdf", 7),
+                point(0.6429, "tb03.pdf", 2), point(1.0, "sh01a.pdf", 14)]
+    top = _stable_top(shuffled, 4)
+    assert [(p.payload["uri"], p.payload["chunk_index"]) for p in top] == [
+        ("sh01a.pdf", 14), ("tb03.pdf", 2), ("tb03.pdf", 9), ("a.pdf", 7),
+    ]
+    assert _stable_top(list(reversed(shuffled)), 4) == top
+
+
 def test_citations_name_the_first_page_of_a_range():
     from app.documents import format_citation
 
@@ -325,45 +343,393 @@ def test_citations_name_the_first_page_of_a_range():
     assert format_citation("receipt.jpg", {}) == "receipt.jpg"
 
 
-# --- PDF page layout classification ----------------------------------------
+def _full_hit(**overrides):
+    hit = {
+        "score": 0.571428, "content": "MIDI channel: 1 (default)", "title": "TB-03",
+        "uri": "tb03.pdf", "domain": "manuals", "source_id": "inbox:manuals",
+        "doc_id": "d1", "chunk_index": 4, "heading_path": [], "indexed_at": "2026-09-24",
+        "locator": {"page": 3, "pages": [3]}, "citation": "tb03.pdf, page 3",
+        "lifecycle": "active", "superseded_by": None,
+    }
+    return {**hit, **overrides}
 
 
-def test_numbered_steps_are_read_as_rows():
-    """`1  Turn on the computer.` must stay on one line; reading order splits
-    the step number onto its own."""
-    from app.pipeline.extract.pdf import ROWS, _classify_page
+def test_model_view_keeps_what_the_model_uses():
+    from app.documents import for_model
 
-    page = "\n".join(f"   {n}    Step number {n} of the procedure." for n in range(1, 8))
-    verdict, median = _classify_page(page)
-    assert verdict == ROWS
-    assert median <= 5
-
-
-def test_two_column_prose_is_read_in_reading_order():
-    from app.pipeline.extract.pdf import COLUMNS, _classify_page
-
-    left = "This guide provides important installation and maintenance detail"
-    page = "\n".join(f"{left}     Warning {n}: do not open the enclosure." for n in range(1, 8))
-    assert _classify_page(page)[0] == COLUMNS
+    assert for_model(_full_hit()) == {
+        "content": "MIDI channel: 1 (default)",
+        "citation": "tb03.pdf, page 3",
+        "doc_id": "d1",
+        "chunk_index": 4,
+        "score": 0.571,
+    }
 
 
-def test_a_page_with_no_gutters_is_prose():
-    from app.pipeline.extract.pdf import PROSE, _classify_page
+def test_model_view_reports_lifecycle_only_when_it_is_news():
+    from app.documents import for_model
 
-    verdict, median = _classify_page("Ordinary paragraph text.\nAnother line of it.\n")
-    assert verdict == PROSE
-    assert median is None
+    old = for_model(_full_hit(lifecycle="superseded", superseded_by="tb03-v2.pdf"))
+    assert old["lifecycle"] == "superseded" and old["superseded_by"] == "tb03-v2.pdf"
+    # The stale banner rides in the content, which is passed through untouched.
+    stale = for_model(_full_hit(lifecycle="stale", content="[STALE: old]\nbody"))
+    assert stale["lifecycle"] == "stale" and stale["content"].startswith("[STALE")
 
 
-def test_undecidable_pages_are_flagged_not_guessed():
-    """Between the thresholds the whitespace genuinely cannot tell a data table
-    from two-column prose. Recording it gives the Phase 2 VLM pass a work
-    queue instead of a silent coin flip."""
-    from app.pipeline.extract.pdf import AMBIGUOUS, LEFT_COLUMNS_MIN, LEFT_ROWS_MAX, _classify_page
+def test_fetch_context_caps_the_window(tmp_path, monkeypatch):
+    from app import main
+    from app.pipeline import qdrant_store
 
-    width = (LEFT_ROWS_MAX + LEFT_COLUMNS_MIN) // 2
-    page = "\n".join(f"{'x' * width}     right hand column {n}" for n in range(1, 8))
-    assert _classify_page(page)[0] == AMBIGUOUS
+    monkeypatch.setattr(settings, "state_db_path", tmp_path / "absent.db")
+    asked = {}
+    monkeypatch.setattr(
+        qdrant_store, "fetch_context", lambda doc_id, idx, **kw: asked.update(kw) or []
+    )
+
+    main.fetch_context("d1", 11, before=5, after=5)
+    assert asked == {"before": 2, "after": 2}
+    main.fetch_context("d1", 11)
+    assert asked == {"before": 1, "after": 1}
+
+
+def test_model_view_passes_errors_and_context_rows_through():
+    from app.documents import for_model
+
+    error = {"error": "Unknown domain 'manual'.", "valid_domains": ["manuals"]}
+    assert for_model(error) is error
+    # fetch_context rows have no score.
+    assert "score" not in for_model(_full_hit(score=None))
+
+
+# --- PDF extraction ----------------------------------------------------------
+
+
+def test_respace_splits_runs_raw_glued_together():
+    """`-raw` drops spaces in letter-spaced text; reading order has them."""
+    from app.pipeline.extract.pdf import _respace
+
+    reading = "INJURY OR DEATH. THIS PUMP SHOULD BE\nINSTALLED BY A PROFESSIONAL."
+    raw = "INJURYORDEATH.THISPUMP SHOULD BE\nINSTALLED BY A PROFESSIONAL."
+    assert _respace(raw, reading) == (
+        "INJURY OR DEATH. THIS PUMP SHOULD BE\nINSTALLED BY A PROFESSIONAL."
+    )
+
+
+def test_respace_leaves_words_reading_order_also_produced():
+    from app.pipeline.extract.pdf import _respace
+
+    # "therapist" could be spelled "the rapist" from this vocabulary. It is
+    # a word reading order produced, so it is never split.
+    assert _respace("the therapist", "the rapist the therapist") == "the therapist"
+    # Nothing in reading order spells it: left alone rather than guessed at.
+    assert _respace("KEYTRANSPOSE", "unrelated words") == "KEYTRANSPOSE"
+
+
+def test_respace_uses_the_fewest_pieces():
+    from app.pipeline.extract.pdf import _respace
+
+    assert _respace("1.Press MasterTune", "1. Press Master Tune MasterTune") == (
+        "1. Press MasterTune"
+    )
+
+
+def test_pages_are_extracted_in_stored_order(tmp_path, monkeypatch):
+    """Every page takes `-raw`, re-spaced from reading order, and says so."""
+    from app.pipeline.extract import pdf
+
+    calls = []
+
+    def fake(path, page, mode=pdf.MODE_RAW):
+        calls.append((page, mode))
+        text = "Selecting Assign Mode\n1.Press [MENU]. " * 10
+        return text if mode == pdf.MODE_RAW else text.replace("1.Press", "1. Press")
+
+    monkeypatch.setattr(pdf, "_pdfinfo", lambda path: (2, "SH-01A"))
+    monkeypatch.setattr(pdf, "_page_text", fake)
+    monkeypatch.setattr(pdf, "_headings", lambda path: {})
+    manual = tmp_path / "sh01a.pdf"
+    manual.write_bytes(b"%PDF-1.4")
+
+    doc = pdf.PdfExtractor().extract(manual)
+    assert sorted(calls) == [(1, "raw"), (1, "reading"), (2, "raw"), (2, "reading")]
+    assert [b.extra for b in doc.blocks] == [
+        {"page": 1, "extract_mode": "raw"},
+        {"page": 2, "extract_mode": "raw"},
+    ]
+    assert "1. Press [MENU]" in doc.blocks[0].text
+    assert "flagged_pages" not in doc.extra
+
+
+# --- PDF sections ------------------------------------------------------------
+
+_SH01A_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<pdf2xml>
+<page number="1" position="absolute" top="0" left="0" height="842" width="1191">
+<fontspec id="0" size="24" family="MyriadPro" color="#000000"/>
+<fontspec id="1" size="10" family="MyriadPro" color="#000000"/>
+<fontspec id="2" size="14" family="MyriadPro" color="#ffffff"/>
+<fontspec id="3" size="12" family="MyriadPro" color="#000000"/>
+<text top="20" left="40" width="80" height="30" font="0"><b>SH-01A</b></text>
+<text top="30" left="40" width="80" height="17" font="2"><b>Introduction</b></text>
+<text top="60" left="40" width="300" height="13" font="1">Body text that is long enough to set the body size of the page.</text>
+<text top="80" left="40" width="300" height="13" font="1">More body text, so that ten point is by far the most common size.</text>
+<text top="100" left="40" width="30" height="15" font="3"><b>1.1.</b></text>
+<text top="100" left="75" width="120" height="15" font="3"><b>Making the connections</b></text>
+<text top="120" left="40" width="30" height="17" font="2">9:00</text>
+<text top="140" left="40" width="30" height="17" font="2">A sentence set at display size that runs well past eighty characters and so is not a heading.</text>
+</page>
+<page number="2" position="absolute" top="0" left="0" height="842" width="1191">
+<text top="30" left="40" width="80" height="17" font="2"><b>Key Transpose</b></text>
+<text top="60" left="40" width="300" height="13" font="1">Hold down the [KEY TRANSPOSE] button and press any key except the centre C key.</text>
+<text top="90" left="40" width="80" height="17" font="2"><b>Selecting Assign Mode</b></text>
+<text top="110" left="40" width="60" height="15" font="3"><b>Poly play</b></text>
+<text top="130" left="40" width="60" height="15" font="3"><b>Chord play</b></text>
+</page>
+</pdf2xml>"""
+
+
+def test_headings_are_found_by_font_size():
+    from app.pipeline.extract.pdf import _parse_headings
+
+    assert _parse_headings(_SH01A_XML) == {
+        # The 24pt cover title is used once, so it is not a level. `9:00` has
+        # no words; the display-size sentence is too long. `1.1.` and its
+        # title share a line and are joined.
+        1: [("Introduction", 1), ("1.1. Making the connections", 2)],
+        2: [("Key Transpose", 1), ("Selecting Assign Mode", 1), ("Poly play", 2), ("Chord play", 2)],
+    }
+
+
+def test_no_headings_without_pdftohtml_output():
+    from app.pipeline.extract.pdf import _parse_headings
+
+    assert _parse_headings("") == {}
+
+
+def test_page_is_cut_at_its_headings():
+    from app.pipeline.extract.pdf import _split_sections
+
+    text = (
+        "the end of the previous section.\n"
+        "Key Transpose\n"
+        "Hold down [KEY TRANSPOSE] and press a key.\n"
+        "Selecting Assign Mode\n"
+        "1. Press the [MENU] button.\n"
+        "Poly play\n"
+        "Plays polyphonically.\n"
+        "Selecting Assign Mode again, in body text.\n"
+    )
+    headings = [("Key Transpose", 1), ("Selecting Assign Mode", 1), ("Poly play", 2)]
+    sections, path = _split_sections(text, headings, [(1, "Sequencer")])
+
+    assert sections == [
+        ("the end of the previous section.", ["Sequencer"], False),
+        ("Key Transpose\nHold down [KEY TRANSPOSE] and press a key.", ["Key Transpose"], True),
+        ("Selecting Assign Mode\n1. Press the [MENU] button.", ["Selecting Assign Mode"], True),
+        (
+            "Poly play\nPlays polyphonically.\nSelecting Assign Mode again, in body text.",
+            ["Selecting Assign Mode", "Poly play"],
+            True,
+        ),
+    ]
+    assert path == [(1, "Selecting Assign Mode"), (2, "Poly play")]
+
+
+def test_a_heading_line_cuts_only_as_often_as_the_font_data_found_it():
+    from app.pipeline.extract.pdf import _split_sections
+
+    text = "Sequencer\nThe Sequencer section.\nSequencer\nstill the same section."
+    sections, _ = _split_sections(text, [("Sequencer", 1)], [])
+    assert len(sections) == 1
+
+
+def test_a_wrapped_heading_is_one_heading():
+    from app.pipeline.extract.pdf import _split_sections
+
+    text = "Thank you for your interest in Arturia Analog\nLab!\nWelcome."
+    headings = [("Thank you for your interest in Arturia Analog", 1), ("Lab!", 1)]
+    sections, path = _split_sections(text, headings, [])
+    assert sections == [(text, ["Thank you for your interest in Arturia Analog Lab!"], True)]
+
+
+def test_extractor_emits_sections_with_their_path(tmp_path, monkeypatch):
+    from app.pipeline.extract import pdf
+
+    pages = {1: "Sequencer\nThe sequencer plays.", 2: "continues here.\nHold\nHold notes."}
+    monkeypatch.setattr(pdf, "_pdfinfo", lambda path: (2, "SH-01A"))
+    monkeypatch.setattr(pdf, "_page_text", lambda path, page, mode=pdf.MODE_RAW: pages[page] * 1)
+    monkeypatch.setattr(pdf, "_headings", lambda path: {1: [("Sequencer", 1)], 2: [("Hold", 1)]})
+    manual = tmp_path / "sh01a.pdf"
+    manual.write_bytes(b"%PDF-1.4")
+
+    doc = pdf.PdfExtractor().extract(manual)
+    assert [(b.extra["page"], b.extra["heading_path"], b.extra["section_start"]) for b in doc.blocks] == [
+        (1, ["Sequencer"], True),
+        (2, ["Sequencer"], False),
+        (2, ["Hold"], True),
+    ]
+    assert {b.kind for b in doc.blocks} == {"section"}
+
+
+def _section(text, path, *, start=True, page=1):
+    return TextBlock(
+        text=text,
+        kind="section",
+        extra={"page": page, "heading_path": path, "section_start": start},
+    )
+
+
+def test_each_section_gets_its_own_chunk():
+    """Two sections that would fit together are still kept apart: packed,
+    each one's embedding is the average of both topics."""
+    key = _section("Key Transpose\n" + "Hold the button and press a key. " * 8, ["Key Transpose"])
+    assign = _section("Assign Mode\n" + "Press MENU then a number button. " * 8, ["Assign Mode"])
+    chunks = chunker.chunk_blocks([key, assign])
+
+    assert [c.heading_path for c in chunks] == [["Key Transpose"], ["Assign Mode"]]
+    # Each opens on its own heading, so no breadcrumb is repeated above it.
+    assert chunks[1].text.startswith("Assign Mode\n")
+
+
+def test_a_bare_title_is_packed_with_the_section_after_it():
+    chapter = _section("3. THE STEP SEQUENCERS", ["3. THE STEP SEQUENCERS"])
+    first = _section(
+        "3.1. Overview\n" + "The step sequencers play monophonic lines. " * 8,
+        ["3. THE STEP SEQUENCERS", "3.1. Overview"],
+    )
+    chunks = chunker.chunk_blocks([chapter, first])
+
+    assert len(chunks) == 1
+    assert chunks[0].text.startswith("3. THE STEP SEQUENCERS\n\n3.1. Overview")
+
+
+def test_a_continuation_packs_with_its_section_and_keeps_both_pages():
+    head = _section("Sequencer\n" + "The sequencer plays. " * 10, ["Sequencer"], page=11)
+    tail = _section("It continues on the next page.", ["Sequencer"], start=False, page=12)
+    (chunk,) = chunker.chunk_blocks([head, tail])
+    assert chunk.extra["locator"] == {"page": 11, "pages": [11, 12]}
+
+
+def test_every_piece_of_a_long_section_carries_its_breadcrumb():
+    long = _section(
+        "Pattern Write\n" + "Press a step button to enter a note. " * 200,
+        ["Sequencer", "Pattern Write"],
+    )
+    chunks = chunker.chunk_blocks([long])
+
+    assert len(chunks) > 1
+    # The first piece opens on its heading, so only the parent is added.
+    assert chunks[0].text.startswith("Sequencer\n\nPattern Write\n")
+    for chunk in chunks[1:]:
+        assert chunk.text.startswith("Sequencer > Pattern Write\n\n")
+    assert all(c.token_count <= settings.chunk_max_tokens for c in chunks)
+    assert all(c.heading_path == ["Sequencer", "Pattern Write"] for c in chunks)
+
+
+def test_a_bare_title_goes_into_the_first_piece_of_a_long_section():
+    chapter = _section("5. PROJECTS", ["5. PROJECTS"])
+    long = _section(
+        "5.1. Saving\n" + "Hold SAVE and press PROJECT. " * 200, ["5. PROJECTS", "5.1. Saving"]
+    )
+    chunks = chunker.chunk_blocks([chapter, long])
+
+    assert chunks[0].text.startswith("5. PROJECTS\n\n5.1. Saving")
+    assert chunks[0].heading_path == ["5. PROJECTS"]
+    assert chunks[1].text.startswith("5. PROJECTS > 5.1. Saving\n\n")
+
+
+def test_blocks_without_a_heading_path_still_pack_together():
+    """Transcript turns have no sections; they pack as they always did."""
+    turns = [TextBlock(text=f"turn {n}: " + "words " * 20, kind="user") for n in range(3)]
+    (chunk,) = chunker.chunk_blocks(turns)
+    assert chunk.heading_path == []
+    assert chunk.text.startswith("turn 0")
+
+
+# --- state database --------------------------------------------------------
+
+
+@pytest.fixture
+def read_only_state_dir(tmp_path):
+    """data/state as the MCP servers see it: a directory they cannot write."""
+    directory = tmp_path / "state"
+    directory.mkdir()
+    yield directory
+    directory.chmod(0o755)
+
+
+def test_reader_works_on_a_read_only_mount(read_only_state_dir):
+    """The writer's file must stay readable after it exits.
+
+    A WAL-mode file cannot be opened read-only once its -wal/-shm files are
+    gone and the directory refuses to recreate them, which is exactly the
+    MCP servers' `:ro` mount after the one-shot worker exits.
+    """
+    from app.pipeline import state
+
+    path = read_only_state_dir / "rag.db"
+    with state.writer(path) as conn:
+        conn.execute(
+            "INSERT INTO sources (source_id, domain, source_type) VALUES ('inbox:notes', 'notes', 'inbox')"
+        )
+    read_only_state_dir.chmod(0o555)
+
+    with state.reader(path) as conn:
+        assert [r["source_id"] for r in state.all_sources(conn)] == ["inbox:notes"]
+
+
+def test_writer_converts_an_existing_wal_database(tmp_path):
+    import sqlite3
+
+    from app.pipeline import state
+
+    path = tmp_path / "rag.db"
+    legacy = sqlite3.connect(path)
+    legacy.execute("PRAGMA journal_mode=WAL")
+    legacy.close()
+
+    with state.writer(path) as conn:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+
+
+def test_reader_degrades_when_the_file_cannot_be_read(read_only_state_dir):
+    from app.pipeline import state
+
+    path = read_only_state_dir / "rag.db"
+    path.write_bytes(b"not a database")
+    read_only_state_dir.chmod(0o555)
+
+    with state.reader(path) as conn:
+        assert state.all_sources(conn) == []
+
+
+def test_list_sources_includes_inbox_sources_it_cannot_see(tmp_path, monkeypatch):
+    """mcp-server has no inbox mount, so inbox sources come from the state db."""
+    from app import main
+    from app.pipeline import qdrant_store, state
+
+    monkeypatch.setattr(settings, "state_db_path", tmp_path / "rag.db")
+    monkeypatch.setattr(settings, "inbox_path", tmp_path / "not-mounted")
+    monkeypatch.setattr(settings, "sources_file", tmp_path / "sources.yaml")
+    monkeypatch.setattr(qdrant_store, "count_points", lambda *a, **kw: 7)
+    (tmp_path / "sources.yaml").write_text(
+        "sources:\n"
+        "  - {id: dev-notes, type: local, domain: notes, path: /tmp}\n"
+        "  - {id: old-notes, type: local, domain: notes, path: /tmp, enabled: false}\n"
+    )
+    with state.writer() as conn:
+        for source_id, domain, kind in [
+            ("inbox:manuals", "manuals", "inbox"),
+            ("dev-notes", "notes", "local"),
+            ("old-notes", "notes", "local"),
+        ]:
+            state.record_source_start(conn, source_id, domain, kind, "run-1")
+
+    listed = {s["source_id"]: s for s in main.list_sources()}
+    assert sorted(listed) == ["dev-notes", "inbox:manuals"]
+    assert listed["inbox:manuals"]["domain"] == "manuals"
+    assert listed["inbox:manuals"]["tier"] == "open"
+    assert listed["inbox:manuals"]["chunks"] == 7
 
 
 # --- document lifecycle ----------------------------------------------------
@@ -442,6 +808,48 @@ def test_tombstones_survive_the_disappearance_sweep(state_db):
         missing = {r["doc_id"] for r in state.documents_missing_run(conn, "s", "r2")}
         assert missing == {"drop"}
         assert "keep" in state.tombstones(conn, "s")
+
+
+def test_reindex_keeps_tombstones_and_lifecycle(state_db, monkeypatch):
+    """Reindex used to delete every row for the source -- including the
+    tombstone that keeps a retracted file out, so it came straight back."""
+    import argparse
+
+    from app import documents, ingest
+    from app.pipeline import state
+    from app.sources import Source
+
+    with state.writer() as conn:
+        _doc(conn, "gone", "bad-spec.md")
+        _doc(conn, "old", "rack-plan.md")
+        _doc(conn, "live", "topology.md")
+        state.set_lifecycle(conn, "gone", documents.RETRACTED, reason="wrong")
+        state.set_lifecycle(conn, "old", documents.STALE, reason="decommissioned")
+    monkeypatch.setattr(ingest, "all_sources", lambda: [Source(id="s", type="local", domain="notes")])
+    monkeypatch.setattr(ingest, "_run", lambda sources, force, dry_run: 0)
+
+    ingest.cmd_reindex(argparse.Namespace(source_id="s"))
+
+    with state.reader() as conn:
+        rows = {r["doc_id"]: r for r in conn.execute("SELECT * FROM documents")}
+    assert rows["gone"]["lifecycle"] == documents.RETRACTED
+    assert rows["gone"]["content_hash"] == "h"
+    assert rows["old"]["lifecycle"] == documents.STALE
+    assert rows["old"]["lifecycle_reason"] == "decommissioned"
+    # Everything not tombstoned reads as changed, so the run re-embeds it.
+    assert rows["old"]["content_hash"] == rows["live"]["content_hash"] == ""
+
+
+def test_flagged_pages_leave_out_retracted_documents(state_db):
+    from app import documents
+    from app.pipeline import state
+
+    with state.writer() as conn:
+        _doc(conn, "gone", "intelliflo.pdf", flagged_pages=4)
+        _doc(conn, "live", "tb03.pdf", flagged_pages=1)
+        state.set_lifecycle(conn, "gone", documents.RETRACTED, reason="wrong")
+    with state.reader() as conn:
+        assert [r["uri"] for r in state.flagged_pages(conn)] == ["tb03.pdf"]
 
 
 def test_retracted_documents_have_no_opt_in():

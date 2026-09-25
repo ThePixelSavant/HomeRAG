@@ -17,6 +17,8 @@ import shutil
 import sys
 from pathlib import Path
 
+import yaml
+
 from app import documents
 from app.config import settings
 from app.domains import DOMAIN_TIERS, Tier, UnknownDomainError, domains_in, tier_of
@@ -126,6 +128,10 @@ def cmd_doctor(args) -> int:
         )
         if not status.get("identity_configured"):
             rows.append((WARN, "VAULT_JWT_SECRET", "unset; every model-initiated vault call will be denied"))
+    except control.ControlForbidden:
+        # Expected: this container is unprivileged and the socket belongs to
+        # the vault server's user. Not a warning -- nothing is wrong.
+        rows.append((OK, "vault", "not readable from here (by design); use `make vault-status`"))
     except Exception as exc:  # noqa: BLE001
         rows.append((WARN, "vault", f"control socket unavailable: {exc}"))
 
@@ -251,11 +257,17 @@ def cmd_reindex(args) -> int:
         raise SystemExit(f"No source with id {args.source_id!r}")
     source = sources[0]
     if not source.is_vault:
+        # Blank the stored hash so every document reads as changed, rather
+        # than deleting the rows. Deleting also dropped the tombstone that
+        # keeps a retracted document out -- so reindex re-indexed it -- and
+        # every other document's lifecycle, which re-indexing must preserve.
+        placeholders = ",".join("?" for _ in documents.TOMBSTONED)
         with state.writer() as conn:
-            for row in conn.execute(
-                "SELECT doc_id FROM documents WHERE source_id=?", (source.id,)
-            ).fetchall():
-                conn.execute("DELETE FROM documents WHERE doc_id=?", (row["doc_id"],))
+            conn.execute(
+                "UPDATE documents SET content_hash='' "
+                f"WHERE source_id=? AND lifecycle NOT IN ({placeholders})",
+                (source.id, *sorted(documents.TOMBSTONED)),
+            )
     return _run(sources, force=True, dry_run=False)
 
 
@@ -395,6 +407,63 @@ def cmd_restore(args) -> int:
     return 0
 
 
+def cmd_list(args) -> int:
+    """Every open-tier document, which is the inventory `status` only counts.
+
+    Open tier only, and it says so: vault documents live in the encrypted
+    database and are not readable from here at all. `make vault-list` is their
+    equivalent and needs an unlocked vault.
+    """
+    sql = (
+        "SELECT uri, domain, lifecycle, chunk_count, status, flagged_pages, "
+        "indexed_at, size_bytes FROM documents"
+    )
+    where, params = [], []
+    if args.domain:
+        where.append("domain=?")
+        params.append(args.domain)
+    if args.match:
+        where.append("uri LIKE ?")
+        params.append(f"%{args.match}%")
+    if not args.all:
+        where.append("lifecycle=?")
+        params.append(documents.ACTIVE)
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+
+    with state.reader() as conn:
+        rows = conn.execute(sql + " ORDER BY domain, uri", params).fetchall()
+
+    if args.json:
+        print(json.dumps([dict(r) for r in rows], indent=2, default=str))
+        return 0
+    if not rows:
+        print("No documents match." if (args.domain or args.match) else "Nothing indexed yet.")
+        return 0
+
+    width = min(max(len(r["uri"]) for r in rows), 62)
+    for row in rows:
+        uri = row["uri"] if len(row["uri"]) <= width else "…" + row["uri"][-(width - 1):]
+        # Only annotate what is not the ordinary case, so the exceptions are
+        # what catches the eye rather than a column of "active" on every line.
+        notes = []
+        if row["lifecycle"] != documents.ACTIVE:
+            notes.append(row["lifecycle"].upper())
+        if row["status"] != state.INDEXED:
+            notes.append(row["status"])
+        if row["flagged_pages"]:
+            notes.append(f"{row['flagged_pages']} page(s) flagged")
+        suffix = f"  [{', '.join(notes)}]" if notes else ""
+        print(f"  {uri:<{width}}  {row['domain']:<10} {row['chunk_count']:>4} chunks"
+              f"  {(row['indexed_at'] or '')[:10]}{suffix}")
+
+    total = sum(r["chunk_count"] for r in rows)
+    scope = "" if args.all else " active"
+    print(f"\n  {len(rows)}{scope} document(s), {total} chunks."
+          + ("" if args.all else "  Add --all to include superseded/stale/retracted."))
+    return 0
+
+
 def cmd_lifecycle(args) -> int:
     with state.writer() as conn:
         rows = conn.execute(
@@ -454,6 +523,60 @@ def cmd_query(args) -> int:
     return 0
 
 
+_QUOTES = str.maketrans({"’": "'", "‘": "'", "“": '"', "”": '"'})
+
+
+def _squash(text: str) -> str:
+    """Compare text regardless of spacing, case and curly quotes.
+
+    Extraction changes move line breaks and spaces (`1–16,OFF` vs `1–16, OFF`)
+    without changing what a chunk says, and must not read as a miss.
+    """
+    return "".join(text.translate(_QUOTES).lower().split())
+
+
+def cmd_eval(args) -> int:
+    """Rank each question's known answer in the open-tier search.
+
+    Measures what a model gets: `search_docs` returns the top 3 by default, so
+    hit@3 is the number that matters, and the size of those 3 is what gets
+    prefilled. Ranks are searched to `--depth` so a near miss shows as one.
+    """
+    questions = yaml.safe_load(Path(args.file).read_text())["questions"]
+    rows = []
+    for q in questions:
+        hits = qdrant_store.search(q["question"], limit=args.depth, domains=domains_in(Tier.OPEN))
+        want = _squash(q["expect"])
+        rank = next(
+            (n for n, h in enumerate(hits, 1) if h["uri"] == q["uri"] and want in _squash(h["content"])),
+            None,
+        )
+        rows.append({"id": q["id"], "rank": rank, "top3_chars": sum(len(h["content"]) for h in hits[:3])})
+
+    total = len(rows)
+    summary = {
+        "questions": total,
+        "hit@1": sum(1 for r in rows if r["rank"] == 1) / total,
+        "hit@3": sum(1 for r in rows if r["rank"] and r["rank"] <= 3) / total,
+        f"mrr@{args.depth}": sum(1 / r["rank"] for r in rows if r["rank"]) / total,
+        "mean_top3_chars": round(sum(r["top3_chars"] for r in rows) / total),
+    }
+    if args.json:
+        print(json.dumps({"summary": summary, "questions": rows}, indent=2))
+        return 0
+
+    width = max(len(r["id"]) for r in rows)
+    for r in rows:
+        rank = str(r["rank"]) if r["rank"] else f">{args.depth}"
+        print(f"  {r['id']:<{width}}  rank {rank:>4}  top-3 {r['top3_chars']:>5} chars")
+    print(
+        f"\nhit@1 {summary['hit@1']:.0%}   hit@3 {summary['hit@3']:.0%}   "
+        f"mrr@{args.depth} {summary[f'mrr@{args.depth}']:.3f}   "
+        f"mean top-3 {summary['mean_top3_chars']} chars   ({total} questions)"
+    )
+    return 0
+
+
 def cmd_status(args) -> int:
     payload: dict = {
         "collection": settings.collection_name,
@@ -482,6 +605,8 @@ def cmd_status(args) -> int:
         from app.vault import control
 
         payload["vault"] = control.send({"action": "status"}).get("status")
+    except control.ControlForbidden:
+        payload["vault"] = {"unreadable_here": "run `make vault-status`"}
     except Exception as exc:  # noqa: BLE001
         payload["vault"] = {"error": str(exc)}
 
@@ -503,13 +628,16 @@ def cmd_status(args) -> int:
     flagged = payload["flagged_pages"]
     if flagged:
         total = sum(r["flagged_pages"] for r in flagged)
-        print(f"pages with undecided layout: {total} across {len(flagged)} document(s)")
+        print(f"pages flagged for review: {total} across {len(flagged)} document(s)")
         for row in flagged[:5]:
             print(f"    {row['flagged_pages']:3d}  {row['uri']}  ({row['domain']})")
     if payload["quarantined_open"]:
         print(f"  !! {payload['quarantined_open']} quarantined document(s) awaiting review")
     vault = payload.get("vault") or {}
-    if "error" in vault:
+    if "unreadable_here" in vault:
+        print(f"vault: {vault['unreadable_here']}  (its control socket is restricted to "
+              "the vault container, which is the point)")
+    elif "error" in vault:
         print(f"vault: unavailable ({vault['error']})")
     else:
         print(f"vault: {'unlocked' if vault.get('unlocked') else 'SEALED'}  "
@@ -596,6 +724,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_query)
 
+    p = sub.add_parser("eval", help="rank known answers in open-tier search")
+    p.add_argument("--file", default="tests/retrieval/questions.yaml")
+    p.add_argument("--depth", type=int, default=10, help="how far down to look for the answer")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_eval)
+
     p = sub.add_parser("status")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_status)
@@ -630,6 +764,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("uri")
     p.add_argument("--domain")
     p.set_defaults(func=cmd_restore)
+
+    p = sub.add_parser("list", help="every open-tier document")
+    p.add_argument("--domain")
+    p.add_argument("--match", help="substring of the uri")
+    p.add_argument("--all", action="store_true", help="include superseded/stale/retracted")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_list)
 
     p = sub.add_parser("lifecycle", help="documents that are not plainly active")
     p.add_argument("--json", action="store_true")

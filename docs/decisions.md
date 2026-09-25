@@ -164,6 +164,8 @@ that used to be there.
 
 ## ADR-008: PDF pages are extracted twice
 
+**Superseded by [ADR-024](#adr-024-pdf-pages-use--raw-re-spaced-from-reading-order).**
+
 **Chosen:** Run `pdftotext` both with and without `-layout` on every page, and
 keep whichever fits the page's shape.
 
@@ -508,3 +510,136 @@ caller nothing about how to reconstruct the call.
 
 **Revisit if:** approval moves into the chat itself, where the approved call
 could be replayed by the server rather than by the model.
+
+## ADR-023: The model gets a trimmed result row
+
+**Chosen:** Both MCP servers pass every row through `documents.for_model`,
+which keeps `content`, `citation`, `doc_id`, `chunk_index` and `score`, and adds
+`lifecycle`/`superseded_by` only when the document is not `active`.
+`search_docs` defaults to 3 results.
+
+**Rejected:** Sending the full row, as `make query` prints it.
+
+On the CPU-only llama-server a question's latency is dominated by prefilling
+the tool result, at 60–100 tokens/s. Measured on a TB-03 manual query, the
+five-hit result was 3,331 tokens, of which 1,247 were metadata: `locator`,
+`uri` and `title` restate the citation, `heading_path` is already the first
+line of a markdown chunk, and `source_id`, `indexed_at` and `domain` are
+bookkeeping the model has no use for. That was ~17s of a ~75s answer. Two of
+the five hits were from a different device's manual, so the default limit
+drops to 3; the docstring tells the model to raise it rather than rephrase.
+
+`search_vault` keeps its default of 5. There a follow-up search costs the owner
+another approval at a terminal, which is dearer than the prefill.
+
+`fetch_context` is capped at 2 chunks either side. Asked an SH-01A question,
+the model requested 5 either side; prefilling those 11 chunks (5,165 tokens)
+took 85s of a 3.5-minute answer, and the detail was in the adjacent chunk. It
+can call again from the last chunk returned. The vault's `fetch_context` is
+not capped: each call there is approved by a human who sees the arguments.
+
+The trim happens at the MCP boundary, not in `_hit`, so the CLI and the tests
+still see the full row.
+
+**Revisit if:** inference moves to a GPU, where prefill is cheap enough that
+recall is worth more than the tokens.
+
+## ADR-024: PDF pages use `-raw`, re-spaced from reading order
+
+**Chosen:** Extract every page with `pdftotext -raw` (the PDF's stored text
+order), and re-split tokens `-raw` glued together using the words the same page
+yields in reading order.
+
+**Rejected:** ADR-008's per-page choice between `-layout` and reading order;
+`-raw` alone; `-raw` with a per-page fallback to reading order.
+
+The classifier chose wrongly on the pages that mattered. Roland's A3 sheets
+(SH-01A, TR-06) are dense four-column pages whose short gutter segments read as
+table rows, so they kept `-layout`, which interleaved all four columns. Asked
+how to set the SH-01A to poly mode, the model found "Selecting Assign Mode" in
+one chunk and the POLY row in the next, surrounded by other sections, fetched
+eleven chunks to piece it together, and took 3.5 minutes to answer. Reading
+order was no better on those pages: it split the TB-03's settings table from
+its own rows.
+
+Compared across the 382 pages of the six indexed manuals (Roland, Arturia,
+Pentair, Dell), `-raw` was never worse than either mode on the pages compared
+side by side. It kept every procedure on the Roland sheets in sequence, kept
+the Pentair spec table intact where `-layout` spliced the next column into it,
+kept the Dell and IntelliFlo numbered steps that ADR-008 chose `-layout` for,
+and kept 90-97% of real table rows in the Arturia and Dell manuals.
+
+Its defect is spacing. On 7 of IntelliFlo's 32 pages, letter-spaced warning
+boxes came out as runs like `INJURYORDEATH.THISPUMPSHOULDBEINSTALLED`, up to
+53% of a page's characters. A fallback was measured and rejected: `-raw` and
+reading order contain identical characters on every page, so a length check
+never fires, and a glue-rate threshold cannot separate those pages from the
+Dell contents pages and the TB-03 sheet, which glue a little and are still far
+better as `-raw`. Re-spacing from reading order's own words fixes the runs,
+costs 0.06s across all 382 pages, and cannot invent a word: a token is split
+only into words reading order produced, only when reading order never produced
+the token itself, and into the fewest pieces.
+
+The extractor no longer sets `flagged_pages`. Its "ambiguous" pages were the
+Roland and IntelliFlo pages `-raw` now reads correctly.
+
+**Revisit if:** a PDF turns up whose stored order is itself scrambled. `-raw`
+cannot fix that; a page render through the Phase 2 vision model can.
+
+## ADR-025: PDF chunks follow section headings
+
+**Chosen:** Cut each PDF page at its section headings, found by font size from
+`pdftohtml -xml`, and start a new chunk at every heading unless what is pending
+is under 40 tokens. Prefix each chunk with `document title > heading path`.
+
+**Rejected:** Packing sections up to the token budget; detecting headings from
+the text; a page-margin filter for running headers; a larger merge floor.
+
+Cut by size alone, a Roland page's chunk held arpeggio, chord memory, Key
+Transpose and Assign Mode together. Its embedding matched none of them, and the
+answer to "how do I set the SH-01A to play as a polysynth?" ranked 8th.
+
+Measured with `make eval` (14 questions over five manuals; hit@3 is what a
+model sees, since `search_docs` returns 3):
+
+| | hit@1 | hit@3 | MRR@10 | top-3 chars |
+|---|---:|---:|---:|---:|
+| Size-based chunks (baseline) | 36% | 71% | 0.547 | 4,382 |
+| Sections, floor 40 | 50% | 79% | 0.633 | 2,980 |
+| + title root, front-matter levels | **57%** | **79%** | **0.699** | **2,801** |
+| same, floor 120 | 43% | 57% | 0.537 | 3,351 |
+
+The SH-01A answer moved from 8th to 2nd, the Key Transpose answer from past
+10th to 2nd, and the model reads 36% less per search. Two answers fell out of
+the top 3: TB-03's tempo (2nd to 5th, behind the manual's opening settings
+table, which says "TB-03" and "tempo" repeatedly) and XPS system setup (1st to
+4th, behind three chunks of the same section). Neither is a chunking defect,
+and tuning further against 14 questions would be fitting the test.
+
+Why each rule:
+
+- **Font size, not text.** `MONO Monophonic` and a bold numbered step look like
+  headings as text. Every manual sets headings at least 2pt above body text;
+  98-100% of those match a `-raw` line exactly. The misses are correct
+  non-cuts: Dell contents entries (dot leaders) and TR-06 table cells at heading
+  size.
+- **No margin filter.** Excluding the top and bottom 6% of each page, meant
+  for running headers, removed only real headings — 66 chapter titles in Analog
+  Lab, and section titles at the top of an A3 sheet's columns. No manual sets a
+  running header at heading size.
+- **Front-matter levels.** Arturia sets "Table Of Contents" at 17pt, above its
+  15pt chapters, so it sat at the root of every breadcrumb. A size confined to
+  under 10% of a document of 10+ pages takes the next size's level.
+- **Title root.** A Roland section says "Setting the tempo", never which
+  instrument; the question always names one. Transcripts already carry their
+  title the same way.
+- **Floor of 40.** A bare chapter title as its own chunk matches every question
+  about the chapter and answers none. 120 packed real sections together again.
+
+This also found that `FORCE=1` does not re-embed — it only overrides the
+sweep — so a chunking change reaches the index through `rag reindex`, which
+now blanks hashes rather than deleting rows. Deleting them dropped the
+retracted tombstone, so reindex re-indexed a retracted document.
+
+**Revisit if:** a manual sets headings at body size (bold only), or the eval
+set grows enough to tune the floor honestly.

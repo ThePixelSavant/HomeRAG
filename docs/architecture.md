@@ -59,7 +59,7 @@ deletes, retracts or unlocks.
 | Module | Role |
 |---|---|
 | [app/domains.py](../app/domains.py) | The domain→tier map. Also the frozen `POINT_NAMESPACE` and `SCHEMA_VERSION`. |
-| [app/documents.py](../app/documents.py) | Lifecycle states and citation formatting. Dependency-free — both tiers need it and neither may import the other. |
+| [app/documents.py](../app/documents.py) | Lifecycle states, citation formatting, and the trimmed result row the MCP servers send a model (`for_model`). Dependency-free — both tiers need it and neither may import the other. |
 | [app/config.py](../app/config.py) | Settings from the environment. |
 | [app/sources.py](../app/sources.py) | The source manifest plus implicit inbox sources. |
 | [app/pipeline/embedder.py](../app/pipeline/embedder.py) | **The only module that imports fastembed.** |
@@ -137,29 +137,30 @@ embedder at all.
 | `TEXT` | `.txt`, anything plain | `chunk_text` | `{"lines": [...]}` |
 | `BLOCKS` | PDF pages, transcript turns | `chunk_blocks` — packs atomic units, never splits one unless it must | `{"page": 12, "pages": [12, 13]}` |
 
-### PDF extraction is done twice per page
+### PDF extraction: stored order, re-spaced
 
-`pdftotext -layout` preserves the visual grid, which keeps a table row or a
-numbered step on one line. On a two-column page it interleaves the columns line
-by line, splicing a safety warning into the middle of unrelated body text.
-Dropping `-layout` gives reading order, which fixes the columns and breaks the
-rows. A manual is both, so each page is extracted both ways and classified.
+Every page is `pdftotext -raw`, which emits text in the order the PDF stores
+it. Publishing tools store a text frame's content in the frame's own order, so
+columns come out whole, numbered steps stay in sequence and most table rows
+stay on one line. The two geometry-based modes both fail on real manuals:
+`-layout` interleaves the columns of any multi-column page, and default reading
+order scrambles dense ones.
 
-`_classify_page` measures the median width of the text left of the first 3+
-space gutter, **measured from the first non-space character** — an indented
-step (`   1    Turn on...`) has its first gutter at column 0, and counting that
-scores the line as having nothing on the left.
+`-raw` takes word gaps from the stored glyphs rather than their positions, so
+letter-spaced text comes out glued (`INJURYORDEATH.THISPUMP`). Reading order
+holds the same characters with the spaces restored from geometry, so each page
+is extracted both ways and `_respace` splits a glued raw token back into
+reading-order words. A token reading order also produced is never touched.
 
-| Median left width | Verdict | Extraction kept |
-|---|---|---|
-| ≤ 20 | rows | `-layout` |
-| ≥ 40 | columns | reading order |
-| between | **ambiguous** | reading order, and the page is recorded |
-| no gutters at all | prose | reading order |
+Each page is then cut at its section headings, found by font size from
+`pdftohtml -xml`: a heading is any line set at least 2pt above body text, at a
+size used at least three times, with words in it. Each section becomes a block
+carrying its heading path, and `chunk_blocks` starts a new chunk at each one, so
+a chunk is about one thing and says which, with a `title > heading path`
+breadcrumb. See [decisions.md](decisions.md#adr-025-pdf-chunks-follow-section-headings).
 
-Ambiguous pages are recorded in `flagged_pages`, never guessed silently. That
-list is the Phase 2 vision pass's work queue and `make status` reports the
-count. See [decisions.md](decisions.md#adr-008-pdf-pages-are-extracted-twice).
+This replaced a whitespace classifier that chose `-layout` or reading order per
+page. See [decisions.md](decisions.md#adr-024-pdf-pages-use--raw-re-spaced-from-reading-order).
 
 ## Deletion: two mechanisms, both required
 
@@ -192,16 +193,27 @@ the stack to new hardware unnecessarily painful.
 ```
 data/inbox/<domain>/   the drop folder; directory name IS the domain
 data/quarantine/       held back by the sensitivity scan
-data/state/rag.db      SQLite WAL: runs, sources, documents, quarantine
+data/state/rag.db      SQLite (rollback journal): runs, sources, documents, quarantine
 data/vault/vault.db    SQLCipher: rows, chunk text, vectors, ledger, audit
 data/vault/blobs/      AES-256-GCM originals
 data/qdrant/           open-tier index (derived; rebuildable)
+data/qdrant-snapshots/ snapshots -- outside data/qdrant so a restore into an
+                       empty storage dir does not have to step around them
 ```
+
+Everything above is owned by the **host user**, not root, because the
+containers that write it run unprivileged. See
+[Who each container runs as](#who-each-container-runs-as).
 
 Qdrant is a **derived index, not the source of truth**. Point IDs are
 `uuid5(POINT_NAMESPACE, "source_id|doc_id|chunk_index")` — deterministic and
 positional — so `make rebuild-index` reconstructs it exactly. Snapshots are an
 optimisation over that, not the recovery plan.
+
+Snapshots used to write into the container's own layer, where a `compose up`
+that recreated the container discarded them silently — awkward for the one
+feature whose purpose is surviving a move to other hardware. They are now bind
+mounted like everything else.
 
 Point IDs are deliberately **not** a hash of chunk content: that makes a
 document's stale chunks unenumerable, and collides whenever two documents share
@@ -226,6 +238,32 @@ process with them. See
 `vault.db` regardless of what the process does. The read-only mount on
 `data/state` is why reader-side helpers must degrade rather than migrate; see
 [development.md](development.md#migrations).
+
+### Who each container runs as
+
+| Container | Runs as | Why |
+|---|---|---|
+| `ingestion-worker` | **1000:1000** | Opens untrusted input, and writes bind-mounted `./data` — as root it left host files nobody could edit without sudo |
+| `mcp-server` | **1000:1000** | The HTTP surface the model talks to |
+| `qdrant` | **1000:1000** | Set in compose, since it is a third-party image |
+| `mcp-vault` | **root** | Not yet migrated — see below |
+
+`RAG_UID`/`RAG_GID` are build args and compose variables, defaulting to
+`1000:1000`. They must match the owner of `./data` or every write fails. On a
+host where you are not uid 1000, set them in `.env` and rebuild.
+
+**`mcp-vault` is still root, deliberately.** It has the strongest case of the
+four — it holds the key — so this is a migration problem, not a design one:
+`vault.salt`, `vault.verifier`, `vault.db` and `control.sock` on the live
+volume are root-owned `0600`, and changing their owner means touching the
+vault's secret material while it is in daily use. That is worth doing on its
+own, with the vault sealed and a backup taken.
+
+One visible consequence: `control.sock` is `0600` and owned by root, so the
+now-unprivileged worker cannot read it. `make status` and `make doctor`
+therefore cannot report vault state and say so, rather than printing a
+permission error that reads like a fault. `make vault-status` runs inside the
+vault container and is unaffected.
 
 `data/state/` and `data/vault/` are separate directories precisely so these
 mounts can differ. Mount directories, never files: Docker creates a *directory*

@@ -39,11 +39,19 @@ Consequences you must preserve when changing [app/pipeline/sync.py](app/pipeline
 ```bash
 make build && make up      # llm-net must exist first: cd ~/Dev/LLM && docker compose up -d
 make doctor                # run this before trusting anything
-make ingest / query / status / add / reindex / rebuild-index
+make ingest / query / list / status / add / reindex / rebuild-index
+make eval                  # retrieval eval: tests/retrieval/questions.yaml
 make lifecycle / supersede / stale / retract / restore
-make unlock / lock / vault-query / vault-lifecycle / approve / vault-audit
+make unlock / lock / vault-list / vault-query / vault-lifecycle / approve / vault-audit
 make test                  # pytest inside the worker image
 ```
+
+[scripts/rag](scripts/rag) forwards all of these from any directory
+(`rag list`, `rag add <file> <domain>`, `rag query "..."`). It is a script
+rather than an alias because an alias cannot resolve a relative path against
+the caller's cwd before make cd's into the repo, and does not exist in cron or
+systemd units. **Full reference: [docs/cli.md](docs/cli.md)** — update it when
+you add a target, along with the README command list.
 
 Local dev without Docker (`.venv` is gitignored):
 
@@ -101,25 +109,35 @@ is bare numbers with nothing saying which column is torque.
 the last block win. A chunk built from pages 11 and 12 that cited only 12 sends
 the reader past the answer.
 
-### PDF extraction: every page is done twice
+**PDF sections get their own chunks.** The extractor cuts each page at its
+headings, found by **font size** via `pdftohtml -xml` (as text a heading is
+indistinguishable from a table cell). `chunk_blocks` starts a chunk at every
+`section_start` block unless what is pending is under `SECTION_MIN_TOKENS`
+(40 — a bare chapter title), and prefixes `title > heading path`. Blocks
+without `heading_path` (transcript turns) pack exactly as before. Tune against
+`make eval`, not intuition: 120 looked safer and dropped hit@3 from 79% to
+57%. ADR-025.
 
-`pdftotext -layout` keeps a table row or a numbered step on one line, and
-scrambles two-column pages by interleaving the columns. Dropping `-layout`
-fixes the columns and breaks the rows. A manual is both, so `_classify_page`
-measures the median width of the text left of the first 3+ space gutter —
-short means rows, long means columns — and each page keeps whichever
-extraction fits.
+### PDF extraction: `-raw`, re-spaced from reading order
 
-Measure from the **first non-space character**, not column 0: an indented step
-(`   1    Turn on...`) has its first gutter at position 0, and counting that
-scores the line as having nothing on the left.
+Every page is `pdftotext -raw`: text in the order the PDF stores it. That keeps
+columns whole, numbered steps in sequence and most table rows on one line.
+`-layout` interleaves the columns of any multi-column page, and default reading
+order scrambles dense ones (Roland's A3 sheets split the POLY row from its
+table). The old whitespace classifier choosing between those two was retired
+after `-raw` beat both on the whole corpus — see ADR-024.
 
-Between the thresholds the whitespace genuinely cannot tell a data table from
-two-column prose. Those pages take reading order and are **recorded in
-`flagged_pages`** rather than silently guessed; that list is the Phase 2 VLM
-pass's work queue, and `make status` reports the count. Whitespace-aligned
-tables are deliberately not detected for the same reason — the VLM transcribing
-a page to markdown is the fix, and the chunker's table handling then applies.
+`-raw`'s one defect is **glued words** in letter-spaced text
+(`INJURYORDEATH.THISPUMP`). Reading order has the same characters with the
+spaces restored, so each page is still extracted twice and `_respace` splits a
+raw token back into reading-order words — only when reading order never
+produced the token itself, and in the fewest pieces.
+
+Do not reintroduce a per-page choice of mode: it was measured, and no
+threshold separates the glued pages from good ones. A PDF whose *stored* order
+is scrambled would defeat this; none seen yet, and the Phase 2 VLM pass is the
+answer if one appears. The extractor no longer sets `flagged_pages`; the column
+and `make status` line remain for whatever flags pages next.
 
 ### Citations
 
@@ -129,6 +147,14 @@ sources need no second rebuild. `search()` returns it plus a prebuilt
 `citation`. Both MCP servers' tool docstrings tell the model to quote numeric
 specs verbatim and cite — ugly-but-checkable beats fluent-but-wrong for a
 torque figure.
+
+The MCP servers do **not** send that full row: `documents.for_model` cuts it
+to content, citation, `doc_id`/`chunk_index` and score, plus lifecycle only
+when it isn't `active`. Every tool-result token is prefilled on a CPU-only
+llama-server at ~70 tokens/s, and the dropped fields were 37% of a search
+result. `search_docs` defaults to 3 hits; `search_vault` keeps 5 because a
+follow-up costs the owner another approval. The open `fetch_context` caps its
+window at 2 either side. The CLI still prints everything.
 
 ### Document lifecycle
 
@@ -232,7 +258,9 @@ frontier presets is configuration, and the approval prompt is the backstop.
 | Qdrant image digest | Snapshot restore needs a matching minor version, so `:latest` breaks migration. Pinned by digest with a rollback comment. |
 | Glob matching | `fnmatch("a.md", "**/*")` is **False** — `**/` needs a literal slash. `_matches` handles the prefix; an empty `include` means everything. |
 | Bind-mounted files | Docker creates a *directory* when a bind-mounted file is missing. Mount directories: `data/state/` and `data/vault/` are separate so `mcp-server` gets state read-only and no vault mount at all. |
+| `FORCE=1` does not re-embed | It only overrides the sweep's deletion floor. A document re-embeds when its **extracted text** changes, so a chunking-only change reaches the index through `rag reindex`, which blanks the stored hashes (never deletes rows: that dropped the retracted tombstone and every lifecycle flag). |
 | Fingerprint guard | Dimension alone cannot detect a model swap — bge-base, nomic-v1.5, gte-base and arctic-m are all 768-dim. |
+| `rag.db` journal mode | **Not WAL.** A WAL file opens read-only only if its `-wal`/`-shm` exist or can be created; the worker deletes them on exit and the readers' `:ro` mount can't recreate them, so every MCP state read failed. `_connect` sets `DELETE` on each write open, which also converts an old file. |
 
 ## Storage layout
 
@@ -242,7 +270,7 @@ Everything under `data/` as bind mounts, so the stack is one rsync-able tree
 ```
 data/inbox/<domain>/   the drop folder; directory name IS the domain
 data/quarantine/       held back by the sensitivity scan
-data/state/rag.db      SQLite WAL: runs, sources, documents, quarantine
+data/state/rag.db      SQLite (rollback journal): runs, sources, documents, quarantine
 data/vault/vault.db    SQLCipher: rows, chunk text, vectors, ledger, audit
 data/vault/blobs/      AES-256-GCM originals
 data/qdrant/           open-tier index (derived; rebuildable)
@@ -258,9 +286,9 @@ VLM receipt extraction + `ledger` + `query_ledger`; git/web sources with Crawl4A
 (**ingest image only** — Playwright is 1-2 GB); tesseract for bulk scanned OCR.
 `sources.yaml` rejects `git`/`web` types until then rather than failing obscurely.
 
-The vision model added for receipts is also the layout extractor for manuals:
-render a flagged page with `pdftoppm` (already installed), ask for markdown, and
-the table-aware chunker handles the result. One mechanism covers column
-scrambling, broken tables and pages with no text layer, on the ~6% of pages that
-need it rather than all of them. Tesseract keeps the narrower job — bulk
+The vision model added for receipts is also a layout extractor for manuals:
+render a page with `pdftoppm` (already installed), ask for markdown, and the
+table-aware chunker handles the result. `-raw` removed most of its original
+work queue; what is left is pages with no text layer and whitespace-aligned
+tables, and it needs a new trigger since the extractor no longer flags pages. Tesseract keeps the narrower job — bulk
 plain-text OCR where structure is not the content.

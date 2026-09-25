@@ -16,6 +16,7 @@ import logging
 
 from mcp.server.mcpserver import Context, MCPServer
 
+from app import documents
 from app.config import settings
 from app.domains import Tier, domains_in
 from app.vault import control, grants, identity, service
@@ -117,6 +118,10 @@ def search_vault(
             include_stale=include_stale,
             ctx=_context(ctx),
         )
+        # Default limit stays at 5 here, unlike the open tier's 3: a follow-up
+        # search costs the owner another approval at a terminal, which is worth
+        # more than the prefill two extra hits cost.
+        rows = [documents.for_model(r) for r in rows]
         return {"results": rows, "count": len(rows)}
     except VaultSealed as exc:
         return _denied(exc, "VAULT_SEALED")
@@ -149,6 +154,7 @@ def fetch_context(
         rows = service.fetch_context(
             doc_id, chunk_index, before=before, after=after, ctx=_context(ctx)
         )
+        rows = [documents.for_model(r) for r in rows]
         return {"results": rows, "count": len(rows)}
     except VaultSealed as exc:
         return _denied(exc, "VAULT_SEALED")

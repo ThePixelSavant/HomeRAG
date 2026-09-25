@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+# Run the RAG control plane from anywhere.
+#
+# Everything here is a thin forward to the Makefile, which stays the single
+# definition of what the commands do. Two things make that non-trivial and are
+# the reason this is a script rather than a shell alias:
+#
+#   1. An alias cannot fix a relative path. `rag add manual.pdf manuals` run
+#      from ~/Documents has to resolve that file against YOUR directory before
+#      make runs in the repo, or it silently means a different file -- or none.
+#   2. Aliases do not exist in scripts, cron, systemd units, or any shell but
+#      the interactive one that defined them. A file on PATH works everywhere.
+#
+# Install:  ln -s ~/Dev/RAG/scripts/rag ~/.local/bin/rag
+set -euo pipefail
+
+# Resolve through the symlink so the repo can move without reinstalling.
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
+
+usage() {
+    cat <<'EOF'
+rag -- RAG knowledge base, from any directory
+
+  rag add <file> <domain> [--move]       file a document and ingest it
+  rag query <text> [--limit N]           search the open tier
+            [--domain d] [--stale]
+            [--superseded] [--dense]
+  rag list [--domain d] [--match x]      every indexed document
+           [--all]
+  rag remove <uri> "<reason>"            retract: delete vectors, keep it out
+  rag restore <uri>                      clear a flag (then: rag ingest)
+  rag <target> [VAR=value ...]           anything else in the Makefile
+
+Common targets: status, doctor, ingest, lifecycle, unlock, vault-list,
+vault-query, vault-audit, approve, supersede, stale, rebuild-index.
+
+The domain on `add` decides whether a document is stored in the clear or in
+the encrypted vault, so it is always required and never guessed.
+
+Full reference: docs/cli.md
+EOF
+}
+
+# `make` must run in the repo, so any path the caller gave relative to THEIR
+# directory has to be made absolute first. Done before the cd, deliberately.
+abspath() {
+    local p="$1"
+    [ -e "$p" ] || { echo "rag: $p: no such file" >&2; exit 2; }
+    printf '%s' "$(cd "$(dirname "$p")" && pwd)/$(basename "$p")"
+}
+
+[ $# -gt 0 ] || { usage; exit 0; }
+cmd="$1"; shift
+
+case "$cmd" in
+-h|--help|help)
+    if [ "$cmd" = help ]; then
+        usage
+        echo
+        grep -hE '^[a-z][a-z-]*:.*##' "$ROOT/Makefile" \
+            | sed 's/:[^#]*## */\t/' | expand -t26 | sed 's/^/  /'
+    else
+        usage
+    fi
+    exit 0
+    ;;
+
+add)
+    # Positional, because `rag add FILE=x DOMAIN=y` from another directory is
+    # exactly the ceremony this script exists to remove.
+    [ $# -ge 2 ] || { echo "usage: rag add <file> <domain> [--move]" >&2; exit 2; }
+    file="$(abspath "$1")"; domain="$2"; shift 2
+    move=
+    for arg in "$@"; do
+        case "$arg" in
+        --move|-m) move=1 ;;
+        *) echo "rag add: unexpected argument '$arg'" >&2; exit 2 ;;
+        esac
+    done
+    cd "$ROOT"
+    exec make -s add FILE="$file" DOMAIN="$domain" ${move:+MOVE=1}
+    ;;
+
+query|q)
+    [ $# -ge 1 ] || { echo 'usage: rag query <text> [--limit N] [--domain d]' >&2; exit 2; }
+    text="$1"; shift
+    limit=; domain=; extra=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+        --limit) limit="$2"; shift 2 ;;
+        --domain|--domains) domain="$2"; shift 2 ;;
+        --stale) extra+=(STALE=1); shift ;;
+        --superseded) extra+=(SUPERSEDED=1); shift ;;
+        --dense) extra+=(ARGS=--dense); shift ;;
+        *) echo "rag query: unexpected argument '$1'" >&2; exit 2 ;;
+        esac
+    done
+    cd "$ROOT"
+    exec make -s query Q="$text" ${limit:+LIMIT="$limit"} ${domain:+DOMAINS="$domain"} "${extra[@]}"
+    ;;
+
+list|ls)
+    domain=; match=; all=
+    while [ $# -gt 0 ]; do
+        case "$1" in
+        --domain) domain="$2"; shift 2 ;;
+        --match) match="$2"; shift 2 ;;
+        --all|-a) all=1; shift ;;
+        *) echo "rag list: unexpected argument '$1'" >&2; exit 2 ;;
+        esac
+    done
+    cd "$ROOT"
+    exec make -s list ${domain:+DOMAIN="$domain"} ${match:+MATCH="$match"} ${all:+ALL=1}
+    ;;
+
+restore)
+    # Pairs with `remove`, so it takes its argument the same way. Without this
+    # it fell through to the catch-all, which handed make a bare word -- make
+    # read it as another target, URI was never set, and the usage message
+    # blamed the user for an argument they had in fact supplied.
+    [ $# -ge 1 ] || { echo "usage: rag restore <uri>" >&2; exit 2; }
+    uri="$1"; shift
+    cd "$ROOT"
+    exec make -s restore URI="$uri" "$@"
+    ;;
+
+remove|retract)
+    # Named `remove` as well because that is what people look for, and because
+    # deleting the file is NOT a removal -- the next ingest re-indexes it.
+    [ $# -ge 2 ] || {
+        echo 'usage: rag remove <uri> "<reason>"' >&2
+        echo 'The reason is required: it is recorded on the tombstone and is' >&2
+        echo 'what explains the deletion to whoever finds it missing later.' >&2
+        exit 2
+    }
+    uri="$1"; reason="$2"; shift 2
+    cd "$ROOT"
+    exec make -s retract URI="$uri" REASON="$reason" "$@"
+    ;;
+
+*)
+    # Everything else goes through untouched, so a new Makefile target works
+    # here the day it is added without this script needing to know about it.
+    #
+    # But make reads a bare word as another TARGET, not as an argument, so
+    # `rag stale foo.md` would silently fail to set URI and then complain that
+    # URI was missing. Refuse it here and say which form to use, rather than
+    # letting make give a confusing answer about a target it cannot build.
+    for arg in "$@"; do
+        case "$arg" in
+        *=*|-*) ;;
+        *)
+            echo "rag $cmd: '$arg' looks like a value, not a make target." >&2
+            echo "Pass it as NAME=value, e.g.:" >&2
+            echo "    rag $cmd URI=\"$arg\"" >&2
+            echo "Or use a shorthand: rag add|query|list|remove|restore --help" >&2
+            exit 2
+            ;;
+        esac
+    done
+    cd "$ROOT"
+    exec make "$cmd" "$@"
+    ;;
+esac
