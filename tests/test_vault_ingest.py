@@ -19,7 +19,7 @@ import sys
 import pytest
 
 from app.pipeline import state, sync
-from app.sources import LOCAL, Source
+from app.sources import INBOX, LOCAL, Source
 from app.vault import store as vault_store
 from app.vault.keyagent import AGENT
 
@@ -93,6 +93,27 @@ def test_unchanged_document_is_not_re_embedded(vault_source):
     assert second.docs_indexed == 0
     assert second.docs_skipped == 1
     assert second.chunks_upserted == 0
+
+
+def test_consumed_inbox_documents_survive_the_next_run(vault_source):
+    """A vault inbox file is consumed into an encrypted blob when it is filed,
+    so the next run finds the drop folder empty. That is not a disappearance:
+    the sweep used to delete the document and its blob on that second run."""
+    inbox = Source(id="inbox:receipts", type=INBOX, domain="receipts", path=vault_source.path)
+    first = _sync(inbox, run_id="run-1")
+    assert first.docs_indexed == 1
+    assert not any(inbox.path.iterdir()), "the plaintext should have been consumed"
+
+    second = _sync(inbox, run_id="run-2")
+    assert second.chunks_deleted == 0
+
+    conn = AGENT.connect()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] >= 1
+        assert conn.execute("SELECT COUNT(*) FROM blobs").fetchone()[0] == 1
+    finally:
+        conn.close()
 
 
 def test_changed_document_is_reindexed(vault_source):

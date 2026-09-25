@@ -608,7 +608,12 @@ def sync_source(source: Source, run_id: str, *, force: bool = False, dry_run: bo
                 except qdrant_store.SweepRefused as exc:
                     result.notes.append(str(exc))
                     logger.warning("Sweep refused for %s: %s", source.id, exc)
-            else:
+            elif source.type != INBOX:
+                # Not for a vault INBOX: its files are consumed into encrypted
+                # blobs as they are ingested, so an empty drop folder is the
+                # normal state, not a disappearance. Sweeping it deleted every
+                # receipt, blob included, on the run after it was filed. A
+                # vault inbox document leaves only by retraction.
                 for row in vault_store.documents_missing_run(vconn, source.id, run_id):
                     vault_store.delete_document(vconn, row["doc_id"])
                     vault_blobs.delete(vconn, row["doc_id"])
