@@ -17,6 +17,8 @@ import shutil
 import sys
 from pathlib import Path
 
+import yaml
+
 from app import documents
 from app.config import settings
 from app.domains import DOMAIN_TIERS, Tier, UnknownDomainError, domains_in, tier_of
@@ -255,11 +257,17 @@ def cmd_reindex(args) -> int:
         raise SystemExit(f"No source with id {args.source_id!r}")
     source = sources[0]
     if not source.is_vault:
+        # Blank the stored hash so every document reads as changed, rather
+        # than deleting the rows. Deleting also dropped the tombstone that
+        # keeps a retracted document out -- so reindex re-indexed it -- and
+        # every other document's lifecycle, which re-indexing must preserve.
+        placeholders = ",".join("?" for _ in documents.TOMBSTONED)
         with state.writer() as conn:
-            for row in conn.execute(
-                "SELECT doc_id FROM documents WHERE source_id=?", (source.id,)
-            ).fetchall():
-                conn.execute("DELETE FROM documents WHERE doc_id=?", (row["doc_id"],))
+            conn.execute(
+                "UPDATE documents SET content_hash='' "
+                f"WHERE source_id=? AND lifecycle NOT IN ({placeholders})",
+                (source.id, *sorted(documents.TOMBSTONED)),
+            )
     return _run(sources, force=True, dry_run=False)
 
 
@@ -515,6 +523,60 @@ def cmd_query(args) -> int:
     return 0
 
 
+_QUOTES = str.maketrans({"’": "'", "‘": "'", "“": '"', "”": '"'})
+
+
+def _squash(text: str) -> str:
+    """Compare text regardless of spacing, case and curly quotes.
+
+    Extraction changes move line breaks and spaces (`1–16,OFF` vs `1–16, OFF`)
+    without changing what a chunk says, and must not read as a miss.
+    """
+    return "".join(text.translate(_QUOTES).lower().split())
+
+
+def cmd_eval(args) -> int:
+    """Rank each question's known answer in the open-tier search.
+
+    Measures what a model gets: `search_docs` returns the top 3 by default, so
+    hit@3 is the number that matters, and the size of those 3 is what gets
+    prefilled. Ranks are searched to `--depth` so a near miss shows as one.
+    """
+    questions = yaml.safe_load(Path(args.file).read_text())["questions"]
+    rows = []
+    for q in questions:
+        hits = qdrant_store.search(q["question"], limit=args.depth, domains=domains_in(Tier.OPEN))
+        want = _squash(q["expect"])
+        rank = next(
+            (n for n, h in enumerate(hits, 1) if h["uri"] == q["uri"] and want in _squash(h["content"])),
+            None,
+        )
+        rows.append({"id": q["id"], "rank": rank, "top3_chars": sum(len(h["content"]) for h in hits[:3])})
+
+    total = len(rows)
+    summary = {
+        "questions": total,
+        "hit@1": sum(1 for r in rows if r["rank"] == 1) / total,
+        "hit@3": sum(1 for r in rows if r["rank"] and r["rank"] <= 3) / total,
+        f"mrr@{args.depth}": sum(1 / r["rank"] for r in rows if r["rank"]) / total,
+        "mean_top3_chars": round(sum(r["top3_chars"] for r in rows) / total),
+    }
+    if args.json:
+        print(json.dumps({"summary": summary, "questions": rows}, indent=2))
+        return 0
+
+    width = max(len(r["id"]) for r in rows)
+    for r in rows:
+        rank = str(r["rank"]) if r["rank"] else f">{args.depth}"
+        print(f"  {r['id']:<{width}}  rank {rank:>4}  top-3 {r['top3_chars']:>5} chars")
+    print(
+        f"\nhit@1 {summary['hit@1']:.0%}   hit@3 {summary['hit@3']:.0%}   "
+        f"mrr@{args.depth} {summary[f'mrr@{args.depth}']:.3f}   "
+        f"mean top-3 {summary['mean_top3_chars']} chars   ({total} questions)"
+    )
+    return 0
+
+
 def cmd_status(args) -> int:
     payload: dict = {
         "collection": settings.collection_name,
@@ -661,6 +723,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--include-stale", action="store_true")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_query)
+
+    p = sub.add_parser("eval", help="rank known answers in open-tier search")
+    p.add_argument("--file", default="tests/retrieval/questions.yaml")
+    p.add_argument("--depth", type=int, default=10, help="how far down to look for the answer")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_eval)
 
     p = sub.add_parser("status")
     p.add_argument("--json", action="store_true")

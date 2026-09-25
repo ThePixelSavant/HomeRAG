@@ -40,6 +40,7 @@ Consequences you must preserve when changing [app/pipeline/sync.py](app/pipeline
 make build && make up      # llm-net must exist first: cd ~/Dev/LLM && docker compose up -d
 make doctor                # run this before trusting anything
 make ingest / query / list / status / add / reindex / rebuild-index
+make eval                  # retrieval eval: tests/retrieval/questions.yaml
 make lifecycle / supersede / stale / retract / restore
 make unlock / lock / vault-list / vault-query / vault-lifecycle / approve / vault-audit
 make test                  # pytest inside the worker image
@@ -248,6 +249,7 @@ frontier presets is configuration, and the approval prompt is the backstop.
 | Qdrant image digest | Snapshot restore needs a matching minor version, so `:latest` breaks migration. Pinned by digest with a rollback comment. |
 | Glob matching | `fnmatch("a.md", "**/*")` is **False** — `**/` needs a literal slash. `_matches` handles the prefix; an empty `include` means everything. |
 | Bind-mounted files | Docker creates a *directory* when a bind-mounted file is missing. Mount directories: `data/state/` and `data/vault/` are separate so `mcp-server` gets state read-only and no vault mount at all. |
+| `FORCE=1` does not re-embed | It only overrides the sweep's deletion floor. A document re-embeds when its **extracted text** changes, so a chunking-only change reaches the index through `rag reindex`, which blanks the stored hashes (never deletes rows: that dropped the retracted tombstone and every lifecycle flag). |
 | Fingerprint guard | Dimension alone cannot detect a model swap — bge-base, nomic-v1.5, gte-base and arctic-m are all 768-dim. |
 | `rag.db` journal mode | **Not WAL.** A WAL file opens read-only only if its `-wal`/`-shm` exist or can be created; the worker deletes them on exit and the readers' `:ro` mount can't recreate them, so every MCP state read failed. `_connect` sets `DELETE` on each write open, which also converts an old file. |
 

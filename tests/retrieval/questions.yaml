@@ -1,0 +1,81 @@
+# Retrieval eval for `make eval`. Not a pytest file: it needs the live index.
+#
+# A question passes at rank N when the Nth search result is from `uri` and its
+# content contains `expect`. The match ignores whitespace and case, so it
+# survives re-chunking and extraction changes that only move line breaks or
+# spaces. `expect` is answer text, not a heading: a hit on the heading alone
+# is not an answer.
+#
+# Phrased the way a person asks, not the way the manual words it -- the
+# SH-01A question never says "Assign Mode", which is the whole difficulty.
+
+questions:
+  - id: sh01a-poly
+    question: how do I set the SH-01A to play as a polysynth?
+    uri: SH-01A_eng04_W.pdf
+    expect: Plays polyphonically
+
+  - id: sh01a-reset
+    question: how do I factory reset the SH-01A?
+    uri: SH-01A_eng04_W.pdf
+    expect: While holding down the [2] button, turn on the power
+
+  - id: sh01a-transpose
+    question: how do I transpose the SH-01A keyboard?
+    uri: SH-01A_eng04_W.pdf
+    expect: Hold down the [KEYTRANSPOSE] button and press any key
+
+  - id: tb03-midi
+    question: what MIDI channel does the TB-03 use?
+    uri: TB-03_eng03_W.pdf
+    expect: Specifies the MIDI transmit/receive channel
+
+  - id: tb03-tempo
+    question: how do I set the tempo on the TB-03?
+    uri: TB-03_eng03_W.pdf
+    expect: use the 14 [VALUE] knob to adjust the tempo
+
+  - id: tr06-write
+    question: how do I record a pattern on the TR-06?
+    uri: TR-06_eng02_W.pdf
+    expect: Use the [PATTERN GROUP] button to select the pattern group
+
+  - id: tr06-backup
+    question: how do I back up the TR-06?
+    uri: TR-06_eng02_W.pdf
+    expect: Connect your computer to the TR-06's USB port
+
+  - id: bsp-tempo-range
+    question: what tempo range does the BeatStep Pro support?
+    uri: beatstep-pro_Manual_2_0_EN.pdf
+    expect: 30-300 beats per minute
+
+  - id: bsp-tap
+    question: how many taps does tap tempo take on the BeatStep Pro?
+    uri: beatstep-pro_Manual_2_0_EN.pdf
+    expect: 2, 3, or 4 taps
+
+  - id: bsp-save
+    question: how do I save a project on the BeatStep Pro?
+    uri: beatstep-pro_Manual_2_0_EN.pdf
+    expect: Hold the SAVE button
+
+  - id: al-activate
+    question: how do I register and activate Analog Lab?
+    uri: analog-lab_Manual_5_11_1_EN.pdf
+    expect: asking you to log in or create a new Arturia account
+
+  - id: xps-memory
+    question: how do I remove a memory module from the XPS 8700?
+    uri: xps-8700-owners-manual.pdf
+    expect: Press out the securing clip at each end of the memory-module connector
+
+  - id: xps-setup
+    question: how do I enter system setup on the XPS 8700?
+    uri: xps-8700-owners-manual.pdf
+    expect: watch for the F2 prompt
+
+  - id: xps-bezel
+    question: how do I put the front bezel back on the XPS 8700?
+    uri: xps-8700-owners-manual.pdf
+    expect: Align and insert the front bezel clamps

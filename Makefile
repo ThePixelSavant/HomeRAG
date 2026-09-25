@@ -9,7 +9,7 @@ WORKER     = $(COMPOSE) run --rm ingestion-worker
 VAULTEXEC  = docker exec -it mcp-vault python -m app.vaultctl
 VAULTRUN   = docker exec mcp-vault python -m app.vaultctl
 
-.PHONY: up down logs build doctor warm-cache ingest reindex add query status \
+.PHONY: up down logs build doctor warm-cache ingest reindex add query eval status \
         rebuild-index review-quarantine supersede stale retract restore lifecycle list \
         unlock lock vault-status vault-query vault-list vault-lifecycle \
         approve vault-audit test
@@ -64,6 +64,9 @@ query:                  ## Search the open tier: make query Q="priming the pump"
 	@test -n "$(Q)" || { echo 'usage: make query Q="..."'; exit 2; }
 	$(WORKER) query "$(Q)" $(if $(DOMAINS),--domains $(DOMAINS)) $(if $(LIMIT),--limit $(LIMIT)) \
 	  $(if $(SUPERSEDED),--include-superseded) $(if $(STALE),--include-stale) $(ARGS)
+
+eval:                   ## Rank known answers in search: make eval [FILE=tests/retrieval/q.yaml] [JSON=1]
+	$(WORKER) eval $(if $(FILE),--file $(FILE)) $(if $(JSON),--json) $(ARGS)
 
 status:                 ## Index health, per-domain counts, vault state, backlogs
 	$(WORKER) status $(if $(JSON),--json)

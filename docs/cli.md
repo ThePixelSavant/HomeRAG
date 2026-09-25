@@ -131,9 +131,13 @@ sweep is refusing. If you did not, the refusal is correct — see
 rag reindex SOURCE=<id>
 ```
 
-Drops the state rows for that source and re-reads every file. Use after
-changing chunking or extraction; for an embedding-model change use
-`rebuild-index`.
+Re-reads and re-embeds every file in that source. Use after changing chunking
+or extraction: a plain `rag ingest` skips any document whose extracted text is
+unchanged, even with `FORCE=1`, so a chunking change never reaches the index
+that way. For an embedding-model change use `rebuild-index`.
+
+Lifecycle survives: a stale or superseded document stays flagged, and a
+retracted one stays out — its tombstone is left alone and it is not re-read.
 
 ---
 
@@ -396,6 +400,29 @@ distinction matters to the sweep.
 Vault state reads `not readable from here (by design)` — the control socket is
 `0600` and owned by the vault container's user, while the worker now runs
 unprivileged. Use `rag vault-status`.
+
+### `rag eval` — measure retrieval
+
+```bash
+rag eval [FILE=tests/retrieval/questions.yaml] [JSON=1]
+```
+
+Asks each question in the file and reports the rank at which the known answer
+came back, then hit@1, hit@3, MRR and the size of the top 3 results. A
+question passes at rank N when the Nth result is from its `uri` and contains
+its `expect` text, ignoring spacing, case and curly quotes, so it survives
+re-chunking. hit@3 is the number that matters: `search_docs` gives a model 3
+results by default, and the size of those 3 is what the model must read.
+
+Run it before and after any change to extraction or chunking, and add a
+question whenever a real one comes back wrong.
+
+```
+  sh01a-poly       rank    2  top-3  4013 chars
+  tb03-tempo       rank    5  top-3  4480 chars
+  ...
+hit@1 57%   hit@3 79%   mrr@10 0.699   mean top-3 2801 chars   (14 questions)
+```
 
 ### `rag status` — index health
 

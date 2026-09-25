@@ -605,6 +605,36 @@ def test_tombstones_survive_the_disappearance_sweep(state_db):
         assert "keep" in state.tombstones(conn, "s")
 
 
+def test_reindex_keeps_tombstones_and_lifecycle(state_db, monkeypatch):
+    """Reindex used to delete every row for the source -- including the
+    tombstone that keeps a retracted file out, so it came straight back."""
+    import argparse
+
+    from app import documents, ingest
+    from app.pipeline import state
+    from app.sources import Source
+
+    with state.writer() as conn:
+        _doc(conn, "gone", "bad-spec.md")
+        _doc(conn, "old", "rack-plan.md")
+        _doc(conn, "live", "topology.md")
+        state.set_lifecycle(conn, "gone", documents.RETRACTED, reason="wrong")
+        state.set_lifecycle(conn, "old", documents.STALE, reason="decommissioned")
+    monkeypatch.setattr(ingest, "all_sources", lambda: [Source(id="s", type="local", domain="notes")])
+    monkeypatch.setattr(ingest, "_run", lambda sources, force, dry_run: 0)
+
+    ingest.cmd_reindex(argparse.Namespace(source_id="s"))
+
+    with state.reader() as conn:
+        rows = {r["doc_id"]: r for r in conn.execute("SELECT * FROM documents")}
+    assert rows["gone"]["lifecycle"] == documents.RETRACTED
+    assert rows["gone"]["content_hash"] == "h"
+    assert rows["old"]["lifecycle"] == documents.STALE
+    assert rows["old"]["lifecycle_reason"] == "decommissioned"
+    # Everything not tombstoned reads as changed, so the run re-embeds it.
+    assert rows["old"]["content_hash"] == rows["live"]["content_hash"] == ""
+
+
 def test_retracted_documents_have_no_opt_in():
     from app import documents
 
