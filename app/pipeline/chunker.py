@@ -56,7 +56,7 @@ _HEADER_BUDGET_RATIO = 0.5
 
 # Per-block keys that chunk_blocks combines across a chunk rather than letting
 # the last block win.
-_AGGREGATED = frozenset({"page", "extract_mode", "layout_verdict"})
+_AGGREGATED = frozenset({"page", "extract_mode"})
 
 
 @dataclass

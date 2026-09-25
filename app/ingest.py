@@ -444,7 +444,7 @@ def cmd_list(args) -> int:
         if row["status"] != state.INDEXED:
             notes.append(row["status"])
         if row["flagged_pages"]:
-            notes.append(f"{row['flagged_pages']} undecided page(s)")
+            notes.append(f"{row['flagged_pages']} page(s) flagged")
         suffix = f"  [{', '.join(notes)}]" if notes else ""
         print(f"  {uri:<{width}}  {row['domain']:<10} {row['chunk_count']:>4} chunks"
               f"  {(row['indexed_at'] or '')[:10]}{suffix}")
@@ -566,7 +566,7 @@ def cmd_status(args) -> int:
     flagged = payload["flagged_pages"]
     if flagged:
         total = sum(r["flagged_pages"] for r in flagged)
-        print(f"pages with undecided layout: {total} across {len(flagged)} document(s)")
+        print(f"pages flagged for review: {total} across {len(flagged)} document(s)")
         for row in flagged[:5]:
             print(f"    {row['flagged_pages']:3d}  {row['uri']}  ({row['domain']})")
     if payload["quarantined_open"]:

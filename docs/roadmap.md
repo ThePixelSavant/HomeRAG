@@ -51,6 +51,10 @@ extracted both ways and classified by the shape of its text.
 | XPS p86 (numbered steps) | 1 | rows | `-layout` |
 | TPM guide p1–2 (pure prose) | no gutters | prose | reading order |
 
+*Since replaced:* the classifier kept `-layout` for Roland's dense A3 sheets,
+which scrambled them. Every page is now `pdftotext -raw`, re-spaced from
+reading order — [ADR-024](decisions.md#adr-024-pdf-pages-use--raw-re-spaced-from-reading-order).
+
 ### 2. Table-aware chunking
 
 A split markdown table repeats its header on every continuation chunk. The
@@ -103,9 +107,10 @@ ask for markdown, feed the result to the table chunker from Phase 1.5.
 One mechanism fixes column scrambling, broken tables, and scanned pages with no
 text layer at once.
 
-Scope it to pages that need it: those flagged ambiguous, those classified
-table-heavy, and those marked `ocr_required`. On the XPS manual that is roughly
-4 pages of 86 — about 2 minutes of CPU inference rather than 45.
+Scope it to pages that need it. `-raw` extraction (ADR-024) fixed the column
+scrambling this was first meant for, and the extractor no longer flags pages,
+so the queue is now pages marked `ocr_required` plus whitespace-aligned tables,
+which still need a detector.
 
 ### c. Tesseract, in a narrower role
 

@@ -29,7 +29,7 @@ Legend: **done** = built, tested and exercised against real data ·
 | Source manifest + implicit inbox sources | done | Directory name is the domain |
 | Enumeration with include/exclude globs | done | `**/` prefix bug fixed and regression-tested |
 | Text / markdown extraction | done | |
-| PDF extraction | done | Per-page adaptive; see [gaps](#known-gaps) for undecided pages |
+| PDF extraction | done | `pdftotext -raw`, re-spaced from reading order (ADR-024); see [gaps](#known-gaps) |
 | Claude Code transcript extraction | done | Tool calls collapsed, results dropped except errors |
 | Token-accurate chunking | done | Truncation-free tokenizer clone |
 | Markdown table header repetition | done | Whitespace tables deliberately excluded |
@@ -95,8 +95,8 @@ from unit tests.
 |---|---|
 | Two-column PDF pages are no longer scrambled | IntelliFlo p2 extracted as contiguous prose; the `-layout` output for comparison splices "General Warnings" into the middle of the body text |
 | Row structure survives | XPS p86 keeps `1    Turn on the computer.` on one line |
-| Page classifier matches measurement | 8 pages across 3 real PDFs classify exactly as measured (medians 1, 4, 25.5, 32.5, 59, 69, and two with no gutters) |
-| Undecided pages are recorded | 5 flagged across 2 manuals (4 + 1), surfaced by `make status` |
+| Dense multi-column sheets read in order | SH-01A p2 extracted with `-raw`: "Selecting Assign Mode" is followed by its steps and the MONO/UNISON/POLY/CHORD table, where `-layout` interleaved four columns (ADR-024) |
+| Glued words are re-spaced | IntelliFlo p2's warning box reads "INJURY OR DEATH. THIS PUMP SHOULD BE INSTALLED" instead of `-raw`'s `INJURYORDEATH.THISPUMP…` |
 | Table headers survive splitting | Torque fixture: 1 of 5 chunks carried column labels before, 5 of 5 after, all under the 480-token ceiling |
 | Small tables are untouched | 1 chunk, exactly 1 header |
 | Page citations point at the right page | `…install-guide.pdf, page 21` — `pdftotext -f 21` contains the quoted step |
@@ -128,9 +128,10 @@ Ordered by how likely they are to bite.
 1. **The ledger has no writer.** `query_ledger` works and is gated, but no code
    path inserts a row. Receipts ingested today are chunked and searchable, not
    summable. Phase 2.
-2. **Undecided PDF pages take reading order.** 5 of 118 pages across the two
-   indexed manuals. Prose from them is fine; a table on one may have lost its
-   row structure. Counted by `make status` under "pages with undecided layout".
+2. **PDF text follows the file's stored order.** Right for every manual
+   indexed so far; a PDF whose stored order is itself scrambled would come out
+   scrambled, and nothing detects that yet. A token `-raw` glued that reading
+   order cannot spell is left glued (Roland's `KEYTRANSPOSE`).
 3. **Whitespace-aligned tables in PDFs are not detected as tables.** Deliberate
    — a whitespace gutter cannot distinguish a data table from two-column prose,
    and guessing reintroduces the exact failure just fixed. The Phase 2 vision
@@ -156,7 +157,7 @@ Nothing is blocking the system any more. What remains is optional.
 
 1. **Swap in a vision model** — Qwen3-VL-30B-A3B-Instruct Q4_K_M plus its
    mmproj, ~18.6 GB — which Phase 2's receipt extraction depends on. It would
-   also clear the 5 undecided PDF pages in gap 2.
+   also cover the PDF cases in gap 2 that text extraction cannot.
 2. **Decide on the orphaned Docker volumes.** `rag_qdrant-data` and
    `rag_ollama-data` are left over from the pre-bind-mount layout, and there is
    an 8 GB ollama image unused by this stack. All three are untouched pending

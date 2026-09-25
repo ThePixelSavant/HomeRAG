@@ -383,45 +383,62 @@ def test_model_view_passes_errors_and_context_rows_through():
     assert "score" not in for_model(_full_hit(score=None))
 
 
-# --- PDF page layout classification ----------------------------------------
+# --- PDF extraction ----------------------------------------------------------
 
 
-def test_numbered_steps_are_read_as_rows():
-    """`1  Turn on the computer.` must stay on one line; reading order splits
-    the step number onto its own."""
-    from app.pipeline.extract.pdf import ROWS, _classify_page
+def test_respace_splits_runs_raw_glued_together():
+    """`-raw` drops spaces in letter-spaced text; reading order has them."""
+    from app.pipeline.extract.pdf import _respace
 
-    page = "\n".join(f"   {n}    Step number {n} of the procedure." for n in range(1, 8))
-    verdict, median = _classify_page(page)
-    assert verdict == ROWS
-    assert median <= 5
-
-
-def test_two_column_prose_is_read_in_reading_order():
-    from app.pipeline.extract.pdf import COLUMNS, _classify_page
-
-    left = "This guide provides important installation and maintenance detail"
-    page = "\n".join(f"{left}     Warning {n}: do not open the enclosure." for n in range(1, 8))
-    assert _classify_page(page)[0] == COLUMNS
+    reading = "INJURY OR DEATH. THIS PUMP SHOULD BE\nINSTALLED BY A PROFESSIONAL."
+    raw = "INJURYORDEATH.THISPUMP SHOULD BE\nINSTALLED BY A PROFESSIONAL."
+    assert _respace(raw, reading) == (
+        "INJURY OR DEATH. THIS PUMP SHOULD BE\nINSTALLED BY A PROFESSIONAL."
+    )
 
 
-def test_a_page_with_no_gutters_is_prose():
-    from app.pipeline.extract.pdf import PROSE, _classify_page
+def test_respace_leaves_words_reading_order_also_produced():
+    from app.pipeline.extract.pdf import _respace
 
-    verdict, median = _classify_page("Ordinary paragraph text.\nAnother line of it.\n")
-    assert verdict == PROSE
-    assert median is None
+    # "therapist" could be spelled "the rapist" from this vocabulary. It is
+    # a word reading order produced, so it is never split.
+    assert _respace("the therapist", "the rapist the therapist") == "the therapist"
+    # Nothing in reading order spells it: left alone rather than guessed at.
+    assert _respace("KEYTRANSPOSE", "unrelated words") == "KEYTRANSPOSE"
 
 
-def test_undecidable_pages_are_flagged_not_guessed():
-    """Between the thresholds the whitespace genuinely cannot tell a data table
-    from two-column prose. Recording it gives the Phase 2 VLM pass a work
-    queue instead of a silent coin flip."""
-    from app.pipeline.extract.pdf import AMBIGUOUS, LEFT_COLUMNS_MIN, LEFT_ROWS_MAX, _classify_page
+def test_respace_uses_the_fewest_pieces():
+    from app.pipeline.extract.pdf import _respace
 
-    width = (LEFT_ROWS_MAX + LEFT_COLUMNS_MIN) // 2
-    page = "\n".join(f"{'x' * width}     right hand column {n}" for n in range(1, 8))
-    assert _classify_page(page)[0] == AMBIGUOUS
+    assert _respace("1.Press MasterTune", "1. Press Master Tune MasterTune") == (
+        "1. Press MasterTune"
+    )
+
+
+def test_pages_are_extracted_in_stored_order(tmp_path, monkeypatch):
+    """Every page takes `-raw`, re-spaced from reading order, and says so."""
+    from app.pipeline.extract import pdf
+
+    calls = []
+
+    def fake(path, page, mode=pdf.MODE_RAW):
+        calls.append((page, mode))
+        text = "Selecting Assign Mode\n1.Press [MENU]. " * 10
+        return text if mode == pdf.MODE_RAW else text.replace("1.Press", "1. Press")
+
+    monkeypatch.setattr(pdf, "_pdfinfo", lambda path: (2, "SH-01A"))
+    monkeypatch.setattr(pdf, "_page_text", fake)
+    manual = tmp_path / "sh01a.pdf"
+    manual.write_bytes(b"%PDF-1.4")
+
+    doc = pdf.PdfExtractor().extract(manual)
+    assert sorted(calls) == [(1, "raw"), (1, "reading"), (2, "raw"), (2, "reading")]
+    assert [b.extra for b in doc.blocks] == [
+        {"page": 1, "extract_mode": "raw"},
+        {"page": 2, "extract_mode": "raw"},
+    ]
+    assert "1. Press [MENU]" in doc.blocks[0].text
+    assert "flagged_pages" not in doc.extra
 
 
 # --- state database --------------------------------------------------------

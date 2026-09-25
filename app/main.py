@@ -229,10 +229,10 @@ def get_index_status() -> dict:
         # Surfaced rather than hidden: an index that silently omits scanned
         # PDFs looks complete when it is not.
         "ocr_required_count": by_status.get(state.OCR_REQUIRED, 0),
-        # Pages whose layout could not be decided from whitespace alone. Text
-        # from them is in reading order, which is right for prose and wrong for
-        # a table, so treat figures quoted from these documents with care.
-        "undecided_layout_pages": sum(r["flagged_pages"] for r in flagged),
+        # Pages an extractor flagged as possibly misread. Treat figures quoted
+        # from these documents with care. The PDF extractor no longer flags
+        # any (see extract/pdf.py); the count stays for whatever does next.
+        "pages_flagged_for_review": sum(r["flagged_pages"] for r in flagged),
         "quarantined_count": quarantined,
         "vault_domains": domains_in(Tier.VAULT),
         "note": "Vault domains are served by the separate vault tool server.",

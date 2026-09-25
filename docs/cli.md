@@ -151,7 +151,7 @@ Open tier only. Vault documents are in the encrypted database — see
 
 ```
   analog-lab_Manual_5_11_1_EN.pdf           manuals   118 chunks  2026-09-23
-  intelliflo3-pro3-vsf-install-guide.pdf    manuals    67 chunks  2026-09-20  [4 undecided page(s)]
+  intelliflo3-pro3-vsf-install-guide.pdf    manuals    67 chunks  2026-09-20
 
   19 active document(s), 567 chunks.
 ```
@@ -164,7 +164,7 @@ Open tier only. Vault documents are in the encrypted database — see
 | `JSON=1` | Machine-readable (make form only) |
 
 Only exceptions are annotated — a lifecycle that is not `active`, a status that
-is not `indexed`, undecided pages. A column reading "active" on every row would
+is not `indexed`, pages flagged for review. A column reading "active" on every row would
 hide the one row that is not.
 
 ### `rag query` — search the open tier
@@ -403,8 +403,8 @@ unprivileged. Use `rag vault-status`.
 rag status [JSON=1]
 ```
 
-Point counts per domain, documents by status and lifecycle, pages with
-undecided layout, quarantine backlog, source history.
+Point counts per domain, documents by status and lifecycle, pages flagged
+for review, quarantine backlog, source history.
 
 ### `rag review-quarantine`
 

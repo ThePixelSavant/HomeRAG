@@ -164,6 +164,8 @@ that used to be there.
 
 ## ADR-008: PDF pages are extracted twice
 
+**Superseded by [ADR-024](#adr-024-pdf-pages-use--raw-re-spaced-from-reading-order).**
+
 **Chosen:** Run `pdftotext` both with and without `-layout` on every page, and
 keep whichever fits the page's shape.
 
@@ -541,3 +543,45 @@ still see the full row.
 
 **Revisit if:** inference moves to a GPU, where prefill is cheap enough that
 recall is worth more than the tokens.
+
+## ADR-024: PDF pages use `-raw`, re-spaced from reading order
+
+**Chosen:** Extract every page with `pdftotext -raw` (the PDF's stored text
+order), and re-split tokens `-raw` glued together using the words the same page
+yields in reading order.
+
+**Rejected:** ADR-008's per-page choice between `-layout` and reading order;
+`-raw` alone; `-raw` with a per-page fallback to reading order.
+
+The classifier chose wrongly on the pages that mattered. Roland's A3 sheets
+(SH-01A, TR-06) are dense four-column pages whose short gutter segments read as
+table rows, so they kept `-layout`, which interleaved all four columns. Asked
+how to set the SH-01A to poly mode, the model found "Selecting Assign Mode" in
+one chunk and the POLY row in the next, surrounded by other sections, fetched
+eleven chunks to piece it together, and took 3.5 minutes to answer. Reading
+order was no better on those pages: it split the TB-03's settings table from
+its own rows.
+
+Compared across the 382 pages of the six indexed manuals (Roland, Arturia,
+Pentair, Dell), `-raw` was never worse than either mode on the pages compared
+side by side. It kept every procedure on the Roland sheets in sequence, kept
+the Pentair spec table intact where `-layout` spliced the next column into it,
+kept the Dell and IntelliFlo numbered steps that ADR-008 chose `-layout` for,
+and kept 90-97% of real table rows in the Arturia and Dell manuals.
+
+Its defect is spacing. On 7 of IntelliFlo's 32 pages, letter-spaced warning
+boxes came out as runs like `INJURYORDEATH.THISPUMPSHOULDBEINSTALLED`, up to
+53% of a page's characters. A fallback was measured and rejected: `-raw` and
+reading order contain identical characters on every page, so a length check
+never fires, and a glue-rate threshold cannot separate those pages from the
+Dell contents pages and the TB-03 sheet, which glue a little and are still far
+better as `-raw`. Re-spacing from reading order's own words fixes the runs,
+costs 0.06s across all 382 pages, and cannot invent a word: a token is split
+only into words reading order produced, only when reading order never produced
+the token itself, and into the fewest pieces.
+
+The extractor no longer sets `flagged_pages`. Its "ambiguous" pages were the
+Roland and IntelliFlo pages `-raw` now reads correctly.
+
+**Revisit if:** a PDF turns up whose stored order is itself scrambled. `-raw`
+cannot fix that; a page render through the Phase 2 vision model can.

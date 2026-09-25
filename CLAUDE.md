@@ -108,25 +108,26 @@ is bare numbers with nothing saying which column is torque.
 the last block win. A chunk built from pages 11 and 12 that cited only 12 sends
 the reader past the answer.
 
-### PDF extraction: every page is done twice
+### PDF extraction: `-raw`, re-spaced from reading order
 
-`pdftotext -layout` keeps a table row or a numbered step on one line, and
-scrambles two-column pages by interleaving the columns. Dropping `-layout`
-fixes the columns and breaks the rows. A manual is both, so `_classify_page`
-measures the median width of the text left of the first 3+ space gutter —
-short means rows, long means columns — and each page keeps whichever
-extraction fits.
+Every page is `pdftotext -raw`: text in the order the PDF stores it. That keeps
+columns whole, numbered steps in sequence and most table rows on one line.
+`-layout` interleaves the columns of any multi-column page, and default reading
+order scrambles dense ones (Roland's A3 sheets split the POLY row from its
+table). The old whitespace classifier choosing between those two was retired
+after `-raw` beat both on the whole corpus — see ADR-024.
 
-Measure from the **first non-space character**, not column 0: an indented step
-(`   1    Turn on...`) has its first gutter at position 0, and counting that
-scores the line as having nothing on the left.
+`-raw`'s one defect is **glued words** in letter-spaced text
+(`INJURYORDEATH.THISPUMP`). Reading order has the same characters with the
+spaces restored, so each page is still extracted twice and `_respace` splits a
+raw token back into reading-order words — only when reading order never
+produced the token itself, and in the fewest pieces.
 
-Between the thresholds the whitespace genuinely cannot tell a data table from
-two-column prose. Those pages take reading order and are **recorded in
-`flagged_pages`** rather than silently guessed; that list is the Phase 2 VLM
-pass's work queue, and `make status` reports the count. Whitespace-aligned
-tables are deliberately not detected for the same reason — the VLM transcribing
-a page to markdown is the fix, and the chunker's table handling then applies.
+Do not reintroduce a per-page choice of mode: it was measured, and no
+threshold separates the glued pages from good ones. A PDF whose *stored* order
+is scrambled would defeat this; none seen yet, and the Phase 2 VLM pass is the
+answer if one appears. The extractor no longer sets `flagged_pages`; the column
+and `make status` line remain for whatever flags pages next.
 
 ### Citations
 
@@ -274,9 +275,9 @@ VLM receipt extraction + `ledger` + `query_ledger`; git/web sources with Crawl4A
 (**ingest image only** — Playwright is 1-2 GB); tesseract for bulk scanned OCR.
 `sources.yaml` rejects `git`/`web` types until then rather than failing obscurely.
 
-The vision model added for receipts is also the layout extractor for manuals:
-render a flagged page with `pdftoppm` (already installed), ask for markdown, and
-the table-aware chunker handles the result. One mechanism covers column
-scrambling, broken tables and pages with no text layer, on the ~6% of pages that
-need it rather than all of them. Tesseract keeps the narrower job — bulk
+The vision model added for receipts is also a layout extractor for manuals:
+render a page with `pdftoppm` (already installed), ask for markdown, and the
+table-aware chunker handles the result. `-raw` removed most of its original
+work queue; what is left is pages with no text layer and whitespace-aligned
+tables, and it needs a new trigger since the extractor no longer flags pages. Tesseract keeps the narrower job — bulk
 plain-text OCR where structure is not the content.

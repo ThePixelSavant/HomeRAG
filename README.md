@@ -358,12 +358,11 @@ bge-base, nomic-v1.5, gte-base and arctic-m are all 768-dim.
 - **Receipts** are Phase 2: the VLM extractor, ledger and `query_ledger`.
 - **git and web sources** are Phase 2 (Crawl4AI pulls Playwright, ingest image
   only).
-- **Some PDF pages have an undecided layout.** Each page is extracted both
-  layout-preserving and in reading order, and kept whichever fits — but where
-  whitespace cannot tell a data table from two columns, the page takes reading
-  order and is counted by `make status` under "pages with undecided layout".
-  Prose from them is fine; a table on one may have lost its row structure. The
-  Phase 2 vision model transcribes exactly these pages.
+- **PDF text follows the order the file stores it in** (`pdftotext -raw`).
+  That keeps multi-column manuals and procedures intact, but a PDF whose
+  stored order is itself scrambled would come out scrambled. A table aligned
+  only with spaces may lose its row structure; the Phase 2 vision model is the
+  fix for both.
 - **Whitespace-aligned tables in PDFs** are not detected as tables, for the same
   reason. Markdown tables are, and keep their header across chunks.
 
