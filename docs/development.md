@@ -67,8 +67,14 @@ between a component and its environment.
 | A grant expired 120s after creation whether or not it was approved, so approvals could not be redeemed in time | Every test approved and redeemed within milliseconds — the gate was fully covered and unusable at the same time |
 | `EMPTY` counted as a failure, so three subagent transcripts reported `failed: 3` on every run | Fixtures had content; nothing exercised a document that legitimately extracts to nothing |
 | An approval binds to the exact argument string, but the model rewords its search each turn, so a legitimate re-ask mints a new grant | Tests pass the same query object twice |
+| MCP servers could not read `rag.db` at all once the worker exited: a WAL file opens read-only only if its `-wal`/`-shm` exist or can be created, and the readers' mount is `:ro` | Tests open the database in a writable tmpdir, where SQLite quietly recreates them |
+| `list_sources` omitted every inbox source — `mcp-server` has no inbox mount to enumerate | Tests run with the inbox visible |
+| The PDF classifier kept `-layout` for Roland's dense A3 sheets, interleaving four columns | Fixtures were two-column pages |
+| `rag reindex` deleted the retracted tombstone and every lifecycle flag, so it re-indexed a retracted document | No test ran reindex over a source holding a non-active document |
+| `FORCE=1` was assumed to re-embed; a chunking-only change reached the index as nothing | Tests call the chunker directly; the skip is in `sync`'s hash check |
+| RRF ties came back in arbitrary order, so `make eval` moved between runs | Unit tests assert on scores, not on the order of equal ones |
 
-The last two share a shape worth naming: **a test that acts instantly cannot
+The grant-expiry and approval-binding bugs share a shape worth naming: **a test that acts instantly cannot
 catch a window that is too short for a human**, and **a test that reuses one
 input cannot catch a caller that varies its input**. Both passed for months.
 

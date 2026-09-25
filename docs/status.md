@@ -1,6 +1,6 @@
 # Implementation status
 
-As of commit `37b405c` on `feat/ingestion-pipeline-and-vault`, 2026-09-21.
+As of `feat/ingestion-pipeline-and-vault` after commit `70c9720`, 2026-09-25.
 
 **Phase 1 is built and running. Phase 2 is designed and not started.**
 
@@ -8,11 +8,12 @@ As of commit `37b405c` on `feat/ingestion-pipeline-and-vault`, 2026-09-21.
 
 | | |
 |---|---|
-| Branch | `feat/ingestion-pipeline-and-vault` (19 commits ahead of `master`) |
-| Tests | **103 passing** (57 pipeline, 33 security, 13 vault ingest) |
-| Open tier | 18 documents, 449 chunks, 4 domains |
-| Vault | **9 documents, 500 chunks** — unlocked, ingested, all three gates exercised end to end |
-| Stack | 3 containers up; `make doctor` reports 10 ok, 6 warn, 0 fail |
+| Branch | `feat/ingestion-pipeline-and-vault` (34 commits ahead of `master`) |
+| Tests | **132 passing** (80 pipeline, 39 security, 13 vault ingest) |
+| Open tier | 22 active documents (+1 retracted), 1,182 chunks; `manuals` and `notes` populated |
+| Retrieval | `make eval`: hit@3 **73%**, hit@1 53%, MRR 0.652 over 15 questions; a model reads ~2,980 chars per search |
+| Vault | 9 documents, 500 chunks at last count (2026-09-21); all three gates exercised end to end. Sealed at time of writing |
+| Stack | 3 containers up, running as the host user; `make doctor` reports 10 ok, 6 warn, 0 fail |
 
 The warnings are six empty inbox domains, which is expected. Nothing is
 waiting on a human any more — see [Blocked on you](#blocked-on-you).
@@ -32,6 +33,7 @@ Legend: **done** = built, tested and exercised against real data ·
 | PDF extraction | done | `pdftotext -raw`, re-spaced from reading order (ADR-024); see [gaps](#known-gaps) |
 | Claude Code transcript extraction | done | Tool calls collapsed, results dropped except errors |
 | Token-accurate chunking | done | Truncation-free tokenizer clone |
+| PDF section chunking | done | Headings by font size (`pdftohtml -xml`); a chunk per section with a `title > heading path` breadcrumb ([ADR-025](decisions.md#adr-025-pdf-chunks-follow-section-headings)) |
 | Markdown table header repetition | done | Whitespace tables deliberately excluded |
 | Sensitivity scan + quarantine | done | Luhn-checked; findings never echo the secret |
 | Tier routing | done | `tier_of()` raises rather than defaults |
@@ -51,7 +53,10 @@ Legend: **done** = built, tested and exercised against real data ·
 | Embedding fingerprint guard | done | Catches model swaps dimension alone would miss |
 | Payload indexes | done | 6 fields |
 | Citations (`locator` + `citation`) | done | Pages, page ranges, line ranges, anchors |
-| `fetch_context` (open tier) | done | Ordered neighbours, refuses vault doc_ids |
+| `fetch_context` (open tier) | done | Ordered neighbours, capped at 2 either side, refuses vault doc_ids |
+| Model-facing result trimming | done | `documents.for_model`: content, citation, ids, score; `search_docs` returns 3 ([ADR-023](decisions.md#adr-023-the-model-gets-a-trimmed-result-row)) |
+| Deterministic result order | done | RRF ties broken by position in the document |
+| Retrieval eval (`make eval`) | done | Known-answer ranks, hit@1/hit@3/MRR; `tests/retrieval/questions.yaml` |
 | Document lifecycle | done | 4 states, tombstones, scheduled review dates |
 | Cross-encoder reranking | not started | Phase 3, deprioritised — see [roadmap](roadmap.md) |
 | Snapshot/restore for migration | partial | Qdrant pinned by digest; rebuild is the real recovery path |
@@ -79,7 +84,7 @@ Legend: **done** = built, tested and exercised against real data ·
 
 | Component | Status | Notes |
 |---|---|---|
-| Makefile control plane | done | 26 targets |
+| Makefile control plane | done | 29 targets, reachable from any directory via `rag` |
 | `make doctor` preflight | done | |
 | Open-tier MCP server | done | 4 tools, verified over the wire |
 | Vault MCP server | done | 4 tools, verified to fail closed over the wire |
@@ -94,7 +99,7 @@ from unit tests.
 | Claim | Evidence |
 |---|---|
 | Two-column PDF pages are no longer scrambled | IntelliFlo p2 extracted as contiguous prose; the `-layout` output for comparison splices "General Warnings" into the middle of the body text |
-| Row structure survives | XPS p86 keeps `1    Turn on the computer.` on one line |
+| Row structure survives | XPS p86 keeps `1 Turn on the computer.` on one line under `-raw`, as `-layout` did |
 | Dense multi-column sheets read in order | SH-01A p2 extracted with `-raw`: "Selecting Assign Mode" is followed by its steps and the MONO/UNISON/POLY/CHORD table, where `-layout` interleaved four columns (ADR-024) |
 | Glued words are re-spaced | IntelliFlo p2's warning box reads "INJURY OR DEATH. THIS PUMP SHOULD BE INSTALLED" instead of `-raw`'s `INJURYORDEATH.THISPUMP…` |
 | Table headers survive splitting | Torque fixture: 1 of 5 chunks carried column labels before, 5 of 5 after, all under the 480-token ceiling |
@@ -120,6 +125,12 @@ from unit tests.
 | Vault ingestion writes real documents | 12 transcripts in: 9 indexed, 500 chunks, 3 empty; `vault: unlocked docs=9` |
 | Extraction holds no key | A fresh interpreter importing `parse_worker` pulls in neither `keyagent` nor `crypto` |
 | `mcp-server` cannot reach the vault | No DNS, and a raw-IP connect to `mcp-vault` times out between bridges |
+| Section chunking improves retrieval | `make eval` before/after on 14 questions: hit@3 71%→79%, hit@1 36%→57%, top-3 size −36%; SH-01A poly-mode answer 8th→2nd (ADR-025) |
+| Trimming shortens a real answer | Same SH-01A question in Open WebUI: 3 min 26 s before, 88 s after (the cap, trimming and sections together) |
+| Reindex keeps tombstones | `rag reindex SOURCE=inbox:manuals`: 872 chunks re-embedded, `skipped(retracted): 1`, IntelliFlo row still `retracted` |
+| MCP servers read state on a read-only mount | `fetch_context`, `list_sources`, `get_index_status` all failed while `rag.db` was WAL; all return data after the switch to a rollback journal |
+| `list_sources` shows inbox sources | `inbox:manuals` listed with 7 documents from `mcp-server`, which has no inbox mount |
+| Search order is repeatable | Two consecutive `make eval` runs produce identical output |
 
 ## Known gaps
 
@@ -150,6 +161,13 @@ Ordered by how likely they are to bite.
    re-ingest. This is intentional but worth knowing before you retract.
 8. **No reranking.** Hybrid RRF only. Deliberately deprioritised behind parsing
    quality; see [ADR-011](decisions.md#adr-011-parsing-quality-before-retrieval-tuning).
+9. **The small embedding model misses synonyms.** "SH-01A polysynth setup" —
+   the query a model actually sent — does not find the Assign Mode section,
+   because the manual says "Polyphonic". `sh01a-poly-model` and `tr06-write`
+   miss the top 10 in `make eval`. A larger model (bge-base) is the candidate
+   fix; it needs `rag rebuild-index`, so measure it with `make eval` first.
+10. **A chunking change needs `rag reindex`.** `rag ingest` re-embeds a document
+    only when its extracted text changes, and `FORCE=1` does not change that.
 
 ## Blocked on you
 
@@ -158,16 +176,11 @@ Nothing is blocking the system any more. What remains is optional.
 1. **Swap in a vision model** — Qwen3-VL-30B-A3B-Instruct Q4_K_M plus its
    mmproj, ~18.6 GB — which Phase 2's receipt extraction depends on. It would
    also cover the PDF cases in gap 2 that text extraction cannot.
-2. **Decide on the orphaned Docker volumes.** `rag_qdrant-data` and
-   `rag_ollama-data` are left over from the pre-bind-mount layout, and there is
-   an 8 GB ollama image unused by this stack. All three are untouched pending
-   your say-so.
-3. **Two real manuals are indexed** (`intelliflo3-pro3-vsf-install-guide.pdf`
-   and `xps-8700-owners-manual.pdf`, 139 chunks). They were copied into
-   `data/inbox/manuals/` to verify PDF extraction against real documents and
-   left there because they are legitimate content for that domain. Remove them
-   with `make retract` if you would rather start clean.
-4. **Re-ingest vault sources by hand as they change.** `claude-sessions` has a
+2. **Remove the orphaned Docker volumes.** `rag_qdrant-data` and
+   `rag_ollama-data` are left over from the pre-bind-mount layout; no container
+   uses them and together they hold under 2 KB. The unused ollama image is
+   already gone. `docker volume rm rag_qdrant-data rag_ollama-data`.
+3. **Re-ingest vault sources by hand as they change.** `claude-sessions` has a
    4-hourly cadence that will keep queueing; take it with an interactive
    `make ingest` when you want the newer transcripts.
 
@@ -179,6 +192,20 @@ verified end to end.
 
 | Commit | What |
 |---|---|
+| `70c9720` | PDF chunks follow section headings |
+| `3c8bda2` | Add `make eval`; stop reindex from resurrecting retracted documents |
+| `d66ba12` | PDF extraction: `-raw`, re-spaced from reading order |
+| `91e3153` | Cap `fetch_context` at 2 chunks either side |
+| `a4da69d` | `list_sources` includes inbox sources the server cannot see |
+| `787ebeb` | State db: rollback journal, not WAL |
+| `3c203df` | Send the model a trimmed search result |
+| `613acd6` | Document the `rag` command and the listing commands |
+| `87d3d2b` | Run the containers as the host user instead of root |
+| `339669c` | Document inventory, and a `rag` command that works from anywhere |
+| `ea8fcc5` | `make add`: bind the file's own directory in for the run |
+| `58d8166` | Vault: tell the caller which call an approval covers |
+| `9868fe3` | Correct three claims the Open WebUI integration disproved |
+| `2ee146e` | Bring status and the bug log up to date |
 | `37b405c` | Restart the grant clock on approval |
 | `5545cd2` | An empty document is not a failed one |
 | `c4763b0` | Prompt for the vault passphrase instead of exporting the key |

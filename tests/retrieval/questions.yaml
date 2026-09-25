@@ -15,6 +15,14 @@ questions:
     uri: SH-01A_eng04_W.pdf
     expect: Plays polyphonically
 
+  # The query the model actually sent for the question above, in Open WebUI.
+  # "Polysynth" never appears in the manual ("Polyphonic"), and for this
+  # phrasing the answer was not in the top 10, which cost a second search.
+  - id: sh01a-poly-model
+    question: SH-01A polysynth setup
+    uri: SH-01A_eng04_W.pdf
+    expect: Plays polyphonically
+
   - id: sh01a-reset
     question: how do I factory reset the SH-01A?
     uri: SH-01A_eng04_W.pdf

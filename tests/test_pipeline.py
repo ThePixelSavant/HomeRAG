@@ -314,6 +314,24 @@ def test_chunk_spanning_two_pages_keeps_both():
     assert chunk.extra["locator"] == {"page": 11, "pages": [11, 12]}
 
 
+def test_tied_search_results_come_back_in_a_fixed_order():
+    """RRF ties are common; which tied hit makes the cut must not vary."""
+    from types import SimpleNamespace
+
+    from app.pipeline.qdrant_store import _stable_top
+
+    def point(score, uri, idx):
+        return SimpleNamespace(score=score, payload={"uri": uri, "chunk_index": idx})
+
+    shuffled = [point(0.5, "b.pdf", 3), point(0.6429, "tb03.pdf", 9), point(0.5, "a.pdf", 7),
+                point(0.6429, "tb03.pdf", 2), point(1.0, "sh01a.pdf", 14)]
+    top = _stable_top(shuffled, 4)
+    assert [(p.payload["uri"], p.payload["chunk_index"]) for p in top] == [
+        ("sh01a.pdf", 14), ("tb03.pdf", 2), ("tb03.pdf", 9), ("a.pdf", 7),
+    ]
+    assert _stable_top(list(reversed(shuffled)), 4) == top
+
+
 def test_citations_name_the_first_page_of_a_range():
     from app.documents import format_citation
 
@@ -820,6 +838,18 @@ def test_reindex_keeps_tombstones_and_lifecycle(state_db, monkeypatch):
     assert rows["old"]["lifecycle_reason"] == "decommissioned"
     # Everything not tombstoned reads as changed, so the run re-embeds it.
     assert rows["old"]["content_hash"] == rows["live"]["content_hash"] == ""
+
+
+def test_flagged_pages_leave_out_retracted_documents(state_db):
+    from app import documents
+    from app.pipeline import state
+
+    with state.writer() as conn:
+        _doc(conn, "gone", "intelliflo.pdf", flagged_pages=4)
+        _doc(conn, "live", "tb03.pdf", flagged_pages=1)
+        state.set_lifecycle(conn, "gone", documents.RETRACTED, reason="wrong")
+    with state.reader() as conn:
+        assert [r["uri"] for r in state.flagged_pages(conn)] == ["tb03.pdf"]
 
 
 def test_retracted_documents_have_no_opt_in():

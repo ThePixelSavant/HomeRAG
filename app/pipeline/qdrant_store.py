@@ -432,6 +432,22 @@ def fetch_context(doc_id: str, chunk_index: int, *, before: int = 1, after: int 
     return sorted(rows, key=lambda r: r["chunk_index"] if r["chunk_index"] is not None else 0)
 
 
+# RRF scores are rank arithmetic, so exact ties are common -- two hits at
+# 0.6429 -- and Qdrant returns tied points in no fixed order. That made the
+# same query return different top-3s run to run, including WHICH hits made
+# the cut when a tie straddled it. So a few more are fetched than asked for,
+# ties are broken by position in the document, and the list is cut here.
+_TIE_HEADROOM = 10
+
+
+def _stable_top(points: list, limit: int) -> list:
+    def key(point):
+        payload = point.payload or {}
+        return (-(point.score or 0.0), payload.get("uri", ""), payload.get("chunk_index") or 0)
+
+    return sorted(points, key=key)[:limit]
+
+
 def search(
     query: str,
     *,
@@ -481,7 +497,7 @@ def search(
                 ),
             ],
             query=qm.FusionQuery(fusion=qm.Fusion.RRF),
-            limit=limit,
+            limit=limit + _TIE_HEADROOM,
             with_payload=True,
         )
     else:
@@ -490,8 +506,8 @@ def search(
             query=dense,
             using=DENSE,
             query_filter=query_filter,
-            limit=limit,
+            limit=limit + _TIE_HEADROOM,
             with_payload=True,
         )
 
-    return [_hit(hit.payload or {}, hit.score) for hit in response.points]
+    return [_hit(hit.payload or {}, hit.score) for hit in _stable_top(response.points, limit)]

@@ -77,8 +77,9 @@ CREATE TABLE IF NOT EXISTS documents (
     review_after     TEXT,
     supersedes       TEXT,
     superseded_by    TEXT,
-    -- Pages whose layout could not be decided from whitespace alone. Recorded
-    -- rather than guessed silently: this is the Phase 2 VLM pass's work queue.
+    -- Pages an extractor flagged as possibly misread, for review or the Phase
+    -- 2 VLM pass. The PDF extractor no longer sets it (ADR-024); the column
+    -- stays for whatever flags pages next.
     flagged_pages    INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS ix_documents_source ON documents(source_id);
@@ -442,11 +443,18 @@ def tombstones(conn: sqlite3.Connection, source_id: str | None = None) -> dict[s
 
 
 def flagged_pages(conn: sqlite3.Connection) -> list[sqlite3.Row]:
-    """Documents with pages whose layout could not be decided."""
+    """Documents with pages flagged for review.
+
+    Tombstoned documents are left out: a retracted document is never re-read,
+    so its count is frozen at whatever the extractor said before it was
+    retracted, and there is nothing to review.
+    """
+    placeholders = ",".join("?" for _ in documents.TOMBSTONED)
     try:
         return conn.execute(
             "SELECT uri, domain, flagged_pages FROM documents WHERE flagged_pages > 0 "
-            "ORDER BY flagged_pages DESC"
+            f"AND lifecycle NOT IN ({placeholders}) ORDER BY flagged_pages DESC",
+            sorted(documents.TOMBSTONED),
         ).fetchall()
     except sqlite3.OperationalError:
         return []
