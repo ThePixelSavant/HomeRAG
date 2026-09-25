@@ -643,3 +643,65 @@ retracted tombstone, so reindex re-indexed a retracted document.
 
 **Revisit if:** a manual sets headings at body size (bold only), or the eval
 set grows enough to tune the floor honestly.
+
+## ADR-026: Receipts are read by a vision model and validated in Python
+
+**Chosen:** Images and PDFs filed under `receipts` are sent to the vision
+model (Qwen3-VL-30B-A3B, served beside Coder-Next by llama-server's router)
+for a JSON reading, constrained by a schema. Amounts and dates come back as
+printed strings; `app/receipts.py` turns them into integer cents and ISO dates
+and checks the arithmetic. Anything doubtful is written to the ledger with
+`needs_review` and its reasons; possible duplicates are flagged, never merged.
+
+**Rejected:** Asking the model for numbers; trusting the parse worker's own
+verdict; dropping receipts that fail validation; auto-merging duplicates; an
+MCP tool for review.
+
+- **Strings, not numbers.** A model asked for a number rounds, drops a sign,
+  or quietly adds things up. Asked to copy text, it only has to read.
+  `Decimal` does the rest, and an ambiguous `03/04/25` is read where the
+  ambiguity can be noted.
+- **The parent validates.** The reading crosses from the process that parsed
+  attacker-influenced bytes; the key-holding parent re-runs `validate` on the
+  raw reading. The JSON schema guarantees the answer parses, not that it is
+  right.
+- **Flag, don't drop.** A receipt whose total cannot be read gets a row at 0
+  cents, flagged. Leaving it out would make a total silently short;
+  `needs_review_count` on every `query_ledger` response is how a total says
+  how far to trust it.
+- **Duplicates are a human's call.** The same receipt photographed twice and
+  two identical coffees on one day look the same. The match is loose on
+  merchant (first word) because the date and amount already matched exactly.
+- **Text before pixels.** An e-receipt's text layer is sent as text: a few
+  hundred tokens against ~1,500 image tokens plus the projector's encode, all
+  prefilled on the CPU. Photos are scaled to 1536 px on the long edge; full
+  size would be ~15k tokens.
+- **Skip unchanged by file hash, before the model is called.** Every other
+  document compares extracted text, but here extraction IS the model call.
+
+Built and tested against a stub of llama-server's chat endpoint (the real parse
+worker, client, validation and ledger write); the end-to-end run with the model
+itself follows once it is served.
+
+**Revisit if:** receipts arrive in volume enough that a reading's cost per page
+matters more than its accuracy, or a smaller vision model turns out good
+enough.
+
+## ADR-027: The vault CLI runs inside the vault server
+
+**Chosen:** Every `vaultctl` command that reads or writes the vault (list,
+query, ledger, lifecycle, ledger review) is an action on `control.sock`,
+executed in the server process that holds the key.
+
+**Rejected:** Calling the service layer from `vaultctl` directly.
+
+`vaultctl` runs through `docker exec`, which starts a fresh interpreter with an
+empty key agent. Called directly, those commands could only ever report
+"sealed". They were written that way, passed their tests (which unlock in the
+same process), and never worked against the running stack. Unlock, approve
+and audit already went over the socket, which is why they did.
+
+The socket is `0600` and owned by the vault container's user, who can already
+approve a model's request or read the server's memory, so the new actions
+widen nothing. Gate 3 is skipped for them as it always was for the CLI: a human
+is at the terminal.

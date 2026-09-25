@@ -12,7 +12,7 @@ VAULTRUN   = docker exec mcp-vault python -m app.vaultctl
 .PHONY: up down logs build doctor warm-cache ingest reindex add query eval status \
         rebuild-index review-quarantine supersede stale retract restore lifecycle list \
         unlock lock vault-status vault-query vault-list vault-lifecycle \
-        approve vault-audit test
+        approve vault-audit ledger ledger-review ledger-resolve test
 
 ## --- stack ---------------------------------------------------------------
 
@@ -144,6 +144,19 @@ vault-lifecycle:        ## make vault-lifecycle URI=<uri> STATE=retracted REASON
 	@test -n "$(URI)" -a -n "$(STATE)" || { echo 'usage: make vault-lifecycle URI=<uri> STATE=<state> [REASON="..."]'; exit 2; }
 	@$(VAULTRUN) lifecycle "$(URI)" $(STATE) $(if $(REASON),--reason "$(REASON)") \
 	  $(if $(NEW),--superseded-by "$(NEW)") $(if $(DOMAIN),--domain $(DOMAIN))
+
+ledger:                 ## Receipt totals in exact cents: make ledger [START=] [END=] [MERCHANT=] [GROUP=month]
+	@$(VAULTRUN) ledger $(if $(START),--start $(START)) $(if $(END),--end $(END)) \
+	  $(if $(MERCHANT),--merchant "$(MERCHANT)") $(if $(CATEGORY),--category $(CATEGORY)) \
+	  $(if $(GROUP),--group-by $(GROUP)) $(if $(LIMIT),--limit $(LIMIT))
+
+ledger-review:          ## Ledger rows flagged for a human, with why
+	@$(VAULTRUN) ledger-review $(if $(JSON),--json)
+
+ledger-resolve:         ## Correct/confirm a flagged row: make ledger-resolve ID=n [TOTAL=] [DATE=] [MERCHANT=] [CATEGORY=]
+	@test -n "$(ID)" || { echo 'usage: make ledger-resolve ID=<n> [TOTAL=12.49] [DATE=2026-09-24] [MERCHANT=..] [CATEGORY=..]'; exit 2; }
+	@$(VAULTRUN) ledger-resolve $(ID) $(if $(TOTAL),--total "$(TOTAL)") $(if $(DATE),--date "$(DATE)") \
+	  $(if $(MERCHANT),--merchant "$(MERCHANT)") $(if $(CATEGORY),--category $(CATEGORY))
 
 approve:                ## Release one pending request: make approve CODE=123456
 	@$(VAULTEXEC) approve $(if $(CODE),--code $(CODE))

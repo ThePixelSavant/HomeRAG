@@ -29,7 +29,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from app import documents
+from app import documents, receipts
 from app.config import settings
 from app.domains import Tier
 from app.pipeline import chunker, classify, embedder, extract, parse_worker, qdrant_store, state
@@ -72,6 +72,10 @@ class SourceResult:
     # counting it as failed makes `failed` mean nothing.
     docs_empty: int = 0
     flagged_pages: int = 0
+    # Receipts written to the ledger this run, and how many of those a human
+    # must check before their amounts can be trusted.
+    receipts_read: int = 0
+    receipts_flagged: int = 0
     failed: int = 0
     enumeration_complete: bool = False
     error: str | None = None
@@ -466,6 +470,9 @@ def _write_vault_record(vconn, source: Source, record: dict, run_id: str, result
         ],
     )
 
+    if record.get("receipt") is not None:
+        _write_ledger(vconn, source, record, result)
+
     # The original is sensitive too. Inbox drops are consumed; sources indexed
     # in place (transcripts, mounted dirs) are left alone -- we do not own them.
     if source.type == INBOX:
@@ -473,6 +480,40 @@ def _write_vault_record(vconn, source: Source, record: dict, run_id: str, result
 
     result.chunks_upserted += len(chunks)
     result.docs_indexed += 1
+
+
+def _write_ledger(vconn, source: Source, record: dict, result: SourceResult) -> None:
+    """Validate a receipt reading and write its ledger row.
+
+    Validation happens HERE, in the process holding the key, on the raw
+    reading -- never on a verdict computed by the parse worker, which read the
+    attacker-influenced file. A possible duplicate (same date, same amount,
+    same-looking merchant, different document) is flagged, never merged: the
+    same receipt photographed twice and two identical coffees on one day look
+    alike, and only a human can tell them apart.
+    """
+    doc_id = record["doc_id"]
+    row = receipts.validate(
+        record["receipt"],
+        fallback_date=dt.datetime.fromtimestamp(record.get("mtime") or 0, dt.timezone.utc).date().isoformat(),
+        extracted_by=record.get("extractor") or "vlm",
+        source_id=source.id,
+        domain=source.domain,
+    )
+    duplicates = sorted({
+        match["uri"]
+        for match in vault_store.ledger_matches(
+            vconn, row["txn_date"], row["amount_cents"], exclude_doc_id=doc_id
+        )
+        if receipts.same_merchant(match["merchant"], row["merchant"])
+    })
+    if duplicates and row["amount_cents"]:
+        note = f"possible duplicate of {', '.join(duplicates)}"
+        row["needs_review"] = 1
+        row["review_notes"] = f"{row['review_notes']}; {note}" if row["review_notes"] else note
+    vault_store.replace_ledger(vconn, doc_id, [row])
+    result.receipts_read += 1
+    result.receipts_flagged += row["needs_review"]
 
 
 def _ingest_vault_source(

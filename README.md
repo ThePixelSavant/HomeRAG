@@ -120,6 +120,9 @@ rag vault-query Q="..."          # human path: no approval needed
 rag vault-lifecycle URI=<uri> STATE=<state> [REASON="..."]
 rag approve [CODE=123456]        # release one pending model request
 rag vault-audit [N=50]
+rag ledger [START=] [END=] [GROUP=month]   # receipt totals, exact cents
+rag ledger-review                # receipts flagged for a human
+rag ledger-resolve ID=n [TOTAL=] [DATE=] [MERCHANT=] [CATEGORY=]
 
 rag test
 rag help                         # shorthands plus every Makefile target

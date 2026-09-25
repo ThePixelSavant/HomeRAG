@@ -43,6 +43,7 @@ make ingest / query / list / status / add / reindex / rebuild-index
 make eval                  # retrieval eval: tests/retrieval/questions.yaml
 make lifecycle / supersede / stale / retract / restore
 make unlock / lock / vault-list / vault-query / vault-lifecycle / approve / vault-audit
+make ledger / ledger-review / ledger-resolve   # receipts, in exact cents
 make test                  # pytest inside the worker image
 ```
 
@@ -248,6 +249,38 @@ Identity comes from Open WebUI's **signed HS256 assertion**, not the plaintext
 is no model identifier in any forwarded header, so keeping vault tools off
 frontier presets is configuration, and the approval prompt is the backstop.
 
+**`vaultctl` runs in a fresh interpreter** (`docker exec`), whose key agent is
+empty. Anything that reads or writes the vault must therefore be an action on
+`control.sock`, executed in the server (`control._cli_actions`). A command that
+calls `service`/`AGENT` directly in `vaultctl` can only ever report "sealed";
+list, query, ledger and lifecycle shipped that way and never worked.
+
+### Receipts and the ledger
+
+Images and PDFs filed under `receipts` (`app/receipts.py` `RECEIPT_DOMAINS`)
+are routed **by domain, not suffix** in `parse_worker` to
+`extract/receipt.py`, which asks the vision model (`settings.vision_model`,
+`qwen3-vl` on llama-server's router) for a JSON reading: an e-receipt's text
+layer when it has one, since that is far cheaper than an image; otherwise
+images scaled to 1536 px. A markdown note under `receipts` is still text.
+
+- **The model copies strings; Python does arithmetic.** Amounts and dates come
+  back as printed; `receipts.parse_amount` (Decimal to integer cents) and
+  `parse_date` read them. Never ask the model for a number.
+- **The parent validates** (`sync._write_ledger` → `receipts.validate`) on the
+  raw reading, and never trusts a verdict from the parse worker. Anything
+  doubtful — lines that do not sum, no total (recorded as 0), no date (the
+  file's date is used), an ambiguous `03/04/25` — sets `needs_review` with notes.
+- **Duplicates are flagged, never merged:** same date, same cents,
+  same-looking merchant (`same_merchant` compares first words).
+- Ledger rows follow their document: `replace_ledger` on every re-index;
+  `retract` and `delete_document` delete them. A surviving row would keep
+  counting in totals.
+- **Unchanged receipts are skipped by FILE hash before the model is called**
+  (a reading costs minutes of CPU); other documents compare extracted text.
+- Review is CLI only (`rag ledger-review`, `rag ledger-resolve`), for the same
+  reason lifecycle is.
+
 ## Gotchas that have already bitten
 
 | Thing | Why |
@@ -258,6 +291,7 @@ frontier presets is configuration, and the approval prompt is the backstop.
 | Qdrant image digest | Snapshot restore needs a matching minor version, so `:latest` breaks migration. Pinned by digest with a rollback comment. |
 | Glob matching | `fnmatch("a.md", "**/*")` is **False** — `**/` needs a literal slash. `_matches` handles the prefix; an empty `include` means everything. |
 | Bind-mounted files | Docker creates a *directory* when a bind-mounted file is missing. Mount directories: `data/state/` and `data/vault/` are separate so `mcp-server` gets state read-only and no vault mount at all. |
+| Vault inbox sweep | A vault inbox file is **consumed** into a blob when filed, so the next run finds the folder empty. The sweep treated that as disappearance and deleted every receipt and its blob. Vault `INBOX` sources are never swept; their documents leave only by retraction. |
 | `FORCE=1` does not re-embed | It only overrides the sweep's deletion floor. A document re-embeds when its **extracted text** changes, so a chunking-only change reaches the index through `rag reindex`, which blanks the stored hashes (never deletes rows: that dropped the retracted tombstone and every lifecycle flag). |
 | Fingerprint guard | Dimension alone cannot detect a model swap — bge-base, nomic-v1.5, gte-base and arctic-m are all 768-dim. |
 | `rag.db` journal mode | **Not WAL.** A WAL file opens read-only only if its `-wal`/`-shm` exist or can be created; the worker deletes them on exit and the readers' `:ro` mount can't recreate them, so every MCP state read failed. `_connect` sets `DELETE` on each write open, which also converts an old file. |
@@ -280,9 +314,10 @@ Qdrant is a **derived index, not the source of truth** — deterministic point I
 mean `make rebuild-index` reconstructs it exactly. Snapshots are an optimisation
 over that.
 
-## Phase 2 (not yet built)
+## Phase 2 (in progress)
 
-VLM receipt extraction + `ledger` + `query_ledger`; git/web sources with Crawl4AI
+Receipt extraction into the ledger is built (see *Receipts and the ledger*)
+and waits on the vision model being served. Not yet built: git/web sources with Crawl4AI
 (**ingest image only** — Playwright is 1-2 GB); tesseract for bulk scanned OCR.
 `sources.yaml` rejects `git`/`web` types until then rather than failing obscurely.
 

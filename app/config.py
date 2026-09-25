@@ -75,8 +75,18 @@ class Settings(BaseSettings):
 
     # --- Vision model (receipt extraction) ---
     llama_url: str = "http://llama-server:8080"
-    vision_model: str = "local"
-    vision_timeout_seconds: int = 180
+    # The id llama-server's router serves the vision model under. Coder-Next
+    # stays the coding model; this one reads receipts and answers RAG chats.
+    vision_model: str = "qwen3-vl"
+    # A photographed receipt costs ~1,500 image tokens plus the projector's
+    # encode, prefilled on the CPU at ~70 tokens/s: minutes, not seconds.
+    vision_timeout_seconds: int = 600
+    # Long edge a receipt image is scaled to before it is sent. A 12 MP phone
+    # photo at full size would be ~15k image tokens; 1536 px keeps small print
+    # legible at a tenth of that.
+    receipt_image_max_px: int = 1536
+    # A scanned PDF past this many pages is not a receipt.
+    receipt_max_pages: int = 3
 
     @property
     def allowed_emails(self) -> list[str]:

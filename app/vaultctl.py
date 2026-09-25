@@ -57,11 +57,22 @@ def cmd_status(args) -> int:
     return 0
 
 
-def cmd_query(args) -> int:
-    from app.vault import service
+def _call(action: str, **fields) -> object:
+    """Run one vault action inside the vault server and return its result.
 
+    `vaultctl` runs through `docker exec`, in a fresh interpreter with an empty
+    key agent. Everything that reads or writes the vault therefore happens in
+    the server process, over the control socket -- see control._cli_actions.
+    """
+    reply = _send({"action": action, **fields})
+    if not reply.get("ok"):
+        raise SystemExit(reply.get("error") or f"{action} failed")
+    return reply.get("result")
+
+
+def cmd_query(args) -> int:
     domains = args.domains.split(",") if args.domains else None
-    hits = service.search(args.query, domains=domains, limit=args.limit, ctx=service.Context())
+    hits = _call("query", query=args.query, domains=domains, limit=args.limit)
     if args.json:
         print(json.dumps(hits, indent=2, default=str))
         return 0
@@ -77,14 +88,46 @@ def cmd_query(args) -> int:
 
 
 def cmd_ledger(args) -> int:
-    from app.vault import service
-
     filters = {k: v for k, v in (("merchant", args.merchant), ("category", args.category)) if v}
-    result = service.query_ledger(
-        start_date=args.start, end_date=args.end, group_by=args.group_by,
-        limit=args.limit, ctx=service.Context(), **filters,
+    result = _call(
+        "ledger", start_date=args.start, end_date=args.end, group_by=args.group_by,
+        limit=args.limit, filters=filters,
     )
     print(json.dumps(result, indent=2, default=str))
+    return 0
+
+
+def _cents(value: int) -> str:
+    return f"{value / 100:,.2f}"
+
+
+def cmd_ledger_review(args) -> int:
+    """Ledger rows flagged `needs_review`, with why."""
+    rows = _call("ledger_review")
+    if args.json:
+        print(json.dumps(rows, indent=2, default=str))
+        return 0
+    if not rows:
+        print("Nothing to review: every ledger row reads cleanly.")
+        return 0
+    for row in rows:
+        print(f"\n  #{row['id']}  {row['txn_date']}  {row['merchant'] or '(no merchant)'}  "
+              f"{_cents(row['amount_cents'])} {row['currency']}  [{row['category']}]")
+        print(f"      from {row['uri']}")
+        for note in (row["review_notes"] or "").split("; "):
+            print(f"      - {note}")
+    print(f"\n  {len(rows)} row(s). Correct or confirm each with:"
+          "\n  rag ledger-resolve ID=<n> [TOTAL=12.49] [DATE=2026-09-24] [MERCHANT=..] [CATEGORY=..]")
+    return 0
+
+
+def cmd_ledger_resolve(args) -> int:
+    row = _call(
+        "ledger_resolve", id=args.id, total=args.total, date=args.date,
+        merchant=args.merchant, category=args.category,
+    )
+    print(f"#{row['id']}  {row['txn_date']}  {row['merchant'] or '(no merchant)'}  "
+          f"{_cents(row['amount_cents'])} {row['currency']}  [{row['category']}]  -- resolved")
     return 0
 
 
@@ -92,31 +135,10 @@ def cmd_list(args) -> int:
     """Every vault document. Needs an unlocked vault: the inventory is inside
     the encrypted database, so listing it is reading it."""
     from app import documents
-    from app.vault import service
-    from app.vault.keyagent import AGENT
 
-    if not AGENT.is_unlocked():
-        raise SystemExit("Vault is sealed. Run `make unlock` at a terminal first.")
-
-    conn = AGENT.connect()
-    try:
-        sql = ("SELECT uri, domain, lifecycle, chunk_count, status, indexed_at "
-               "FROM documents")
-        where, params = [], []
-        if args.domain:
-            where.append("domain=?")
-            params.append(args.domain)
-        if not args.all:
-            where.append("lifecycle=?")
-            params.append(documents.ACTIVE)
-        if where:
-            sql += " WHERE " + " AND ".join(where)
-        rows = conn.execute(sql + " ORDER BY domain, uri", params).fetchall()
-    finally:
-        conn.close()
-
+    rows = _call("list", domain=args.domain, all=args.all)
     if args.json:
-        print(json.dumps([dict(r) for r in rows], indent=2, default=str))
+        print(json.dumps(rows, indent=2, default=str))
         return 0
     if not rows:
         print("No vault documents match.")
@@ -134,27 +156,21 @@ def cmd_list(args) -> int:
 
 def cmd_lifecycle(args) -> int:
     from app import documents
-    from app.vault import service
 
-    kwargs = {"domain": args.domain, "reason": args.reason}
+    fields = {"uri": args.uri, "lifecycle": args.lifecycle, "domain": args.domain, "reason": args.reason}
     if args.lifecycle == documents.SUPERSEDED:
         if not args.superseded_by:
             raise SystemExit("supersede needs --superseded-by <uri>")
-        kwargs["superseded_by"] = args.superseded_by
-        kwargs["reason"] = args.reason or f"replaced by {args.superseded_by}"
+        fields["superseded_by"] = args.superseded_by
+        fields["reason"] = args.reason or f"replaced by {args.superseded_by}"
     if args.lifecycle == documents.RETRACTED and not args.reason:
         raise SystemExit("retract needs --reason")
 
-    try:
-        touched = service.set_lifecycle(args.uri, args.lifecycle, **kwargs)
-    except (LookupError, service.VaultSealed) as exc:
-        raise SystemExit(str(exc)) from None
-
-    for uri in touched:
+    for uri in _call("lifecycle", **fields):
         print(f"{uri}: {args.lifecycle}")
     if args.lifecycle == documents.RETRACTED:
-        print("Chunks, vectors and the encrypted original are gone. The row remains as a "
-              "tombstone so ingestion does not bring it back.")
+        print("Chunks, vectors, ledger rows and the encrypted original are gone. The row "
+              "remains as a tombstone so ingestion does not bring it back.")
     return 0
 
 
@@ -262,6 +278,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--group-by", dest="group_by")
     p.add_argument("--limit", type=int, default=100)
     p.set_defaults(func=cmd_ledger)
+
+    # Like lifecycle, review is CLI only: a model may not decide a figure is right.
+    p = sub.add_parser("ledger-review", help="ledger rows flagged needs_review, with why")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_ledger_review)
+
+    p = sub.add_parser("ledger-resolve", help="correct or confirm a flagged ledger row")
+    p.add_argument("id", type=int)
+    p.add_argument("--total", help="as printed, e.g. 12.49 or $1,234.56")
+    p.add_argument("--date", help="as printed, or YYYY-MM-DD")
+    p.add_argument("--merchant")
+    p.add_argument("--category")
+    p.set_defaults(func=cmd_ledger_resolve)
 
     p = sub.add_parser("list", help="every vault document (needs an unlocked vault)")
     p.add_argument("--domain")

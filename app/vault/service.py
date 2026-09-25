@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 from app import documents
@@ -388,6 +389,101 @@ def set_lifecycle(
             touched.append(row["uri"])
         conn.commit()
         return touched
+    finally:
+        conn.close()
+
+
+def list_documents(*, domain: str | None = None, include_all: bool = False) -> list[dict]:
+    """Every vault document. CLI only; listing the inventory is reading it."""
+    if not AGENT.is_unlocked():
+        raise VaultSealed("Vault is sealed. Run `make unlock` at a terminal first.")
+    sql = "SELECT uri, domain, lifecycle, chunk_count, status, indexed_at FROM documents"
+    where, params = [], []
+    if domain:
+        where.append("domain=?")
+        params.append(domain)
+    if not include_all:
+        where.append("lifecycle=?")
+        params.append(documents.ACTIVE)
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    conn = _conn()
+    try:
+        return [dict(r) for r in conn.execute(sql + " ORDER BY domain, uri", params)]
+    finally:
+        conn.close()
+
+
+def ledger_review() -> list[dict]:
+    """Ledger rows a human must check before their amounts can be trusted."""
+    if not AGENT.is_unlocked():
+        raise VaultSealed("Vault is sealed. Run `make unlock` at a terminal first.")
+    conn = _conn()
+    try:
+        return [dict(r) for r in store.ledger_for_review(conn)]
+    finally:
+        conn.close()
+
+
+def resolve_ledger(
+    entry_id: int,
+    *,
+    total: str | None = None,
+    date: str | None = None,
+    merchant: str | None = None,
+    category: str | None = None,
+) -> dict:
+    """Correct a flagged ledger row by hand and clear its flag. CLI only.
+
+    Like lifecycle, there is no MCP tool for this: deciding that a figure is
+    right is a human's call. The corrections are parsed with the same rules as
+    a model's reading, so `12,49` and `$12.49` mean what they mean there, and
+    the previous notes are kept after the resolution so the history survives.
+    """
+    from app import receipts
+
+    if not AGENT.is_unlocked():
+        raise VaultSealed("Vault is sealed. Run `make unlock` at a terminal first.")
+
+    changes: dict = {}
+    if total is not None:
+        cents = receipts.parse_amount(total)
+        if cents is None:
+            raise ValueError(f"cannot read {total!r} as an amount")
+        changes["amount_cents"] = cents
+    if date is not None:
+        iso, note = receipts.parse_date(date, today=datetime.now(timezone.utc).date())
+        if iso is None:
+            raise ValueError(note)
+        changes["txn_date"] = iso
+    if merchant is not None:
+        changes["merchant"] = merchant.strip()[:120] or None
+    if category is not None:
+        if category not in receipts.CATEGORIES:
+            raise ValueError(f"category must be one of {', '.join(receipts.CATEGORIES)}")
+        changes["category"] = category
+
+    conn = _conn()
+    try:
+        row = conn.execute("SELECT * FROM ledger WHERE id=?", (entry_id,)).fetchone()
+        if row is None:
+            raise LookupError(f"No ledger row {entry_id}.")
+        summary = ", ".join(f"{k}={v}" for k, v in changes.items()) or "confirmed as read"
+        history = f"resolved by hand ({summary})"
+        if row["review_notes"]:
+            history += f"; was: {row['review_notes']}"
+        assignments = ", ".join(f"{column}=?" for column in changes)
+        conn.execute(
+            f"UPDATE ledger SET {assignments + ', ' if assignments else ''}"
+            "needs_review=0, review_notes=? WHERE id=?",
+            (*changes.values(), history, entry_id),
+        )
+        audit.record(
+            conn, tool="ledger_resolve", decision=audit.ALLOWED, transport=CLI,
+            principal="cli:local", reason=f"ledger row {entry_id}: {summary}", rows_returned=1,
+        )
+        conn.commit()
+        return dict(conn.execute("SELECT * FROM ledger WHERE id=?", (entry_id,)).fetchone())
     finally:
         conn.close()
 

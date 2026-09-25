@@ -73,6 +73,8 @@ between a component and its environment.
 | `rag reindex` deleted the retracted tombstone and every lifecycle flag, so it re-indexed a retracted document | No test ran reindex over a source holding a non-active document |
 | `FORCE=1` was assumed to re-embed; a chunking-only change reached the index as nothing | Tests call the chunker directly; the skip is in `sync`'s hash check |
 | RRF ties came back in arbitrary order, so `make eval` moved between runs | Unit tests assert on scores, not on the order of equal ones |
+| A vault inbox's second run deleted every receipt it had filed, blob included: the files are consumed into the vault, and the sweep read the empty folder as disappearance | No test ran a vault inbox twice |
+| `vault-list`, `vault-query`, `vault-lifecycle` and `ledger` could only ever say "sealed": `vaultctl` runs in a fresh `docker exec` interpreter with an empty key agent | Tests unlock and call the CLI in one process |
 
 The grant-expiry and approval-binding bugs share a shape worth naming: **a test that acts instantly cannot
 catch a window that is too short for a human**, and **a test that reuses one

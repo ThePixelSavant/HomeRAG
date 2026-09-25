@@ -30,11 +30,13 @@ Run directly for debugging:
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import sys
 from pathlib import Path
 
+from app import receipts
 from app.pipeline import classify, embedder, extract
 from app.pipeline.extract.base import EMPTY, OCR_REQUIRED, OK, doc_id_for
 from app.sources import TRANSCRIPTS
@@ -58,7 +60,25 @@ def _parse_one(source: dict, rel_uri: str, known_hash: str | None) -> dict:
     path = Path(source["path"]) / rel_uri
     record: dict = {"rel_uri": rel_uri, "doc_id": doc_id_for(source["id"], rel_uri)}
 
-    doc = extract.extract(path)
+    file_hash = None
+    if source["domain"] in receipts.RECEIPT_DOMAINS and path.suffix.lower() in receipts.RECEIPT_SUFFIXES:
+        # By domain, not suffix: the same PDF is a manual in `manuals` and a
+        # transaction here. A model or network failure raises into handle(),
+        # which reports it; the file is not consumed, so the next run retries.
+        #
+        # Unchanged is decided on the FILE here, before the model is asked:
+        # a reading costs minutes of CPU, and a receipts folder indexed in
+        # place would otherwise be re-read in full on every run.
+        file_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+        if known_hash is not None and known_hash == file_hash:
+            record["outcome"] = SKIPPED_UNCHANGED
+            record["content_hash"] = file_hash
+            return record
+        from app.pipeline.extract.receipt import extract_receipt
+
+        doc = extract_receipt(path)
+    else:
+        doc = extract.extract(path)
     if doc is None:
         record["outcome"] = SKIPPED_EMPTY
         return record
@@ -93,7 +113,7 @@ def _parse_one(source: dict, rel_uri: str, known_hash: str | None) -> dict:
     else:
         doc.text = classify.redact(doc.text)
 
-    content_hash = doc.content_hash()
+    content_hash = file_hash or doc.content_hash()
     if known_hash is not None and known_hash == content_hash:
         # Unchanged since the last run. Say so before embedding -- the parent
         # only needs to touch the row, and embedding would be pure waste.
@@ -118,6 +138,9 @@ def _parse_one(source: dict, rel_uri: str, known_hash: str | None) -> dict:
         extractor=doc.extractor,
         status_detail=doc.status_detail,
         raw_extraction=json.dumps(doc.extra, default=str),
+        # The unvalidated reading. The parent validates it before any of it
+        # reaches the ledger -- this process is the one that may be lying.
+        receipt=doc.extra.get("receipt"),
         mtime=doc.mtime,
         size_bytes=doc.size_bytes,
         chunks=[

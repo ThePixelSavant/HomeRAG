@@ -70,6 +70,43 @@ that holds the design up is that a passphrase is typed at a terminal and a
 model has no terminal, so vault-tier sources simply do not ingest unattended.
 They queue until someone runs `make ingest` interactively.
 
+### Receipts are read by a model, and the model's answer is not trusted
+
+A receipt in a vault inbox is decoded (Pillow, `pdftoppm`) in the keyless
+parse worker, like any other vault document, and then sent to llama-server's
+vision model. Three consequences:
+
+- **The receipt leaves the worker, over `llm-net`.** It is plaintext HTTP on a
+  Docker bridge to a process shared with Open WebUI's chats, and it stays in
+  that process's KV cache until evicted. Every container on `llm-net` drops
+  `NET_RAW` (`mcp-server` and `ingestion-worker` here; `llama-server` and
+  `open-webui` in `~/Dev/LLM`), so no peer can ARP-spoof onto the path.
+  llama-server's `/slots` reports token counts, never prompt text — checked,
+  not assumed.
+- **The answer is constrained in shape, not in truth.** A JSON schema compiles
+  into a grammar, so the reading always parses; nothing makes it correct. The
+  key-holding parent re-runs validation itself on the raw reading
+  (`app/receipts.py`) rather than trusting any verdict computed in the process
+  that read the attacker-influenced file. Amounts are parsed from the printed
+  strings with `Decimal`. A card number is cut to its last four before it can
+  reach the ledger, and the text is redacted before it is embedded.
+- **A doubtful figure is flagged, never silently summed.** `needs_review` rows
+  still count in totals, and `needs_review_count` on every `query_ledger`
+  response says how much of a total to distrust. Clearing a flag is a human's
+  call at a terminal (`rag ledger-resolve`). There is no MCP tool for it, for
+  the same reason there is none for lifecycle.
+
+### The vault CLI runs inside the vault server
+
+`vaultctl` is started by `docker exec`, in a fresh interpreter whose key agent
+is empty. So every command that reads or writes the vault — list, query,
+ledger, lifecycle, ledger review — runs in the server process as an action
+on `control.sock`, as unlock and approve always did. Gate 1 applies as usual;
+gate 3 is skipped because a human is at the terminal. This widens nothing. The
+socket is `0600`, owned by the vault container's user, and that user can
+already approve a model's pending request, or read the server's memory
+outright.
+
 ### Network segmentation
 
 `mcp-vault` is deliberately **not** on `llm-net`. It sits on `vault-net`, a

@@ -88,11 +88,11 @@ llama-server, where nearly all of that is prefilling tool results.
 - **`make eval`**, the evaluation harness Phase 3 called for, built first so
   each of the above could be measured rather than assumed.
 
-## Phase 2 — vision, aggregation and more sources · **not started**
+## Phase 2 — vision, aggregation and more sources · **in progress**
 
 This is the next block of work. Items are roughly in dependency order.
 
-### a. VLM receipt extraction and the ledger
+### a. VLM receipt extraction and the ledger · *built, awaiting the model* ([ADR-026](decisions.md#adr-026-receipts-are-read-by-a-vision-model-and-validated-in-python))
 
 The largest single gap: `query_ledger` is built and gated but nothing writes
 rows.
@@ -151,7 +151,7 @@ machinery.
 AST-aware chunking for source files stays a nice-to-have. The stated corpus is
 SDK *documentation*, which is markdown, which the existing chunker serves.
 
-### e. Duplicate detection for receipts
+### e. Duplicate detection for receipts · *built, with (a)*
 
 Distinct from supersession. Same merchant + date + total is probably the same
 transaction photographed twice, and double-counting it corrupts every sum the

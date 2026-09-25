@@ -39,7 +39,7 @@ def socket_path() -> Path:
 
 def _handle(request: dict) -> dict:
     from app.vault import audit, grants, service
-    from app.vault.crypto import WrongPassphrase
+    from app.vault.crypto import VaultSealed, WrongPassphrase
     from app.vault.keyagent import AGENT
 
     action = request.get("action")
@@ -115,7 +115,51 @@ def _handle(request: dict) -> dict:
         finally:
             conn.close()
 
+    cli_actions = _cli_actions()
+    if action in cli_actions:
+        try:
+            return {"ok": True, "result": cli_actions[action](request)}
+        except (VaultSealed, LookupError, PermissionError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+
     return {"ok": False, "error": f"unknown action {action!r}"}
+
+
+def _cli_actions() -> dict:
+    """The vault CLI's reads and writes, run HERE, in the process holding the key.
+
+    `make vault-list` and friends run `vaultctl` through `docker exec`, which
+    starts a fresh interpreter whose key agent is empty -- so run in their own
+    process they could only ever report "sealed". They were written that way
+    and never worked. Each is a transport-CLI call: gates 1 and 2 as usual,
+    gate 3 skipped because a human is at the terminal.
+
+    This widens nothing. The socket is 0600 and owned by this container's
+    user, who can already `approve` a model's request and could read this
+    process's memory outright.
+    """
+    from app.vault import service
+
+    return {
+        "list": lambda r: service.list_documents(domain=r.get("domain"), include_all=bool(r.get("all"))),
+        "query": lambda r: service.search(
+            r["query"], domains=r.get("domains"), limit=int(r.get("limit", 5)), ctx=service.Context()
+        ),
+        "ledger": lambda r: service.query_ledger(
+            start_date=r.get("start_date"), end_date=r.get("end_date"), group_by=r.get("group_by"),
+            limit=int(r.get("limit", 100)), ctx=service.Context(), **(r.get("filters") or {}),
+        ),
+        "lifecycle": lambda r: service.set_lifecycle(
+            r["uri"], r["lifecycle"], domain=r.get("domain"), reason=r.get("reason"),
+            superseded_by=r.get("superseded_by"),
+        ),
+        "ledger_review": lambda r: service.ledger_review(),
+        "ledger_resolve": lambda r: service.resolve_ledger(
+            int(r["id"]), total=r.get("total"), date=r.get("date"),
+            merchant=r.get("merchant"), category=r.get("category"),
+        ),
+    }
+
 
 
 def _serve(server: socket.socket) -> None:
@@ -139,7 +183,7 @@ def _serve(server: socket.socket) -> None:
                     except Exception as exc:  # noqa: BLE001 - never kill the channel
                         logger.exception("Control command failed")
                         response = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-                stream.write((json.dumps(response) + "\n").encode())
+                stream.write((json.dumps(response, default=str) + "\n").encode())
                 stream.flush()
         except OSError:
             continue

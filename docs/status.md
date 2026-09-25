@@ -1,15 +1,15 @@
 # Implementation status
 
-As of `feat/ingestion-pipeline-and-vault` after commit `70c9720`, 2026-09-25.
+As of `feat/receipts-ledger`, 2026-09-25. Phase 1 and 1.6 are on `main` (PR #1).
 
-**Phase 1 is built and running. Phase 2 is designed and not started.**
+**Phase 1 is built and running. Phase 2 has started: receipts are built and wait on the vision model.**
 
 ## Summary
 
 | | |
 |---|---|
-| Branch | `feat/ingestion-pipeline-and-vault` (34 commits ahead of `master`) |
-| Tests | **132 passing** (80 pipeline, 39 security, 13 vault ingest) |
+| Branch | `feat/receipts-ledger` — receipts built; merged after the model is verified |
+| Tests | **174 passing** (80 pipeline, 41 receipts, 39 security, 14 vault ingest) |
 | Open tier | 22 active documents (+1 retracted), 1,182 chunks; `manuals` and `notes` populated |
 | Retrieval | `make eval`: hit@3 **73%**, hit@1 53%, MRR 0.652 over 15 questions; a model reads ~2,980 chars per search |
 | Vault | 9 documents, 500 chunks at last count (2026-09-21); all three gates exercised end to end. Sealed at time of writing |
@@ -42,7 +42,7 @@ Legend: **done** = built, tested and exercised against real data ·
 | Git sources | not started | `sources.yaml` rejects the type on purpose |
 | Web sources | not started | Same |
 | OCR for scanned PDFs | not started | Documents marked `ocr_required`, backlog reported |
-| Receipt/VLM extraction | not started | Phase 2 |
+| Receipt/VLM extraction | **built, awaiting the model** | `extract/receipt.py` via `parse_worker`, by domain; tested end to end against a stub of llama-server ([ADR-026](decisions.md#adr-026-receipts-are-read-by-a-vision-model-and-validated-in-python)) |
 
 ### Storage and retrieval
 
@@ -78,7 +78,8 @@ Legend: **done** = built, tested and exercised against real data ·
 | Audit log | done | Records denials too |
 | `fetch_context` (vault) | done | Separately gated, 4 tests |
 | Lifecycle / retraction | done | Destroys chunks, vectors and the blob |
-| Ledger + `query_ledger` | **partial** | **Schema, service, CLI and MCP tool exist and are tested. Nothing writes rows yet** — that is the Phase 2 VLM extractor. |
+| Ledger + `query_ledger` | **built, awaiting the model** | Validated rows in integer cents, `needs_review` with reasons, duplicates flagged; rows follow retraction. `rag ledger`, `ledger-review`, `ledger-resolve` |
+| Vault CLI over the control socket | done | `vault-list`/`query`/`lifecycle`/`ledger` run in the server ([ADR-027](decisions.md#adr-027-the-vault-cli-runs-inside-the-vault-server)) |
 
 ### Interfaces
 
@@ -136,9 +137,9 @@ from unit tests.
 
 Ordered by how likely they are to bite.
 
-1. **The ledger has no writer.** `query_ledger` works and is gated, but no code
-   path inserts a row. Receipts ingested today are chunked and searchable, not
-   summable. Phase 2.
+1. **Receipts wait on the vision model.** The extractor, validation, ledger
+   writes and review commands are built and tested against a stub; nothing is
+   read for real until `qwen3-vl` is served (see *Blocked on you*).
 2. **PDF text follows the file's stored order.** Right for every manual
    indexed so far; a PDF whose stored order is itself scrambled would come out
    scrambled, and nothing detects that yet. A token `-raw` glued that reading
@@ -173,16 +174,16 @@ Ordered by how likely they are to bite.
 
 Nothing is blocking the system any more. What remains is optional.
 
-1. **Swap in a vision model** — Qwen3-VL-30B-A3B-Instruct Q4_K_M plus its
-   mmproj, ~18.6 GB — which Phase 2's receipt extraction depends on. It would
+1. **Download the vision model**: Qwen3-VL-30B-A3B-Instruct Q4_K_M plus its
+   mmproj, about 19.6 GB, over IPv4. Then apply `~/Dev/LLM`'s `vision-router`
+   branch, which serves it beside Coder-Next. Receipts depend on it; it would
    also cover the PDF cases in gap 2 that text extraction cannot.
-2. **Remove the orphaned Docker volumes.** `rag_qdrant-data` and
-   `rag_ollama-data` are left over from the pre-bind-mount layout; no container
-   uses them and together they hold under 2 KB. The unused ollama image is
-   already gone. `docker volume rm rag_qdrant-data rag_ollama-data`.
-3. **Re-ingest vault sources by hand as they change.** `claude-sessions` has a
+2. **Re-ingest vault sources by hand as they change.** `claude-sessions` has a
    4-hourly cadence that will keep queueing; take it with an interactive
    `make ingest` when you want the newer transcripts.
+
+Resolved on 2026-09-25: the orphaned `rag_qdrant-data` and `rag_ollama-data`
+volumes were removed.
 
 Resolved on 2026-09-21: the vault has been unlocked and ingested,
 `VAULT_JWT_SECRET` is set and matching, and Open WebUI is configured and

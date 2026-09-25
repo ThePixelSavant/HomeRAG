@@ -60,18 +60,20 @@ deletes, retracts or unlocks.
 |---|---|
 | [app/domains.py](../app/domains.py) | The domain→tier map. Also the frozen `POINT_NAMESPACE` and `SCHEMA_VERSION`. |
 | [app/documents.py](../app/documents.py) | Lifecycle states, citation formatting, and the trimmed result row the MCP servers send a model (`for_model`). Dependency-free — both tiers need it and neither may import the other. |
+| [app/receipts.py](../app/receipts.py) | What the vision model is asked for, and how its reading becomes a validated ledger row: amounts to integer cents, dates, arithmetic checks, duplicate matching. Dependency-free, so both halves of vault ingestion import it. |
 | [app/config.py](../app/config.py) | Settings from the environment. |
 | [app/sources.py](../app/sources.py) | The source manifest plus implicit inbox sources. |
 | [app/pipeline/embedder.py](../app/pipeline/embedder.py) | **The only module that imports fastembed.** |
 | [app/pipeline/chunker.py](../app/pipeline/chunker.py) | Token-accurate chunking, table headers, char offsets. |
-| [app/pipeline/extract/](../app/pipeline/extract/) | Per-type extractors: text/markdown, PDF, Claude Code transcripts. |
+| [app/pipeline/extract/](../app/pipeline/extract/) | Per-type extractors: text/markdown, PDF, Claude Code transcripts, and receipts (`receipt.py`, dispatched by domain). |
+| [app/pipeline/vlm.py](../app/pipeline/vlm.py) | The client for llama-server's vision model, JSON-schema constrained. Runs in the keyless parse worker. |
 | [app/pipeline/classify.py](../app/pipeline/classify.py) | Sensitivity scan (open tier) and redaction (vault tier). |
 | [app/pipeline/sync.py](../app/pipeline/sync.py) | Orchestration, tier routing, the sweep. |
 | [app/pipeline/qdrant_store.py](../app/pipeline/qdrant_store.py) | Open tier only. |
 | [app/pipeline/state.py](../app/pipeline/state.py) | Operational state: runs, sources, documents, quarantine. |
 | [app/vault/](../app/vault/) | Crypto, key agent, identity, grants, audit, store, service, control socket. |
 | [app/ingest.py](../app/ingest.py) | Control-plane CLI. |
-| [app/vaultctl.py](../app/vaultctl.py) | Vault CLI. Separate so the vault image needs no qdrant-client. |
+| [app/vaultctl.py](../app/vaultctl.py) | Vault CLI. Separate so the vault image needs no qdrant-client; every read and write runs in the vault server over `control.sock` ([ADR-027](decisions.md#adr-027-the-vault-cli-runs-inside-the-vault-server)). |
 | [app/main.py](../app/main.py) | Open-tier MCP server. |
 | [app/vault_server.py](../app/vault_server.py) | Vault MCP server. |
 
@@ -161,6 +163,28 @@ breadcrumb. See [decisions.md](decisions.md#adr-025-pdf-chunks-follow-section-he
 
 This replaced a whitespace classifier that chose `-layout` or reading order per
 page. See [decisions.md](decisions.md#adr-024-pdf-pages-use--raw-re-spaced-from-reading-order).
+
+## Receipts: from a photo to a ledger row
+
+```
+data/inbox/receipts/coffee.jpg
+  └─ parse_worker (no key)        by DOMAIN: receipts + image/PDF → extract/receipt.py
+       ├─ file hash unchanged?    → skipped before the model is asked
+       ├─ PDF text layer?         → sent as text      (cheap)
+       │  else                    → pdftoppm / Pillow → ≤1536 px JPEG
+       ├─ vlm.read_json           → llama-server "qwen3-vl", JSON-schema constrained
+       └─ record: rendered text + chunks + vectors + the RAW reading
+  └─ sync (holds the key)
+       ├─ chunks → vault.db       (search_vault finds the rendered text)
+       ├─ receipts.validate(raw)  → cents, dates, arithmetic, notes
+       ├─ ledger_matches          → possible duplicate? flag, never merge
+       ├─ replace_ledger          (a re-index replaces, never doubles)
+       └─ blobs.consume           → encrypted original; plaintext deleted
+```
+
+A vault inbox is never swept: consumed files leave the drop folder empty on
+purpose. Its documents leave only by retraction, which also deletes their
+ledger rows. See [ADR-026](decisions.md#adr-026-receipts-are-read-by-a-vision-model-and-validated-in-python).
 
 ## Deletion: two mechanisms, both required
 

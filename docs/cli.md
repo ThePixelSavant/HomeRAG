@@ -382,6 +382,56 @@ transport, chat and message ids, and row count. Denials are recorded too. The
 query is stored as a hash, not as text, so the audit log is not a second
 unencrypted copy of what you searched for.
 
+### Receipts
+
+Drop a photo (`.jpg`, `.png`, `.webp`) or a PDF into `data/inbox/receipts/`
+and run `rag ingest`. The vision model reads it into the ledger, and the
+original is encrypted into the vault and deleted from the inbox. A PDF
+e-receipt with a text layer is read as text, which is much faster than a photo
+on this CPU. Every reading is checked: lines that don't sum, a total that
+doesn't add up, no date, an ambiguous date, or the same receipt filed twice
+all flag the row for review rather than being corrected or dropped.
+
+#### `rag ledger` — totals in exact cents
+
+```bash
+rag ledger [START=2026-09-01] [END=2026-09-30] [MERCHANT="Costco"] [CATEGORY=dining] [GROUP=month|merchant|category]
+```
+
+The same query `query_ledger` gives a model, run as you: sums come from SQL
+over integer cents, never from reading text. `needs_review_count` says how many
+rows in the total are flagged.
+
+#### `rag ledger-review` — what needs a human
+
+```bash
+rag ledger-review [JSON=1]
+```
+
+```
+  #7  2026-09-24  Blue Bottle Coffee  12.62 USD  [dining]
+      from coffee-b.jpg
+      - possible duplicate of coffee-a.jpg
+```
+
+#### `rag ledger-resolve` — correct or confirm
+
+```bash
+rag ledger-resolve ID=7                              # confirm the reading as it is
+rag ledger-resolve ID=7 TOTAL=12.62 DATE=2026-09-24  # correct it
+rag ledger-resolve ID=9 MERCHANT="Costco" CATEGORY=groceries
+```
+
+Values are read with the same rules as the model's: `TOTAL=$1,234.56` or
+`TOTAL=12,49` both work, and a date in the future or before 2000 is refused.
+The flag is cleared, the old notes are kept after the resolution, and the
+change is recorded in the audit log. A duplicate you do not want is removed by
+retracting its document: `rag vault-lifecycle URI=coffee-b.jpg STATE=retracted
+REASON="duplicate"`, which also deletes its ledger row.
+
+There is no MCP tool for any of this: a model may not decide that a figure is
+right.
+
 ---
 
 ## Health and maintenance

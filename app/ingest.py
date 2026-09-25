@@ -237,6 +237,8 @@ def _run(sources: list[Source], *, force: bool, dry_run: bool) -> int:
                              ("skipped(retracted)", result.skipped_retracted),
                              ("empty (nothing to index)", result.docs_empty),
                              ("pages flagged for review", result.flagged_pages),
+                             ("receipts read", result.receipts_read),
+                             ("receipts needing review (rag ledger-review)", result.receipts_flagged),
                              ("failed", result.failed)):
             if count:
                 print(f"      {label}: {count}")
