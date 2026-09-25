@@ -585,3 +585,61 @@ Roland and IntelliFlo pages `-raw` now reads correctly.
 
 **Revisit if:** a PDF turns up whose stored order is itself scrambled. `-raw`
 cannot fix that; a page render through the Phase 2 vision model can.
+
+## ADR-025: PDF chunks follow section headings
+
+**Chosen:** Cut each PDF page at its section headings, found by font size from
+`pdftohtml -xml`, and start a new chunk at every heading unless what is pending
+is under 40 tokens. Prefix each chunk with `document title > heading path`.
+
+**Rejected:** Packing sections up to the token budget; detecting headings from
+the text; a page-margin filter for running headers; a larger merge floor.
+
+Cut by size alone, a Roland page's chunk held arpeggio, chord memory, Key
+Transpose and Assign Mode together. Its embedding matched none of them, and the
+answer to "how do I set the SH-01A to play as a polysynth?" ranked 8th.
+
+Measured with `make eval` (14 questions over five manuals; hit@3 is what a
+model sees, since `search_docs` returns 3):
+
+| | hit@1 | hit@3 | MRR@10 | top-3 chars |
+|---|---:|---:|---:|---:|
+| Size-based chunks (baseline) | 36% | 71% | 0.547 | 4,382 |
+| Sections, floor 40 | 50% | 79% | 0.633 | 2,980 |
+| + title root, front-matter levels | **57%** | **79%** | **0.699** | **2,801** |
+| same, floor 120 | 43% | 57% | 0.537 | 3,351 |
+
+The SH-01A answer moved from 8th to 2nd, the Key Transpose answer from past
+10th to 2nd, and the model reads 36% less per search. Two answers fell out of
+the top 3: TB-03's tempo (2nd to 5th, behind the manual's opening settings
+table, which says "TB-03" and "tempo" repeatedly) and XPS system setup (1st to
+4th, behind three chunks of the same section). Neither is a chunking defect,
+and tuning further against 14 questions would be fitting the test.
+
+Why each rule:
+
+- **Font size, not text.** `MONO Monophonic` and a bold numbered step look like
+  headings as text. Every manual sets headings at least 2pt above body text;
+  98-100% of those match a `-raw` line exactly. The misses are correct
+  non-cuts: Dell contents entries (dot leaders) and TR-06 table cells at heading
+  size.
+- **No margin filter.** Excluding the top and bottom 6% of each page, meant
+  for running headers, removed only real headings — 66 chapter titles in Analog
+  Lab, and section titles at the top of an A3 sheet's columns. No manual sets a
+  running header at heading size.
+- **Front-matter levels.** Arturia sets "Table Of Contents" at 17pt, above its
+  15pt chapters, so it sat at the root of every breadcrumb. A size confined to
+  under 10% of a document of 10+ pages takes the next size's level.
+- **Title root.** A Roland section says "Setting the tempo", never which
+  instrument; the question always names one. Transcripts already carry their
+  title the same way.
+- **Floor of 40.** A bare chapter title as its own chunk matches every question
+  about the chapter and answers none. 120 packed real sections together again.
+
+This also found that `FORCE=1` does not re-embed — it only overrides the
+sweep — so a chunking change reaches the index through `rag reindex`, which
+now blanks hashes rather than deleting rows. Deleting them dropped the
+retracted tombstone, so reindex re-indexed a retracted document.
+
+**Revisit if:** a manual sets headings at body size (bold only), or the eval
+set grows enough to tune the floor honestly.

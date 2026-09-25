@@ -54,9 +54,15 @@ _TABLE_SEP_CHARS = set("|-: \t")
 # more context than it restores, so the chunk goes without one.
 _HEADER_BUDGET_RATIO = 0.5
 
-# Per-block keys that chunk_blocks combines across a chunk rather than letting
-# the last block win.
-_AGGREGATED = frozenset({"page", "extract_mode"})
+# Per-block keys that chunk_blocks combines across a chunk, or reads for
+# itself, rather than letting the last block win.
+_AGGREGATED = frozenset({"page", "extract_mode", "heading_path", "section_start"})
+
+# A section this small does not get a chunk of its own; the next section is
+# packed in behind it. It is almost always a chapter title sitting directly
+# above its first subsection, and a chunk holding only a title matches every
+# query about the chapter while answering none of them.
+SECTION_MIN_TOKENS = 40
 
 
 @dataclass
@@ -368,6 +374,8 @@ def chunk_blocks(
     start_index: int = 0,
     separator: str = "\n\n",
     prefix: str = "",
+    section_min_tokens: int = SECTION_MIN_TOKENS,
+    crumb_root: str = "",
     **kwargs,
 ) -> list[Chunk]:
     """Pack atomic blocks into chunks, never splitting one unless it must.
@@ -375,6 +383,17 @@ def chunk_blocks(
     Used where the unit carries meaning on its own -- a conversation turn, a
     PDF page -- and slicing it in half would leave a question without its
     answer.
+
+    Blocks that carry a `heading_path` (PDF sections) are also kept apart:
+    one starting a section (`section_start`) starts a new chunk unless what is
+    pending is under `section_min_tokens`, so two sections share a chunk only
+    when one of them is a bare title. And each chunk is prefixed with its
+    heading breadcrumb, charged to its budget -- the whole path when the chunk
+    starts mid-section, only the parents when its text opens on the heading
+    itself. `crumb_root` (the document title) heads every breadcrumb: a
+    section of a Roland sheet says "Setting the tempo" and never which
+    instrument, which is the first thing a question names. Blocks without a
+    heading path (transcript turns) pack as before, with no breadcrumb.
     """
     target = kwargs.get("target", settings.chunk_target_tokens)
     hard_max = kwargs.get("hard_max", settings.chunk_max_tokens)
@@ -386,6 +405,20 @@ def chunk_blocks(
     index = start_index
     pending: list[TextBlock] = []
     pending_tokens = 0
+    pending_crumb_tokens = 0
+
+    def _crumb(block: TextBlock, *, at_heading: bool) -> str:
+        if "heading_path" not in block.extra:
+            return ""
+        path = block.extra["heading_path"]
+        if at_heading:
+            path = path[:-1]
+        path = [crumb_root, *path] if crumb_root else path
+        return " > ".join(path) + "\n\n" if path else ""
+
+    def _opening_crumb(block: TextBlock) -> str:
+        """The crumb this block carries when it opens a chunk."""
+        return _crumb(block, at_heading=bool(block.extra.get("section_start")))
 
     def _merge(blocks: list[TextBlock]) -> dict:
         """Doc-level extra plus the blocks', with page numbers ACCUMULATED.
@@ -408,42 +441,73 @@ def chunk_blocks(
         return merged
 
     def flush() -> None:
-        nonlocal pending, pending_tokens, index
+        nonlocal pending, pending_tokens, pending_crumb_tokens, index
         if not pending:
             return
         body = separator.join(b.text for b in pending)
-        text = prefix + body if prefix else body
+        text = prefix + _opening_crumb(pending[0]) + body
         chunks.append(
-            Chunk(index=index, text=text, token_count=count_tokens(text), extra=_merge(pending))
+            Chunk(
+                index=index,
+                text=text,
+                token_count=count_tokens(text),
+                heading_path=list(pending[0].extra.get("heading_path") or []),
+                extra=_merge(pending),
+            )
         )
         index += 1
-        pending, pending_tokens = [], 0
+        pending, pending_tokens, pending_crumb_tokens = [], 0, 0
 
     for block in blocks:
         text = block.text.strip()
         if not text:
             continue
         tokens = count_tokens(text)
+        opening = _opening_crumb(block)
+        opening_tokens = count_tokens(opening) if opening else 0
 
-        if tokens + prefix_tokens > hard_max:
-            # Oversized on its own: flush what we have, then split just this one.
-            flush()
-            merged = _merge([block])
-            for piece in split_text(text, **kwargs):
-                body = prefix + piece if prefix else piece
+        if tokens + prefix_tokens + opening_tokens > hard_max:
+            # Oversized on its own: split just this one. Every piece after the
+            # first starts mid-section, so every piece reserves room for the
+            # full breadcrumb. A bare title pending ahead of it goes into the
+            # first piece rather than becoming a chunk of a few tokens.
+            lead = block
+            carried: list[TextBlock] = []
+            if "heading_path" in block.extra and pending and pending_tokens < section_min_tokens:
+                carried, lead = pending, pending[0]
+                text = separator.join([b.text for b in carried] + [text])
+                pending, pending_tokens, pending_crumb_tokens = [], 0, 0
+            else:
+                flush()
+            merged = _merge([*carried, block])
+            opening = _opening_crumb(lead)
+            full = _crumb(block, at_heading=False)
+            piece_kwargs = dict(kwargs)
+            reserve = max(count_tokens(c) if c else 0 for c in (opening, full))
+            if reserve:
+                piece_kwargs["target"] = target - reserve
+                piece_kwargs["hard_max"] = hard_max - reserve
+            for n, piece in enumerate(split_text(text, **piece_kwargs)):
+                owner = lead if n == 0 else block
+                body = prefix + (opening if n == 0 else full) + piece
                 chunks.append(
                     Chunk(
                         index=index,
                         text=body,
                         token_count=count_tokens(body),
+                        heading_path=list(owner.extra.get("heading_path") or []),
                         extra=dict(merged),
                     )
                 )
                 index += 1
             continue
 
-        if pending and pending_tokens + sep_tokens + tokens > budget:
+        if block.extra.get("section_start") and pending_tokens >= section_min_tokens:
             flush()
+        if pending and pending_tokens + sep_tokens + tokens > budget - pending_crumb_tokens:
+            flush()
+        if not pending:
+            pending_crumb_tokens = opening_tokens
         pending.append(block)
         pending_tokens += tokens + (sep_tokens if len(pending) > 1 else 0)
 

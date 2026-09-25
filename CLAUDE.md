@@ -109,6 +109,15 @@ is bare numbers with nothing saying which column is torque.
 the last block win. A chunk built from pages 11 and 12 that cited only 12 sends
 the reader past the answer.
 
+**PDF sections get their own chunks.** The extractor cuts each page at its
+headings, found by **font size** via `pdftohtml -xml` (as text a heading is
+indistinguishable from a table cell). `chunk_blocks` starts a chunk at every
+`section_start` block unless what is pending is under `SECTION_MIN_TOKENS`
+(40 — a bare chapter title), and prefixes `title > heading path`. Blocks
+without `heading_path` (transcript turns) pack exactly as before. Tune against
+`make eval`, not intuition: 120 looked safer and dropped hit@3 from 79% to
+57%. ADR-025.
+
 ### PDF extraction: `-raw`, re-spaced from reading order
 
 Every page is `pdftotext -raw`: text in the order the PDF stores it. That keeps

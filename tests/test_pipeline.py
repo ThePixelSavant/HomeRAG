@@ -428,6 +428,7 @@ def test_pages_are_extracted_in_stored_order(tmp_path, monkeypatch):
 
     monkeypatch.setattr(pdf, "_pdfinfo", lambda path: (2, "SH-01A"))
     monkeypatch.setattr(pdf, "_page_text", fake)
+    monkeypatch.setattr(pdf, "_headings", lambda path: {})
     manual = tmp_path / "sh01a.pdf"
     manual.write_bytes(b"%PDF-1.4")
 
@@ -439,6 +440,192 @@ def test_pages_are_extracted_in_stored_order(tmp_path, monkeypatch):
     ]
     assert "1. Press [MENU]" in doc.blocks[0].text
     assert "flagged_pages" not in doc.extra
+
+
+# --- PDF sections ------------------------------------------------------------
+
+_SH01A_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<pdf2xml>
+<page number="1" position="absolute" top="0" left="0" height="842" width="1191">
+<fontspec id="0" size="24" family="MyriadPro" color="#000000"/>
+<fontspec id="1" size="10" family="MyriadPro" color="#000000"/>
+<fontspec id="2" size="14" family="MyriadPro" color="#ffffff"/>
+<fontspec id="3" size="12" family="MyriadPro" color="#000000"/>
+<text top="20" left="40" width="80" height="30" font="0"><b>SH-01A</b></text>
+<text top="30" left="40" width="80" height="17" font="2"><b>Introduction</b></text>
+<text top="60" left="40" width="300" height="13" font="1">Body text that is long enough to set the body size of the page.</text>
+<text top="80" left="40" width="300" height="13" font="1">More body text, so that ten point is by far the most common size.</text>
+<text top="100" left="40" width="30" height="15" font="3"><b>1.1.</b></text>
+<text top="100" left="75" width="120" height="15" font="3"><b>Making the connections</b></text>
+<text top="120" left="40" width="30" height="17" font="2">9:00</text>
+<text top="140" left="40" width="30" height="17" font="2">A sentence set at display size that runs well past eighty characters and so is not a heading.</text>
+</page>
+<page number="2" position="absolute" top="0" left="0" height="842" width="1191">
+<text top="30" left="40" width="80" height="17" font="2"><b>Key Transpose</b></text>
+<text top="60" left="40" width="300" height="13" font="1">Hold down the [KEY TRANSPOSE] button and press any key except the centre C key.</text>
+<text top="90" left="40" width="80" height="17" font="2"><b>Selecting Assign Mode</b></text>
+<text top="110" left="40" width="60" height="15" font="3"><b>Poly play</b></text>
+<text top="130" left="40" width="60" height="15" font="3"><b>Chord play</b></text>
+</page>
+</pdf2xml>"""
+
+
+def test_headings_are_found_by_font_size():
+    from app.pipeline.extract.pdf import _parse_headings
+
+    assert _parse_headings(_SH01A_XML) == {
+        # The 24pt cover title is used once, so it is not a level. `9:00` has
+        # no words; the display-size sentence is too long. `1.1.` and its
+        # title share a line and are joined.
+        1: [("Introduction", 1), ("1.1. Making the connections", 2)],
+        2: [("Key Transpose", 1), ("Selecting Assign Mode", 1), ("Poly play", 2), ("Chord play", 2)],
+    }
+
+
+def test_no_headings_without_pdftohtml_output():
+    from app.pipeline.extract.pdf import _parse_headings
+
+    assert _parse_headings("") == {}
+
+
+def test_page_is_cut_at_its_headings():
+    from app.pipeline.extract.pdf import _split_sections
+
+    text = (
+        "the end of the previous section.\n"
+        "Key Transpose\n"
+        "Hold down [KEY TRANSPOSE] and press a key.\n"
+        "Selecting Assign Mode\n"
+        "1. Press the [MENU] button.\n"
+        "Poly play\n"
+        "Plays polyphonically.\n"
+        "Selecting Assign Mode again, in body text.\n"
+    )
+    headings = [("Key Transpose", 1), ("Selecting Assign Mode", 1), ("Poly play", 2)]
+    sections, path = _split_sections(text, headings, [(1, "Sequencer")])
+
+    assert sections == [
+        ("the end of the previous section.", ["Sequencer"], False),
+        ("Key Transpose\nHold down [KEY TRANSPOSE] and press a key.", ["Key Transpose"], True),
+        ("Selecting Assign Mode\n1. Press the [MENU] button.", ["Selecting Assign Mode"], True),
+        (
+            "Poly play\nPlays polyphonically.\nSelecting Assign Mode again, in body text.",
+            ["Selecting Assign Mode", "Poly play"],
+            True,
+        ),
+    ]
+    assert path == [(1, "Selecting Assign Mode"), (2, "Poly play")]
+
+
+def test_a_heading_line_cuts_only_as_often_as_the_font_data_found_it():
+    from app.pipeline.extract.pdf import _split_sections
+
+    text = "Sequencer\nThe Sequencer section.\nSequencer\nstill the same section."
+    sections, _ = _split_sections(text, [("Sequencer", 1)], [])
+    assert len(sections) == 1
+
+
+def test_a_wrapped_heading_is_one_heading():
+    from app.pipeline.extract.pdf import _split_sections
+
+    text = "Thank you for your interest in Arturia Analog\nLab!\nWelcome."
+    headings = [("Thank you for your interest in Arturia Analog", 1), ("Lab!", 1)]
+    sections, path = _split_sections(text, headings, [])
+    assert sections == [(text, ["Thank you for your interest in Arturia Analog Lab!"], True)]
+
+
+def test_extractor_emits_sections_with_their_path(tmp_path, monkeypatch):
+    from app.pipeline.extract import pdf
+
+    pages = {1: "Sequencer\nThe sequencer plays.", 2: "continues here.\nHold\nHold notes."}
+    monkeypatch.setattr(pdf, "_pdfinfo", lambda path: (2, "SH-01A"))
+    monkeypatch.setattr(pdf, "_page_text", lambda path, page, mode=pdf.MODE_RAW: pages[page] * 1)
+    monkeypatch.setattr(pdf, "_headings", lambda path: {1: [("Sequencer", 1)], 2: [("Hold", 1)]})
+    manual = tmp_path / "sh01a.pdf"
+    manual.write_bytes(b"%PDF-1.4")
+
+    doc = pdf.PdfExtractor().extract(manual)
+    assert [(b.extra["page"], b.extra["heading_path"], b.extra["section_start"]) for b in doc.blocks] == [
+        (1, ["Sequencer"], True),
+        (2, ["Sequencer"], False),
+        (2, ["Hold"], True),
+    ]
+    assert {b.kind for b in doc.blocks} == {"section"}
+
+
+def _section(text, path, *, start=True, page=1):
+    return TextBlock(
+        text=text,
+        kind="section",
+        extra={"page": page, "heading_path": path, "section_start": start},
+    )
+
+
+def test_each_section_gets_its_own_chunk():
+    """Two sections that would fit together are still kept apart: packed,
+    each one's embedding is the average of both topics."""
+    key = _section("Key Transpose\n" + "Hold the button and press a key. " * 8, ["Key Transpose"])
+    assign = _section("Assign Mode\n" + "Press MENU then a number button. " * 8, ["Assign Mode"])
+    chunks = chunker.chunk_blocks([key, assign])
+
+    assert [c.heading_path for c in chunks] == [["Key Transpose"], ["Assign Mode"]]
+    # Each opens on its own heading, so no breadcrumb is repeated above it.
+    assert chunks[1].text.startswith("Assign Mode\n")
+
+
+def test_a_bare_title_is_packed_with_the_section_after_it():
+    chapter = _section("3. THE STEP SEQUENCERS", ["3. THE STEP SEQUENCERS"])
+    first = _section(
+        "3.1. Overview\n" + "The step sequencers play monophonic lines. " * 8,
+        ["3. THE STEP SEQUENCERS", "3.1. Overview"],
+    )
+    chunks = chunker.chunk_blocks([chapter, first])
+
+    assert len(chunks) == 1
+    assert chunks[0].text.startswith("3. THE STEP SEQUENCERS\n\n3.1. Overview")
+
+
+def test_a_continuation_packs_with_its_section_and_keeps_both_pages():
+    head = _section("Sequencer\n" + "The sequencer plays. " * 10, ["Sequencer"], page=11)
+    tail = _section("It continues on the next page.", ["Sequencer"], start=False, page=12)
+    (chunk,) = chunker.chunk_blocks([head, tail])
+    assert chunk.extra["locator"] == {"page": 11, "pages": [11, 12]}
+
+
+def test_every_piece_of_a_long_section_carries_its_breadcrumb():
+    long = _section(
+        "Pattern Write\n" + "Press a step button to enter a note. " * 200,
+        ["Sequencer", "Pattern Write"],
+    )
+    chunks = chunker.chunk_blocks([long])
+
+    assert len(chunks) > 1
+    # The first piece opens on its heading, so only the parent is added.
+    assert chunks[0].text.startswith("Sequencer\n\nPattern Write\n")
+    for chunk in chunks[1:]:
+        assert chunk.text.startswith("Sequencer > Pattern Write\n\n")
+    assert all(c.token_count <= settings.chunk_max_tokens for c in chunks)
+    assert all(c.heading_path == ["Sequencer", "Pattern Write"] for c in chunks)
+
+
+def test_a_bare_title_goes_into_the_first_piece_of_a_long_section():
+    chapter = _section("5. PROJECTS", ["5. PROJECTS"])
+    long = _section(
+        "5.1. Saving\n" + "Hold SAVE and press PROJECT. " * 200, ["5. PROJECTS", "5.1. Saving"]
+    )
+    chunks = chunker.chunk_blocks([chapter, long])
+
+    assert chunks[0].text.startswith("5. PROJECTS\n\n5.1. Saving")
+    assert chunks[0].heading_path == ["5. PROJECTS"]
+    assert chunks[1].text.startswith("5. PROJECTS > 5.1. Saving\n\n")
+
+
+def test_blocks_without_a_heading_path_still_pack_together():
+    """Transcript turns have no sections; they pack as they always did."""
+    turns = [TextBlock(text=f"turn {n}: " + "words " * 20, kind="user") for n in range(3)]
+    (chunk,) = chunker.chunk_blocks(turns)
+    assert chunk.heading_path == []
+    assert chunk.text.startswith("turn 0")
 
 
 # --- state database --------------------------------------------------------

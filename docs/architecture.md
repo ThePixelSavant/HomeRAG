@@ -152,6 +152,13 @@ holds the same characters with the spaces restored from geometry, so each page
 is extracted both ways and `_respace` splits a glued raw token back into
 reading-order words. A token reading order also produced is never touched.
 
+Each page is then cut at its section headings, found by font size from
+`pdftohtml -xml`: a heading is any line set at least 2pt above body text, at a
+size used at least three times, with words in it. Each section becomes a block
+carrying its heading path, and `chunk_blocks` starts a new chunk at each one, so
+a chunk is about one thing and says which, with a `title > heading path`
+breadcrumb. See [decisions.md](decisions.md#adr-025-pdf-chunks-follow-section-headings).
+
 This replaced a whitespace classifier that chose `-layout` or reading order per
 page. See [decisions.md](decisions.md#adr-024-pdf-pages-use--raw-re-spaced-from-reading-order).
 
