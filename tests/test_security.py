@@ -489,3 +489,18 @@ def test_fetch_context_pending_also_echoes_its_arguments(unlocked, token):
 
     retry = vault_server._pending(excinfo.value)["retry_with"]
     assert retry == {"doc_id": "d1", "chunk_index": 4, "before": 2, "after": 1}
+
+
+def test_the_control_socket_is_unreachable_outside_the_vault_container(tmp_path, monkeypatch):
+    """The socket lives on a tmpfs private to mcp-vault. From anywhere else --
+    the ingestion worker above all, which shares ./data/vault -- its absence is
+    the design, and must read as such rather than as an outage."""
+    from app.config import settings
+    from app.vault import control
+
+    monkeypatch.setattr(settings, "vault_control_socket", tmp_path / "absent" / "control.sock")
+    with pytest.raises(control.ControlForbidden, match="only inside the mcp-vault container"):
+        control.send({"action": "status"})
+    # And by default it is not on the directory the worker mounts.
+    defaults = type(settings).model_fields
+    assert defaults["vault_control_socket"].default.parent != defaults["vault_db_path"].default.parent

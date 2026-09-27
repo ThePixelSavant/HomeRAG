@@ -90,8 +90,12 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.vault
+      args:
+        RAG_UID: ${RAG_UID:-1000}
+        RAG_GID: ${RAG_GID:-1000}
     container_name: mcp-vault
     restart: unless-stopped
+    user: "${RAG_UID:-1000}:${RAG_GID:-1000}"
     ports:
       - "127.0.0.1:${VAULT_PORT:-8001}:8001"
     env_file:
@@ -99,11 +103,19 @@ services:
     environment:
       VAULT_DB_PATH: /data/vault/vault.db
       VAULT_BLOBS_PATH: /data/vault/blobs
+      VAULT_CONTROL_SOCKET: /run/vault/control.sock
       STATE_DB_PATH: /data/state/rag.db
       DATA_ROOT: /data
     volumes:
       - ./data/vault:/data/vault
       - ./data/state:/data/state:ro
+    # The control socket lives here, in memory, private to this container --
+    # NOT on ./data/vault. The ingestion worker runs as the same uid and mounts
+    # that directory; a socket there would be reachable from the process that
+    # parses untrusted files. `make unlock` and the vault CLI run in this
+    # container via `docker exec`, so they are the only callers.
+    tmpfs:
+      - /run/vault:mode=0700,uid=${RAG_UID:-1000},gid=${RAG_GID:-1000}
     # Deliberately NOT on llm-net. vault-net carries only this container and
     # open-webui, so mcp-server is not in the same broadcast domain and cannot
     # ARP-spoof the hop the identity assertion travels on. This service makes no

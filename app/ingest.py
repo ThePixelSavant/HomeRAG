@@ -637,7 +637,7 @@ def cmd_status(args) -> int:
         print(f"  !! {payload['quarantined_open']} quarantined document(s) awaiting review")
     vault = payload.get("vault") or {}
     if "unreadable_here" in vault:
-        print(f"vault: {vault['unreadable_here']}  (its control socket is restricted to "
+        print(f"vault: {vault['unreadable_here']}  (its control socket exists only inside "
               "the vault container, which is the point)")
     elif "error" in vault:
         print(f"vault: unavailable ({vault['error']})")

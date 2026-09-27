@@ -44,6 +44,9 @@ class Settings(BaseSettings):
     state_db_path: Path = Path("/data/state/rag.db")
     vault_db_path: Path = Path("/data/vault/vault.db")
     vault_blobs_path: Path = Path("/data/vault/blobs")
+    # Inside the vault container only: a tmpfs, not the ./data/vault bind mount,
+    # which the ingestion worker shares. See docker-compose.yml.
+    vault_control_socket: Path = Path("/run/vault/control.sock")
     sources_file: Path = Path("/app/sources.yaml")
 
     # --- MCP servers ---

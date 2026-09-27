@@ -3,11 +3,17 @@
 The key lives in the vault server's memory, and `make unlock` runs as a
 separate process -- so the passphrase has to reach that server somehow.
 
-It travels over a Unix domain socket on the bind-mounted data directory, never
-over the network. That matters: an HTTP unlock endpoint on this container would
-be reachable from every other container on llm-net, including Open WebUI, which
-would hand the model a way to try passphrases. A socket file with mode 0600 is
-reachable only by something already inside the trust boundary.
+It travels over a Unix domain socket, never over the network. That matters: an
+HTTP unlock endpoint on this container would be reachable from every other
+container on llm-net, including Open WebUI, which would hand the model a way to
+try passphrases.
+
+The socket lives on a tmpfs inside the vault container, not on the
+./data/vault bind mount. The ingestion worker runs as the same uid and mounts
+that directory, so a socket there would be reachable from the process that
+parses untrusted files -- and while the vault is unlocked, this socket reads
+the vault. Every legitimate caller (`make unlock`, the vault CLI) runs inside
+the vault container via `docker exec`, so nothing else needs to reach it.
 
 Commands are newline-delimited JSON.
 """
@@ -25,11 +31,8 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-SOCKET_NAME = "control.sock"
-
-
 def socket_path() -> Path:
-    return settings.vault_db_path.parent / SOCKET_NAME
+    return settings.vault_control_socket
 
 
 # --------------------------------------------------------------------------
@@ -213,19 +216,23 @@ class ControlUnavailable(RuntimeError):
 
 
 class ControlForbidden(ControlUnavailable):
-    """The socket is there; this process is not allowed to use it.
+    """This process cannot reach the vault's control socket, by design.
 
-    Its own type because it is the expected answer for every unprivileged
-    container, not a fault. Callers report it differently -- see cmd_doctor.
+    Its own type because it is the expected answer from every container but
+    the vault's own, not a fault. Callers report it differently -- see
+    cmd_doctor.
     """
 
 
 def send(request: dict, timeout: float = 120.0) -> dict:
     path = socket_path()
     if not path.exists():
-        raise ControlUnavailable(
-            f"No vault control socket at {path}. Is mcp-vault running? "
-            "Try: docker compose up -d mcp-vault"
+        # Outside the vault container this is the design, not a fault: the
+        # socket is on a tmpfs private to it.
+        raise ControlForbidden(
+            f"The vault control socket ({path}) exists only inside the mcp-vault "
+            "container. Use `make vault-status` and the other vault commands, "
+            "which run there."
         )
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     client.settimeout(timeout)
@@ -239,15 +246,9 @@ def send(request: dict, timeout: float = 120.0) -> dict:
             raise ControlUnavailable("Vault server closed the connection without replying.")
         return json.loads(line)
     except PermissionError:
-        # The socket is 0600 and owned by the vault server's user. Every other
-        # container now runs unprivileged, so this is the expected answer from
-        # them rather than a fault -- and a bare "Permission denied" reads like
-        # a bug, which sends people looking in the wrong place.
         raise ControlForbidden(
-            f"No permission on {path}. The vault control socket is restricted to the "
-            "vault server's own user, so unprivileged containers cannot read vault "
-            "state. This is expected. Use `make vault-status`, which runs inside "
-            "that container."
+            f"No permission on {path}; it is restricted to the vault server's user. "
+            "Use `make vault-status`, which runs inside that container."
         ) from None
     except (ConnectionError, socket.timeout) as exc:
         raise ControlUnavailable(f"Could not reach the vault server: {exc}") from None
