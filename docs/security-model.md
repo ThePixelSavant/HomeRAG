@@ -102,10 +102,24 @@ vision model. Three consequences:
 is empty. So every command that reads or writes the vault — list, query,
 ledger, lifecycle, ledger review — runs in the server process as an action
 on `control.sock`, as unlock and approve always did. Gate 1 applies as usual;
-gate 3 is skipped because a human is at the terminal. This widens nothing. The
-socket is `0600`, owned by the vault container's user, and that user can
-already approve a model's pending request, or read the server's memory
-outright.
+gate 3 is skipped because a human is at the terminal.
+
+**Where the socket lives is the boundary.** It is on a tmpfs private to the
+vault container (`/run/vault`), not on the `./data/vault` bind mount. Since
+2026-09-27 the vault and the ingestion worker run as the same uid (1000), so
+file permissions no longer separate them; the mount does. The worker needs
+the vault's files, never its socket, and a socket on the shared directory would
+be reachable from the parse worker — the process that reads untrusted files —
+while the vault is unlocked. Nothing is widened for the one caller that does
+reach it: anything that can `docker exec` into `mcp-vault` could already
+approve a model's pending request, or read the server's memory outright.
+
+**Re-reading filed receipts** (`rag receipts-reread`) is the one path that
+decrypts an original outside a query. The ingestion worker holds the key,
+decrypts each original into a `0700` directory on `/dev/shm` (memory, not disk),
+and hands it to the keyless parse worker exactly like an inbox drop; the
+plaintext is deleted when the batch finishes. The key-holder still never
+parses.
 
 ### Network segmentation
 
@@ -122,8 +136,8 @@ of a reply to a request you had legitimately approved.
 
 Segmenting is a stronger guarantee than encrypting traffic the attacker can
 still see, and it costs no certificates. `mcp-vault` makes no outbound network
-calls and `vaultctl` reaches it over the bind-mounted `control.sock`, so it
-loses nothing by being unreachable from everything else.
+calls and `vaultctl` reaches it over `control.sock` from inside the same
+container, so it loses nothing by being unreachable from everything else.
 
 `mcp-server` and `ingestion-worker` additionally run with
 `cap_drop: [NET_RAW]`, which removes the spoofing primitive from the two

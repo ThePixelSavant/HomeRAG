@@ -400,7 +400,8 @@ rag ledger [START=2026-09-01] [END=2026-09-30] [MERCHANT="Costco"] [CATEGORY=din
 
 The same query `query_ledger` gives a model, run as you: sums come from SQL
 over integer cents, never from reading text. `needs_review_count` says how many
-rows in the total are flagged.
+rows in the total are flagged. `MERCHANT` matches part of the name in any case,
+so `MERCHANT="batteries plus"` finds "Batteries Plus Bulbs #583".
 
 #### `rag ledger-review` — what needs a human
 
@@ -429,6 +430,20 @@ change is recorded in the audit log. A duplicate you do not want is removed by
 retracting its document: `rag vault-lifecycle URI=coffee-b.jpg STATE=retracted
 REASON="duplicate"`, which also deletes its ledger row.
 
+#### `rag receipts-reread` — read filed receipts again
+
+```bash
+rag receipts-reread                              # every filed receipt
+rag receipts-reread URI=IMG20260927113610.jpg    # just one
+```
+
+For when the reading improves — a better prompt, a better model — after the
+inbox copies were consumed. It asks for the passphrase, decrypts each original
+into memory (`/dev/shm`), has the keyless parse worker read it exactly as a new
+receipt, and replaces that receipt's chunks and ledger row. Flags are
+re-evaluated from scratch; a row you resolved by hand is re-read like any other,
+so re-resolve it if the reading still needs you.
+
 There is no MCP tool for any of this: a model may not decide that a figure is
 right.
 
@@ -447,9 +462,10 @@ Reachability, paths, embedding fingerprint, per-source file counts, backlogs.
 a failure, because that is also what a broken mount looks like and the
 distinction matters to the sweep.
 
-Vault state reads `not readable from here (by design)` — the control socket is
-`0600` and owned by the vault container's user, while the worker now runs
-unprivileged. Use `rag vault-status`.
+Vault state reads `not readable from here (by design)` — the control socket
+exists only inside the vault container, on a private tmpfs, so the worker (which
+parses untrusted files) cannot reach it. Use `rag vault-status`, which runs
+there.
 
 ### `rag eval` — measure retrieval
 

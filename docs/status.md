@@ -1,19 +1,19 @@
 # Implementation status
 
-As of `feat/receipts-ledger`, 2026-09-25. Phase 1 and 1.6 are on `main` (PR #1).
+As of `feat/receipts-ledger`, 2026-09-27. Phase 1 and 1.6 are on `main` (PR #1).
 
-**Phase 1 is built and running. Phase 2 has started: receipts are built and wait on the vision model.**
+**Phase 1 is built and running. Phase 2's receipts are built and verified on real receipts; git/web sources and page transcription are next.**
 
 ## Summary
 
 | | |
 |---|---|
-| Branch | `feat/receipts-ledger` — receipts built; merged after the model is verified |
-| Tests | **174 passing** (80 pipeline, 41 receipts, 39 security, 14 vault ingest) |
+| Branch | `feat/receipts-ledger` — receipts, verified end to end; ready to merge |
+| Tests | **182 passing** (80 pipeline, 48 receipts, 40 security, 14 vault ingest) |
 | Open tier | 22 active documents (+1 retracted), 1,182 chunks; `manuals` and `notes` populated |
 | Retrieval | `make eval`: hit@3 **73%**, hit@1 53%, MRR 0.652 over 15 questions; a model reads ~2,980 chars per search |
-| Vault | 9 documents, 500 chunks at last count (2026-09-21); all three gates exercised end to end. Sealed at time of writing |
-| Stack | 3 containers up, running as the host user; `make doctor` reports 10 ok, 6 warn, 0 fail |
+| Vault | 12 documents: 9 transcripts (500 chunks, 2026-09-21) and 3 receipts; ledger of 3 rows, 2 flagged. All three gates exercised end to end |
+| Stack | 3 containers up, all four running as the host user (vault since 2026-09-27); llama-server serves `qwen3-coder-next` + `qwen3-vl` (router); `make doctor` 10 ok, 6 warn, 0 fail |
 
 The warnings are six empty inbox domains, which is expected. Nothing is
 waiting on a human any more — see [Blocked on you](#blocked-on-you).
@@ -42,7 +42,7 @@ Legend: **done** = built, tested and exercised against real data ·
 | Git sources | not started | `sources.yaml` rejects the type on purpose |
 | Web sources | not started | Same |
 | OCR for scanned PDFs | not started | Documents marked `ocr_required`, backlog reported |
-| Receipt/VLM extraction | **built, awaiting the model** | `extract/receipt.py` via `parse_worker`, by domain; tested end to end against a stub of llama-server ([ADR-026](decisions.md#adr-026-receipts-are-read-by-a-vision-model-and-validated-in-python)) |
+| Receipt/VLM extraction | done | `extract/receipt.py` via `parse_worker`, by domain; tested end to end against a stub of llama-server ([ADR-026](decisions.md#adr-026-receipts-are-read-by-a-vision-model-and-validated-in-python)) |
 
 ### Storage and retrieval
 
@@ -78,8 +78,9 @@ Legend: **done** = built, tested and exercised against real data ·
 | Audit log | done | Records denials too |
 | `fetch_context` (vault) | done | Separately gated, 4 tests |
 | Lifecycle / retraction | done | Destroys chunks, vectors and the blob |
-| Ledger + `query_ledger` | **built, awaiting the model** | Validated rows in integer cents, `needs_review` with reasons, duplicates flagged; rows follow retraction. `rag ledger`, `ledger-review`, `ledger-resolve` |
-| Vault CLI over the control socket | done | `vault-list`/`query`/`lifecycle`/`ledger` run in the server ([ADR-027](decisions.md#adr-027-the-vault-cli-runs-inside-the-vault-server)) |
+| Ledger + `query_ledger` | done | Validated rows in integer cents, `needs_review` with reasons, duplicates flagged; rows follow retraction. `rag ledger`, `ledger-review`, `ledger-resolve` |
+| Vault CLI over the control socket | done | `vault-list`/`query`/`lifecycle`/`ledger` run in the server ([ADR-027](decisions.md#adr-027-the-vault-cli-runs-inside-the-vault-server)); the socket is on a tmpfs private to the vault container ([ADR-028](decisions.md#adr-028-the-vault-runs-as-the-host-user-its-socket-stays-private)) |
+| `rag receipts-reread` | done | Re-reads filed receipts from their encrypted originals via the keyless worker |
 
 ### Interfaces
 
@@ -132,14 +133,21 @@ from unit tests.
 | MCP servers read state on a read-only mount | `fetch_context`, `list_sources`, `get_index_status` all failed while `rag.db` was WAL; all return data after the switch to a rollback journal |
 | `list_sources` shows inbox sources | `inbox:manuals` listed with 7 documents from `mcp-server`, which has no inbox mount |
 | Search order is repeatable | Two consecutive `make eval` runs produce identical output |
+| Real receipts reach the ledger | 2 PDF e-receipts (6.5 s, 34 s: text layer) and a 7.8 MB phone photo (62 s); every total, date, merchant and card correct |
+| Validation catches real misreads | Photo read "Reg Price 10.00" as a charge: items + tax 217.31 vs total 207.31, flagged. Duplicate (photo of the PDF'd receipt) flagged, not merged |
+| A second ingest keeps filed receipts | Empty inbox run after filing: all 3 documents and blobs intact (the sweep used to delete them) |
+| Re-read replaces, never doubles | `rag receipts-reread`: PDF's line items now sum to its subtotal exactly; still 3 rows |
+| The approval flow works on the ledger | Open WebUI: `query_ledger` → PENDING → `rag approve` → allowed, $414.62 across both copies, `needs_review_count` 2 |
+| The vault's socket is private | From the worker: vault files readable, socket absent, `control.send` → ControlForbidden |
 
 ## Known gaps
 
 Ordered by how likely they are to bite.
 
-1. **Receipts wait on the vision model.** The extractor, validation, ledger
-   writes and review commands are built and tested against a stub; nothing is
-   read for real until `qwen3-vl` is served (see *Blocked on you*).
+1. **Photos misread a line now and then.** The Batteries Plus photo still
+   reads a "Reg Price 10.00" as the charge on a line billed at 0.00. It is
+   flagged every time (the arithmetic does not close), so it cannot inflate a
+   total unnoticed, but it needs `rag ledger-resolve`.
 2. **PDF text follows the file's stored order.** Right for every manual
    indexed so far; a PDF whose stored order is itself scrambled would come out
    scrambled, and nothing detects that yet. A token `-raw` glued that reading
@@ -174,13 +182,18 @@ Ordered by how likely they are to bite.
 
 Nothing is blocking the system any more. What remains is optional.
 
-1. **Download the vision model**: Qwen3-VL-30B-A3B-Instruct Q4_K_M plus its
-   mmproj, about 19.6 GB, over IPv4. Then apply `~/Dev/LLM`'s `vision-router`
-   branch, which serves it beside Coder-Next. Receipts depend on it; it would
-   also cover the PDF cases in gap 2 that text extraction cannot.
+1. **Set the RAG preset** ("Qwen3-Local-RAG" in Open WebUI) per
+   [ADR-029](decisions.md#adr-029-qwen3-vl-reads-receipts-coder-next-answers-chats):
+   base model `qwen3-coder-next`; built-in tools, web search, image generation,
+   code interpreter, terminal and memory OFF; system prompt starting
+   `Today is {{CURRENT_DATE}}.`
 2. **Re-ingest vault sources by hand as they change.** `claude-sessions` has a
    4-hourly cadence that will keep queueing; take it with an interactive
    `make ingest` when you want the newer transcripts.
+
+Resolved on 2026-09-27: Qwen3-VL-30B-A3B is downloaded (checksums match) and
+served beside Coder-Next by llama-server's router; both resident use 51 GB,
+leaving 28 GB available.
 
 Resolved on 2026-09-25: the orphaned `rag_qdrant-data` and `rag_ollama-data`
 volumes were removed.
@@ -193,6 +206,10 @@ verified end to end.
 
 | Commit | What |
 |---|---|
+| `1c78f3f` | Receipts: prompt by input, USD dates, merchant contains, `receipts-reread` |
+| `78778f5` | Run mcp-vault as the host user; keep its control socket private |
+| `adb6161` | Receipts into the ledger, read by a vision model (Phase 2a + 2e) |
+| `f113705` | Stop the vault inbox sweep deleting every filed receipt |
 | `70c9720` | PDF chunks follow section headings |
 | `3c8bda2` | Add `make eval`; stop reindex from resurrecting retracted documents |
 | `d66ba12` | PDF extraction: `-raw`, re-spaced from reading order |

@@ -182,6 +182,17 @@ data/inbox/receipts/coffee.jpg
        └─ blobs.consume           → encrypted original; plaintext deleted
 ```
 
+`rag receipts-reread` runs the same path again for receipts already filed:
+the originals are decrypted into `/dev/shm`, read by the keyless parse worker,
+and their chunks and ledger rows replaced by doc_id. It exists because the
+reading improves — a better prompt, a better model — after the inbox copies are
+gone.
+
+The instructions depend on the input (`receipts.prompt_for`): a text layer gets
+rules about wrapped descriptions and non-item lines; an image gets only the
+charged-amount rule. The text rules fixed a PDF's reading and, given to a photo
+of the same receipt, stripped every amount from it.
+
 A vault inbox is never swept: consumed files leave the drop folder empty on
 purpose. Its documents leave only by retraction, which also deletes their
 ledger rows. See [ADR-026](decisions.md#adr-026-receipts-are-read-by-a-vision-model-and-validated-in-python).
@@ -269,25 +280,28 @@ process with them. See
 |---|---|---|
 | `ingestion-worker` | **1000:1000** | Opens untrusted input, and writes bind-mounted `./data` — as root it left host files nobody could edit without sudo |
 | `mcp-server` | **1000:1000** | The HTTP surface the model talks to |
+| `mcp-vault` | **1000:1000** | Holds the key. Migrated 2026-09-27, sealed and backed up first |
 | `qdrant` | **1000:1000** | Set in compose, since it is a third-party image |
-| `mcp-vault` | **root** | Not yet migrated — see below |
 
 `RAG_UID`/`RAG_GID` are build args and compose variables, defaulting to
 `1000:1000`. They must match the owner of `./data` or every write fails. On a
 host where you are not uid 1000, set them in `.env` and rebuild.
 
-**`mcp-vault` is still root, deliberately.** It has the strongest case of the
-four — it holds the key — so this is a migration problem, not a design one:
-`vault.salt`, `vault.verifier`, `vault.db` and `control.sock` on the live
-volume are root-owned `0600`, and changing their owner means touching the
-vault's secret material while it is in daily use. That is worth doing on its
-own, with the vault sealed and a backup taken.
+**`mcp-vault` was the last one on root, and that broke vault ingestion.** The
+worker must read `vault.salt` and `vault.verifier` and write `vault.db` and
+`blobs/`; root-owned `0600` files shut it out, so every vault-tier ingest failed
+with a permission error from the day the others moved to 1000. The files were
+re-owned with the vault sealed, backed up, and checksummed before and after.
 
-One visible consequence: `control.sock` is `0600` and owned by root, so the
-now-unprivileged worker cannot read it. `make status` and `make doctor`
-therefore cannot report vault state and say so, rather than printing a
-permission error that reads like a fault. `make vault-status` runs inside the
-vault container and is unaffected.
+**The control socket did not move with them.** It lives on a tmpfs inside the
+vault container (`/run/vault/control.sock`, mode `0700` directory), not on the
+`./data/vault` bind mount. The worker runs as the same uid and mounts that
+directory, so a socket there would be reachable from the process that parses
+untrusted files — and while the vault is unlocked, the socket reads the vault.
+Every legitimate caller (`make unlock`, the vault CLI) runs in the vault
+container via `docker exec`. From anywhere else `make status` and `make doctor`
+report vault state as not readable from here, by design, and point at
+`make vault-status`.
 
 `data/state/` and `data/vault/` are separate directories precisely so these
 mounts can differ. Mount directories, never files: Docker creates a *directory*

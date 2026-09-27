@@ -123,6 +123,7 @@ rag vault-audit [N=50]
 rag ledger [START=] [END=] [GROUP=month]   # receipt totals, exact cents
 rag ledger-review                # receipts flagged for a human
 rag ledger-resolve ID=n [TOTAL=] [DATE=] [MERCHANT=] [CATEGORY=]
+rag receipts-reread [URI=...]    # re-read filed receipts from their encrypted originals
 
 rag test
 rag help                         # shorthands plus every Makefile target

@@ -679,9 +679,30 @@ MCP tool for review.
 - **Skip unchanged by file hash, before the model is called.** Every other
   document compares extracted text, but here extraction IS the model call.
 
-Built and tested against a stub of llama-server's chat endpoint (the real parse
-worker, client, validation and ledger write); the end-to-end run with the model
-itself follows once it is served.
+Measured on real receipts (2026-09-27), Qwen3-VL-30B-A3B Q4_K_M on the CPU:
+
+| Receipt | Input | Prompt tokens | Time |
+|---|---|---:|---:|
+| Anthropic e-receipt (PDF) | text layer | 306 | 6.5 s |
+| Batteries Plus (PDF) | text layer | 582 | 34 s (525 tokens of line items written) |
+| Batteries Plus (phone photo, 7.8 MB) | image | 1,820 | 62 s |
+
+Every total, date, merchant and card read correctly. Validation flagged what
+was actually wrong: the photo read a "Reg Price 10.00" as a charge on a line
+billed at 0.00 (items + tax 217.31 against a total of 207.31), and the photo
+was flagged as a duplicate of the PDF of the same receipt. Two changes came
+from that run:
+
+- **The prompt depends on the input.** Rules for a text layer's wrapped
+  descriptions fixed the PDF exactly (7 items summing to the printed subtotal)
+  and, sent with the photo, stripped every amount from it. `prompt_for` now
+  gives images only the charged-amount rule.
+- **A USD receipt's `4/12/2026` is month/day by convention** and is no longer
+  flagged as ambiguous.
+
+`rag receipts-reread` exists because the reading improves after the inbox copies
+are consumed: it decrypts each original into `/dev/shm`, reads it in the keyless
+parse worker, and replaces the rows by doc_id.
 
 **Revisit if:** receipts arrive in volume enough that a reading's cost per page
 matters more than its accuracy, or a smaller vision model turns out good
@@ -705,3 +726,62 @@ The socket is `0600` and owned by the vault container's user, who can already
 approve a model's request or read the server's memory, so the new actions
 widen nothing. Gate 3 is skipped for them as it always was for the CLI: a human
 is at the terminal.
+
+## ADR-028: The vault runs as the host user; its socket stays private
+
+**Chosen:** `mcp-vault` runs as uid 1000 like every other container, owns the
+vault files, and keeps its control socket on a tmpfs inside its own container
+(`/run/vault/control.sock`), not on the `./data/vault` bind mount.
+
+**Rejected:** Leaving the vault on root and sharing its files through a group;
+running the worker as root for vault runs; keeping the socket on the shared
+directory.
+
+When the other containers moved to 1000, the vault stayed root, deliberately,
+because re-owning its secret material deserved its own sealed, backed-up step.
+The cost turned out to be total: the worker must read `vault.salt` and
+`vault.verifier` and write `vault.db`, and root-owned `0600` files made every
+vault-tier ingest fail. The migration was done sealed, with a backup and
+checksums before and after, and only ownership changed.
+
+Sharing a uid removes file permissions as the line between the vault and the
+worker, and the worker mounts `./data/vault`. The socket reads the vault while
+it is unlocked, so it moved off that mount to where only processes inside the
+vault container can reach it. Every legitimate caller already runs there
+(`docker exec`). A group would have kept root in the vault but added the moving
+part declined earlier; root for the worker would have put root back into the
+process that parses untrusted receipts.
+
+## ADR-029: Qwen3-VL reads receipts; Coder-Next answers chats
+
+**Chosen:** llama-server's router serves both models. `qwen3-vl` reads
+receipts at ingest. RAG chats run on `qwen3-coder-next`, with Open WebUI's
+built-in tools off.
+
+**Rejected:** Qwen3-VL for everything, which was the first plan, made on a
+measurement that hid the problem.
+
+On a short 1,500-token prompt Qwen3-VL was faster (86 vs 63 tokens/s prefill).
+In a real multi-step RAG chat it was not:
+
+- Its chat template writes each tool as a full JSON schema, about three times
+  Coder-Next's rendering: a new chat's first step was ~8k tokens against 2.5k.
+- It uses full attention in every layer, so each step slows as the chat grows:
+  18 tokens/s by 14k tokens. Coder-Next is mostly linear-attention layers and
+  held about 60 at a similar length.
+- It chose tools worse. Asked how to set the SH-01A to poly mode, it searched
+  once with a phrasing known to miss, then answered confidently and wrongly
+  ("no dedicated polysynth mode"). Coder-Next found the Assign Mode section.
+
+Receipts are short, single-turn and visual, which is what it is good at, and its
+reading was accurate on every receipt tried.
+
+Separately: Open WebUI creates new presets with built-in tools, web search,
+image generation, code interpreter, terminal and memory all ON. Their tool
+definitions took a Coder-Next chat's first step from 2.5k to 9k tokens (134 s).
+Turn them off in RAG presets, and put `Today is {{CURRENT_DATE}}` in the system
+prompt: without the built-in timestamp tool the model guessed the year and
+queried 2023.
+
+**Revisit if:** a GPU makes long-context prefill cheap, or a vision model with
+linear attention and a compact tool format appears.

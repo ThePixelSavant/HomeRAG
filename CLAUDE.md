@@ -44,6 +44,7 @@ make eval                  # retrieval eval: tests/retrieval/questions.yaml
 make lifecycle / supersede / stale / retract / restore
 make unlock / lock / vault-list / vault-query / vault-lifecycle / approve / vault-audit
 make ledger / ledger-review / ledger-resolve   # receipts, in exact cents
+make receipts-reread [URI=...]   # re-read filed receipts from their encrypted originals
 make test                  # pytest inside the worker image
 ```
 
@@ -255,6 +256,13 @@ empty. Anything that reads or writes the vault must therefore be an action on
 calls `service`/`AGENT` directly in `vaultctl` can only ever report "sealed";
 list, query, ledger and lifecycle shipped that way and never worked.
 
+**The socket's location is the boundary, not its permissions.** `mcp-vault` and
+the worker both run as uid 1000 (the vault needs its files readable by the
+worker), so `control.sock` lives on a tmpfs private to the vault container
+(`settings.vault_control_socket`, `/run/vault`) — never on `./data/vault`, which
+the worker mounts. Put it back on the shared directory and the parse worker can
+read an unlocked vault.
+
 ### Receipts and the ledger
 
 Images and PDFs filed under `receipts` (`app/receipts.py` `RECEIPT_DOMAINS`)
@@ -263,6 +271,16 @@ are routed **by domain, not suffix** in `parse_worker` to
 `qwen3-vl` on llama-server's router) for a JSON reading: an e-receipt's text
 layer when it has one, since that is far cheaper than an image; otherwise
 images scaled to 1536 px. A markdown note under `receipts` is still text.
+
+- **The prompt depends on the input** (`receipts.prompt_for`). Text-layer rules
+  (wrapped descriptions, subtotal/tax are not items) fixed a real PDF and, sent
+  with a photo of the same receipt, stripped every amount from it. Test a prompt
+  change on both, then apply it to filed receipts with `rag receipts-reread`.
+- **A USD receipt's `4/12/2026` is not ambiguous**; only other currencies get
+  the month/day note. Flagging it put four US receipts in ten up for review.
+- **`query_ledger`'s merchant filter is a case-insensitive contains**, LIKE
+  wildcards escaped. The model cannot know the printed name: "Batteries Plus"
+  matched nothing exactly against "Batteries Plus Bulbs #583".
 
 - **The model copies strings; Python does arithmetic.** Amounts and dates come
   back as printed; `receipts.parse_amount` (Decimal to integer cents) and
@@ -291,6 +309,8 @@ images scaled to 1536 px. A markdown note under `receipts` is still text.
 | Qdrant image digest | Snapshot restore needs a matching minor version, so `:latest` breaks migration. Pinned by digest with a rollback comment. |
 | Glob matching | `fnmatch("a.md", "**/*")` is **False** — `**/` needs a literal slash. `_matches` handles the prefix; an empty `include` means everything. |
 | Bind-mounted files | Docker creates a *directory* when a bind-mounted file is missing. Mount directories: `data/state/` and `data/vault/` are separate so `mcp-server` gets state read-only and no vault mount at all. |
+| Vault ingestion vs file ownership | `mcp-vault` stayed root after the others moved to 1000, and its `0600` files shut the worker out: every vault ingest failed with `Permission denied: vault.salt`. Everything is 1000 now; the socket moved to a private tmpfs so the shared uid does not hand it to the worker. |
+| RAG chat model | `qwen3-vl` renders tool schemas as full JSON (~3x Coder-Next's tokens) and uses full attention in every layer, so each step slows as a chat grows (86 → 18 tok/s by 14k tokens). On the SH-01A question it guessed a wrong answer where Coder-Next found the section. It reads receipts; Coder-Next answers chats. New Open WebUI presets default every built-in tool ON — ~9k tokens of definitions per prompt. |
 | Vault inbox sweep | A vault inbox file is **consumed** into a blob when filed, so the next run finds the folder empty. The sweep treated that as disappearance and deleted every receipt and its blob. Vault `INBOX` sources are never swept; their documents leave only by retraction. |
 | `FORCE=1` does not re-embed | It only overrides the sweep's deletion floor. A document re-embeds when its **extracted text** changes, so a chunking-only change reaches the index through `rag reindex`, which blanks the stored hashes (never deletes rows: that dropped the retracted tombstone and every lifecycle flag). |
 | Fingerprint guard | Dimension alone cannot detect a model swap — bge-base, nomic-v1.5, gte-base and arctic-m are all 768-dim. |
