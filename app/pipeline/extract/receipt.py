@@ -90,7 +90,7 @@ def extract_receipt(path: Path) -> RawDoc:
         return doc
 
     reading = vlm.read_json(
-        prompt=receipts.PROMPT,
+        prompt=receipts.prompt_for("text" if text else "image"),
         schema=receipts.SCHEMA,
         text=f"Receipt text:\n{text}" if text else None,
         images=images,

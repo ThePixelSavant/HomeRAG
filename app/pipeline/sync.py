@@ -25,6 +25,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -514,6 +515,76 @@ def _write_ledger(vconn, source: Source, record: dict, result: SourceResult) -> 
     vault_store.replace_ledger(vconn, doc_id, [row])
     result.receipts_read += 1
     result.receipts_flagged += row["needs_review"]
+
+
+def reread_receipts(run_id: str, *, uri: str | None = None) -> SourceResult:
+    """Read filed receipts again, from their encrypted originals.
+
+    For when the reading improved -- a better prompt, a better model. The
+    inbox copies were consumed when the receipts were filed, so the only
+    originals are the encrypted blobs, and decrypting one needs the key this
+    process holds. Parsing must still never happen here, so each original is
+    decrypted into a private in-memory directory (/dev/shm, mode 0700) and
+    handed to the keyless parse worker exactly like an inbox drop; the reading
+    comes back through the same validation and write path, replacing the
+    document's chunks and its ledger row by doc_id. The plaintext is deleted
+    when the batch is done.
+
+    The source passed on is LOCAL, not INBOX, so the existing encrypted
+    original is kept rather than stored a second time.
+    """
+    result = SourceResult(source_id="receipts (re-read)")
+    vconn = AGENT.connect()
+    vault_store.init(vconn)
+    try:
+        placeholders = ",".join("?" for _ in receipts.RECEIPT_DOMAINS)
+        sql = (
+            "SELECT d.doc_id, d.source_id, d.domain, d.uri, d.mtime FROM documents d "
+            f"JOIN blobs b ON b.doc_id = d.doc_id WHERE d.domain IN ({placeholders}) "
+            "AND d.lifecycle = ?"
+        )
+        params: list = [*sorted(receipts.RECEIPT_DOMAINS), documents.ACTIVE]
+        if uri:
+            sql += " AND d.uri = ?"
+            params.append(uri)
+        rows = [
+            r for r in vconn.execute(sql, params).fetchall()
+            if Path(r["uri"]).suffix.lower() in receipts.RECEIPT_SUFFIXES
+        ]
+        batches: dict[tuple[str, str], list] = {}
+        for row in rows:
+            batches.setdefault((row["source_id"], row["domain"]), []).append(row)
+
+        shm = Path("/dev/shm")
+        for (source_id, domain), docs in batches.items():
+            with tempfile.TemporaryDirectory(dir=shm if shm.is_dir() else None, prefix="reread-") as tmp:
+                os.chmod(tmp, 0o700)
+                files = []
+                for doc in docs:
+                    target = Path(tmp) / doc["uri"]
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    with os.fdopen(fd, "wb") as out:
+                        out.write(vault_blobs.load(vconn, AGENT.key(), doc["doc_id"]))
+                    # The file's date is the fallback when no date is read;
+                    # keep the original's, not the moment it was decrypted.
+                    if doc["mtime"]:
+                        os.utime(target, (doc["mtime"], doc["mtime"]))
+                    files.append(target)
+                result.docs_seen += len(files)
+
+                source = Source(id=source_id, type=LOCAL, domain=domain, path=Path(tmp))
+                for record in _run_parse_worker(source, files, known={}, tombstoned=()):
+                    try:
+                        _write_vault_record(vconn, source, record, run_id, result)
+                    except Exception as exc:  # noqa: BLE001 - one bad record must not kill the run
+                        logger.exception("Failed to store %s", record.get("rel_uri"))
+                        result.failed += 1
+                        result.notes.append(f"{record.get('rel_uri')}: {type(exc).__name__}: {exc}")
+                vconn.commit()
+    finally:
+        vconn.close()
+    return result
 
 
 def _ingest_vault_source(

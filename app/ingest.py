@@ -23,7 +23,7 @@ from app import documents
 from app.config import settings
 from app.domains import DOMAIN_TIERS, Tier, UnknownDomainError, domains_in, tier_of
 from app.pipeline import embedder, qdrant_store, state, sync
-from app.sources import Source, SourceConfigError, all_sources
+from app.sources import INBOX, Source, SourceConfigError, all_sources
 from app.vault.crypto import WrongPassphrase
 from app.vault.keyagent import AGENT
 
@@ -225,6 +225,11 @@ def _run(sources: list[Source], *, force: bool, dry_run: bool) -> int:
             state.finish_run(conn, run_id, "error" if errors else "ok",
                              "; ".join(r.error for r in errors if r.error))
 
+    _print_results(run_id, results)
+    return 1 if errors else 0
+
+
+def _print_results(run_id: str, results: list) -> None:
     print(f"\nrun {run_id}")
     for result in results:
         print(
@@ -246,11 +251,28 @@ def _run(sources: list[Source], *, force: bool, dry_run: bool) -> int:
             print(f"      ERROR: {result.error}")
         for note in result.notes[:5]:
             print(f"      note: {note}")
-    return 1 if errors else 0
 
 
 def cmd_ingest(args) -> int:
     return _run(_select(args), force=args.force, dry_run=args.dry_run)
+
+
+def cmd_receipts_reread(args) -> int:
+    """Read filed receipts again from their encrypted originals (see
+    sync.reread_receipts). Needs the key to decrypt them, so it prompts for the
+    passphrase exactly as a vault ingest does."""
+    from app.receipts import RECEIPT_DOMAINS
+
+    marker = Source(id="receipts (re-read)", type=INBOX, domain=sorted(RECEIPT_DOMAINS)[0],
+                    path=settings.inbox_path)
+    _unlock_for_vault_sources([marker])
+    if not AGENT.is_unlocked():
+        raise SystemExit("The originals are encrypted; nothing was re-read without the key.")
+    run_id = state.new_run_id()
+    with sync.sync_lock():
+        result = sync.reread_receipts(run_id, uri=args.uri)
+    _print_results(run_id, [result])
+    return 1 if result.failed else 0
 
 
 def cmd_reindex(args) -> int:
@@ -705,6 +727,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--force", action="store_true", help="override the sweep deletion floor")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(func=cmd_ingest)
+
+    p = sub.add_parser("receipts-reread", help="read filed receipts again from their encrypted originals")
+    p.add_argument("--uri", help="just this receipt, e.g. IMG_1234.jpg")
+    p.set_defaults(func=cmd_receipts_reread)
 
     p = sub.add_parser("reindex", help="force a full re-embed of one source")
     p.add_argument("source_id")

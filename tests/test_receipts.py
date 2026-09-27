@@ -343,3 +343,106 @@ def test_a_note_filed_under_receipts_is_still_text(receipts_inbox, vision):
     result = _run(receipts_inbox)
     assert result.docs_indexed == 1 and result.receipts_read == 0
     assert stub.requests == []
+
+
+# --- after the first real receipts ------------------------------------------
+
+
+def test_a_usd_receipt_date_is_month_first_without_a_note():
+    """4/12/2026 on a US receipt is April 12th by convention, not a coin flip."""
+    row = _validate(_clean(date="4/12/2026", total="$12.62"))
+    assert row["txn_date"] == "2026-04-12"
+    assert row["needs_review"] == 0
+    iso, note = receipts.parse_date("4/12/2026", today=TODAY, month_first=True)
+    assert (iso, note) == ("2026-04-12", None)
+
+
+def test_a_non_usd_receipt_still_notes_an_ambiguous_date():
+    row = _validate(_clean(date="4/12/2026", currency="EUR"))
+    assert "ambiguous" in row["review_notes"]
+
+
+def test_the_prompt_names_the_misreads_seen_on_real_receipts():
+    text, image = receipts.prompt_for("text"), receipts.prompt_for("image")
+    for rule in ("Reg Price", "minus sign"):
+        assert rule in text and rule in image
+    # The text-layer rules fixed a PDF and broke a photo of the same receipt.
+    for rule in ("NEVER line items", "wraps onto following"):
+        assert rule in text and rule not in image
+
+
+def test_a_photo_is_read_with_the_image_prompt(receipts_inbox, vision):
+    stub = vision(_clean())
+    _photo(receipts_inbox / "coffee.jpg")
+    _run(receipts_inbox)
+    (request,) = stub.requests
+    assert request["messages"][0]["content"] == receipts.prompt_for("image")
+
+
+def test_filed_receipts_can_be_read_again_from_their_originals(receipts_inbox, vision):
+    """The inbox copy is consumed when filed; a re-read decrypts the vault's
+    original, reads it in the keyless worker, and REPLACES the row."""
+    from app.pipeline import sync
+    from app.vault.keyagent import AGENT
+
+    stub = vision(_clean(total="21.62"))  # a misread: the total is flagged
+    _photo(receipts_inbox / "coffee.jpg")
+    _run(receipts_inbox)
+    (before,) = _ledger()
+    assert before["needs_review"] == 1
+
+    stub.reading = _clean()  # the better reading
+    result = sync.reread_receipts("run-2")
+    assert result.receipts_read == 1 and result.receipts_flagged == 0, result.notes
+
+    (after,) = _ledger()  # replaced, not doubled
+    assert (after["amount_cents"], after["needs_review"]) == (1262, 0)
+    assert len(stub.requests) == 2
+    conn = AGENT.connect()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM blobs").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_a_reread_leaves_no_plaintext_behind(receipts_inbox, vision, tmp_path, monkeypatch):
+    import tempfile
+
+    from app.pipeline import sync
+
+    made = []
+    real = tempfile.TemporaryDirectory
+
+    def spy(*args, **kwargs):
+        handle = real(*args, **kwargs)
+        made.append(handle.name)
+        return handle
+
+    monkeypatch.setattr(sync.tempfile, "TemporaryDirectory", spy)
+    vision(_clean())
+    _photo(receipts_inbox / "coffee.jpg")
+    _run(receipts_inbox)
+    sync.reread_receipts("run-2")
+
+    assert made, "the re-read should have used a private temporary directory"
+    from pathlib import Path
+
+    assert not any(Path(m).exists() for m in made)
+
+
+def test_the_ledger_matches_part_of_a_merchant_name(receipts_inbox, vision):
+    """Asked for "Batteries Plus", an exact match found nothing: the receipt
+    said "Batteries Plus Bulbs #583". A model cannot know the printed name."""
+    from app.vault import service
+
+    vision(_clean(merchant="Batteries Plus Bulbs #583"))
+    _photo(receipts_inbox / "battery.jpg")
+    _run(receipts_inbox)
+
+    ledger = lambda merchant: service.query_ledger(ctx=service.Context(), merchant=merchant)  # noqa: E731
+    assert ledger("Batteries Plus")["total_cents"] == 1262
+    assert ledger("batteries plus")["count"] == 1
+    assert ledger("Costco")["count"] == 0
+    # LIKE wildcards in the name are literal, not patterns.
+    assert ledger("%")["count"] == 0
+    assert ledger("B_tteries")["count"] == 0

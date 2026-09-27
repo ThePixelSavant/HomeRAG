@@ -184,7 +184,8 @@ def query_ledger(
     Args:
         start_date: ISO date, inclusive (YYYY-MM-DD).
         end_date: ISO date, inclusive.
-        merchant: Exact merchant name.
+        merchant: Part of the merchant name, any case ("costco" matches
+            "COSTCO WHOLESALE #123"). Use the shortest name that identifies it.
         category: Exact category.
         group_by: One of month, merchant, category.
         limit: Maximum rows (default 100).

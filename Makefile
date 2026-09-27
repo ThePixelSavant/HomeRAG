@@ -12,7 +12,7 @@ VAULTRUN   = docker exec mcp-vault python -m app.vaultctl
 .PHONY: up down logs build doctor warm-cache ingest reindex add query eval status \
         rebuild-index review-quarantine supersede stale retract restore lifecycle list \
         unlock lock vault-status vault-query vault-list vault-lifecycle \
-        approve vault-audit ledger ledger-review ledger-resolve test
+        approve vault-audit ledger ledger-review ledger-resolve receipts-reread test
 
 ## --- stack ---------------------------------------------------------------
 
@@ -149,6 +149,9 @@ ledger:                 ## Receipt totals in exact cents: make ledger [START=] [
 	@$(VAULTRUN) ledger $(if $(START),--start $(START)) $(if $(END),--end $(END)) \
 	  $(if $(MERCHANT),--merchant "$(MERCHANT)") $(if $(CATEGORY),--category $(CATEGORY)) \
 	  $(if $(GROUP),--group-by $(GROUP)) $(if $(LIMIT),--limit $(LIMIT))
+
+receipts-reread:        ## Re-read filed receipts from their encrypted originals: make receipts-reread [URI=IMG_1.jpg]
+	$(WORKER) receipts-reread $(if $(URI),--uri "$(URI)")
 
 ledger-review:          ## Ledger rows flagged for a human, with why
 	@$(VAULTRUN) ledger-review $(if $(JSON),--json)

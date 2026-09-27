@@ -75,13 +75,39 @@ SCHEMA = {
     "required": ["merchant", "date", "line_items", "total"],
 }
 
-PROMPT = (
+# What the model is told depends on what it is looking at. Each rule below
+# comes from a misread of a real receipt, and one of them cost the other:
+#
+# - A PDF's text layer puts a wrapped description on its own line. The model
+#   read each continuation as another item, and listed the subtotal and tax as
+#   items too. TEXT_RULES fixed that PDF exactly.
+# - Given the same rules, a PHOTO of the same receipt came back with every
+#   description and no amounts at all: told a line without a price belongs to
+#   the item above, it stopped pairing prices with lines it could see. So
+#   images get only the rule their own misread needed -- a "Reg Price 10.00"
+#   taken as the price of a line charged at 0.00.
+_BASE_PROMPT = (
     "You transcribe receipts into JSON. Copy every amount and the date EXACTLY as "
     "printed, including currency symbols and signs -- do not calculate, round, or "
-    "reformat. Use null for anything not printed. List each purchased line with its "
-    "printed amount. For payment_method give only the card brand and last four "
-    "digits, never a full card number. Choose the category from the allowed list."
+    "reformat. Use null for anything not printed.\n"
+    "An item's amount is what was charged for that line, not a unit price, a "
+    "'Reg Price', or a savings figure; a credit or refund line keeps its minus sign.\n"
+    "For payment_method give only the card brand and last four digits, never a full "
+    "card number. Choose the category from the allowed list."
 )
+TEXT_RULES = (
+    "\nThis is the receipt's extracted text, not an image. line_items are the "
+    "products and services purchased, nothing else: subtotal, tax, tip, discounts, "
+    "total, payment, change and balance lines are NEVER line items; put them in their "
+    "own fields. A description that wraps onto following lines is one item: a line "
+    "with no price of its own belongs to the item above it."
+)
+
+
+def prompt_for(input_kind: str) -> str:
+    """The instructions for a receipt read from `text` or from an `image`."""
+    return _BASE_PROMPT + (TEXT_RULES if input_kind == "text" else "")
+
 
 _DATE_FORMATS = (
     ("%Y-%m-%d", False), ("%Y/%m/%d", False),
@@ -127,8 +153,12 @@ def parse_amount(value) -> int | None:
     return -cents if negative else cents
 
 
-def parse_date(value, *, today: date) -> tuple[str | None, str | None]:
+def parse_date(value, *, today: date, month_first: bool = False) -> tuple[str | None, str | None]:
     """A printed date as ISO, plus a note when the reading needs a human.
+
+    `month_first` says the receipt comes from a month/day country -- a USD
+    receipt. There `4/12/2026` is April 12th by convention, not a coin flip,
+    and noting it would flag four US receipts in ten for nothing.
 
     Returns (None, note) for a date that cannot be read, or that falls before
     2000 or after today -- a misread year is the commonest failure, and a
@@ -139,7 +169,7 @@ def parse_date(value, *, today: date) -> tuple[str | None, str | None]:
     text = re.sub(r"\s+", " ", str(value)).strip()
     # Receipts print the time beside the date; it is not part of it.
     text = re.sub(r"[ T]\d{1,2}:\d{2}(:\d{2})?\s*([AaPp][Mm])?$", "", text).strip()
-    for fmt, month_first in _DATE_FORMATS:
+    for fmt, slash_form in _DATE_FORMATS:
         try:
             parsed = datetime.strptime(text, fmt).date()
         except ValueError:
@@ -147,7 +177,7 @@ def parse_date(value, *, today: date) -> tuple[str | None, str | None]:
         if not EARLIEST_DATE <= parsed <= today:
             return None, f"date {text!r} read as {parsed.isoformat()}, which cannot be right"
         note = None
-        if month_first and parsed.day <= 12 and parsed.day != parsed.month:
+        if slash_form and not month_first and parsed.day <= 12 and parsed.day != parsed.month:
             note = f"date {text!r} is ambiguous; read as month/day ({parsed.isoformat()})"
         return parsed.isoformat(), note
     return None, f"date {text!r} not understood"
@@ -206,18 +236,18 @@ def validate(
     if total is None:
         notes.append(f"no total read ({raw.get('total')!r}); recorded as 0")
 
-    txn_date, date_note = parse_date(raw.get("date"), today=today)
-    if date_note:
-        notes.append(date_note)
-    if txn_date is None:
-        txn_date = fallback_date
-        notes.append(f"used the file's date, {fallback_date}")
-
     currency = (raw.get("currency") or "").strip().upper()
     if currency and not re.fullmatch(r"[A-Z]{3}", currency):
         notes.append(f"currency {currency!r} not an ISO code; recorded as {DEFAULT_CURRENCY}")
         currency = ""
     currency = currency or DEFAULT_CURRENCY
+
+    txn_date, date_note = parse_date(raw.get("date"), today=today, month_first=currency == "USD")
+    if date_note:
+        notes.append(date_note)
+    if txn_date is None:
+        txn_date = fallback_date
+        notes.append(f"used the file's date, {fallback_date}")
 
     items = []
     lines = raw.get("line_items")

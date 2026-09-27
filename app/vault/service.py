@@ -300,8 +300,17 @@ def query_ledger(
         params.append(end_date)
     for column, value in filters.items():
         # Column names come from the whitelist above, never from input.
-        where.append(f"{column} = ?")
-        params.append(value)
+        if column == "merchant":
+            # Part of the name, any case. A model cannot know how a shop
+            # printed itself: asked for "Batteries Plus", an exact match found
+            # nothing, because the receipts say "Batteries Plus Bulbs #583".
+            # The approval still binds the exact string asked for.
+            escaped = str(value).lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            where.append("LOWER(merchant) LIKE ? ESCAPE '\\'")
+            params.append(f"%{escaped}%")
+        else:
+            where.append(f"{column} = ?")
+            params.append(value)
     clause = " AND ".join(where)
 
     conn = _conn()
