@@ -433,6 +433,47 @@ def test_respace_uses_the_fewest_pieces():
     )
 
 
+def test_contents_pages_are_recognised_in_both_leader_styles():
+    from app.pipeline.extract.pdf import _is_contents_page
+
+    arturia = "Table Of Contents\n" + "\n".join(
+        f"1.{i}. Section {i} " + "." * 60 + f" {5 + i}" for i in range(8)
+    )
+    dell = "Contents | 3\nContents\n" + "\n".join(
+        f"Replacing Part {i}" + " ." * 20 + f" {9 + 2 * i}" for i in range(8)
+    )
+    assert _is_contents_page(arturia, page_count=120)
+    assert _is_contents_page(dell, page_count=120)
+
+
+def test_contents_page_tolerates_a_two_column_order():
+    """`-raw` reads Analog Lab's two columns in stored order: mostly ascending."""
+    from app.pipeline.extract.pdf import _is_contents_page
+
+    pages = [12, 12, 16, 6, 7, 19, 26, 50, 64, 67, 68, 8, 70, 71, 78, 80]
+    text = "\n".join(f"Entry {i} ..........{p}" for i, p in enumerate(pages))
+    assert _is_contents_page(text, page_count=120)
+
+
+def test_leaders_that_are_not_contents_are_kept():
+    from app.pipeline.extract.pdf import _is_contents_page
+
+    # A spec table: leaders, bare integers, in no order.
+    specs = "\n".join(
+        f"{name} ........ {n}" for name, n in
+        [("Keys", 25), ("Pads", 16), ("Knobs", 16), ("Steps", 64), ("Weight", 2),
+         ("Patterns", 16), ("Voices", 4), ("Outputs", 8)]
+    )
+    assert not _is_contents_page(specs, page_count=120)
+    # A body page with a stray leader line or two.
+    body = "Press SHIFT and turn the knob.\n" * 20 + "See Tempo ........ 11\n" * 2
+    assert not _is_contents_page(body, page_count=120)
+    # Page numbers the document does not have.
+    assert not _is_contents_page(
+        "\n".join(f"Part {i} ........ {900 + i}" for i in range(8)), page_count=120
+    )
+
+
 def test_pages_are_extracted_in_stored_order(tmp_path, monkeypatch):
     """Every page takes `-raw`, re-spaced from reading order, and says so."""
     from app.pipeline.extract import pdf

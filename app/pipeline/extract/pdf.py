@@ -48,6 +48,15 @@ Headings are found by FONT SIZE, from `pdftohtml -xml` (the same poppler that
 provides `pdftotext`). As text they are indistinguishable from table cells --
 `MONO Monophonic` looks like a heading -- but every manual indexed sets its
 headings at least 2pt above body text. See `_headings` for the filters.
+
+### Why contents pages are dropped
+
+A table of contents names every topic in the manual, so it matches every
+query on vocabulary and answers none of them. Worse, its entries are set at
+heading size, so the section split cut each line into a chunk of its own: 195
+of the first 1,182 chunks were contents lines, and "torque specification"
+returned two of them in the top three. `_is_contents_page` finds them by
+their dot leaders; see there for why that cannot catch a spec table.
 """
 
 from __future__ import annotations
@@ -113,6 +122,19 @@ _PAGE_RE = re.compile(r"<page ([^>]*)>(.*?)</page>", re.DOTALL)
 _TEXT_RE = re.compile(r"<text ([^>]*)>(.*?)</text>", re.DOTALL)
 _TAG_RE = re.compile(r"<[^>]+>")
 _LETTER_RE = re.compile(r"[^\W\d_]")
+
+# A contents line ends in a dot leader -- packed (Arturia) or spaced (Dell) --
+# and a bare page number. Measured on the seven manuals indexed so far, every
+# page with such a line is a contents page and every contents page is at least
+# 80% of them; the rest are wrapped titles and running headers.
+_CONTENTS_LINE_RE = re.compile(r"(?:\.\s?){4,}\s*(\d{1,4})\s*$")
+CONTENTS_MIN_LINES = 5
+CONTENTS_MIN_SHARE = 0.5
+# `-raw` reads a two-column contents page in stored order, so its page numbers
+# only mostly ascend: Analog Lab's steps back three times in 36. A spec table
+# that happened to end its rows in bare integers would ascend about half the
+# time.
+CONTENTS_MIN_ASCENDING = 0.75
 
 _PAGES_RE = re.compile(r"^Pages:\s+(\d+)", re.MULTILINE)
 _TITLE_RE = re.compile(r"^Title:\s+(.+)$", re.MULTILINE)
@@ -182,6 +204,19 @@ def _respace(raw: str, reading: str) -> str:
         return " ".join(pieces) if pieces and len(pieces) > 1 else token
 
     return _TOKEN_RE.sub(lambda m: split(m.group()), raw)
+
+
+def _is_contents_page(text: str, page_count: int) -> bool:
+    """Whether a page is a table of contents: mostly leader lines whose page
+    numbers exist in the document and mostly ascend."""
+    lines = [line for line in text.splitlines() if line.strip()]
+    numbers = [int(m.group(1)) for line in lines if (m := _CONTENTS_LINE_RE.search(line))]
+    if len(numbers) < CONTENTS_MIN_LINES or len(numbers) < CONTENTS_MIN_SHARE * len(lines):
+        return False
+    if not all(1 <= n <= page_count for n in numbers):
+        return False
+    ascending = sum(a <= b for a, b in zip(numbers, numbers[1:]))
+    return ascending >= CONTENTS_MIN_ASCENDING * (len(numbers) - 1)
 
 
 def _squash(text: str) -> str:
@@ -363,7 +398,7 @@ class PdfExtractor:
         headings = _headings(path)
         heading_path: list[tuple[int, str]] = []
 
-        blocks, total_chars = [], 0
+        blocks, total_chars, contents = [], 0, []
         for page in range(1, page_count + 1):
             raw = _page_text(path, page, MODE_RAW)
             reading = _page_text(path, page, MODE_READING)
@@ -371,7 +406,12 @@ class PdfExtractor:
 
             if not text:
                 continue
+            # Counted before the skip: a contents page has a text layer, and
+            # the scanned-PDF check below must not think otherwise.
             total_chars += len(text)
+            if _is_contents_page(text, page_count):
+                contents.append(page)
+                continue
             if not headings:
                 blocks.append(
                     TextBlock(text=text, kind="page", extra={"page": page, "extract_mode": MODE_RAW})
@@ -394,6 +434,8 @@ class PdfExtractor:
                 )
 
         doc.extra["page_count"] = page_count
+        if contents:
+            logger.info("%s: skipped contents pages %s", path.name, contents)
 
         if not blocks:
             doc.status = OCR_REQUIRED

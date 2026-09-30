@@ -120,6 +120,12 @@ without `heading_path` (transcript turns) pack exactly as before. Tune against
 `make eval`, not intuition: 120 looked safer and dropped hit@3 from 79% to
 57%. ADR-025.
 
+**Contents pages are dropped** (`_is_contents_page`: mostly dot-leader lines
+whose page numbers exist and mostly ascend). Their entries are heading-sized,
+so the section split made each line its own chunk — 231 of 872 manual chunks,
+matching every query and answering none. Mostly ascending, not strictly:
+`-raw` reads a two-column contents page in stored order.
+
 ### PDF extraction: `-raw`, re-spaced from reading order
 
 Every page is `pdftotext -raw`: text in the order the PDF stores it. That keeps
