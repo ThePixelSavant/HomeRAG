@@ -78,6 +78,7 @@ between a component and its environment.
 | Every vault ingest failed once the worker ran as 1000: `mcp-vault` stayed root and its `0600` files shut the worker out | Tests create the vault as the user running them |
 | `query_ledger` matched merchants exactly; the model asked for "Batteries Plus" and the receipt said "Batteries Plus Bulbs #583" | Test fixtures used the exact stored name |
 | A prompt rule that fixed a PDF's line items stripped every amount from a photo of the same receipt | The model was stubbed; only a real model shows how it reads an instruction |
+| A partly changed document lost its unchanged chunks to the sweep: only re-embedded chunks got the run marker, and `touch_doc` ran only when nothing changed. Found when page transcription added a cover chunk to two manuals and the sweep refused 367 "stale" points; `RAG/CLAUDE.md`, `RAG/README.md` and the XPS manual had already lost 4 chunks between them | Tests stubbed Qdrant out entirely, so no test held per-point run markers; `test_a_partly_changed_document_keeps_its_unchanged_chunks` now does |
 
 The grant-expiry and approval-binding bugs share a shape worth naming: **a test that acts instantly cannot
 catch a window that is too short for a human**, and **a test that reuses one

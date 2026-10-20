@@ -340,8 +340,11 @@ def _sync_open_doc(conn, source: Source, path: Path, doc, run_id: str, result: S
     # Unconditional: a no-op when nothing shrank, and it repairs a prior
     # partial failure.
     qdrant_store.delete_doc_tail(doc_id, len(chunks))
-    if not changed:
-        qdrant_store.touch_doc(doc_id, run_id)
+    # Also unconditional. Only the CHANGED chunks were upserted with this run's
+    # marker; the rest of the document still carries the last one, and the
+    # sweep deletes whatever this run did not mark. Touching only when nothing
+    # changed let a one-paragraph edit cost a document its other chunks.
+    qdrant_store.touch_doc(doc_id, run_id)
 
     state.upsert_document(
         conn, doc_id=doc_id, source_id=source.id, domain=source.domain, tier=Tier.OPEN.value,

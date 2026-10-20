@@ -214,7 +214,9 @@ column in `SCHEMA` never reaches a live database — `_ADDED_COLUMNS` +
   upsert. A no-op when nothing shrank, and it repairs prior partial failures.
 - **Disappearance**: every run stamps `last_seen_run`; unchanged docs get it
   refreshed without re-embedding, then `sweep_source` deletes what the run did
-  not touch.
+  not touch. **`touch_doc` runs after every document, changed or not**: an
+  upsert stamps only the chunks that changed, and touching only unchanged
+  documents let a one-paragraph edit cost a document its other chunks.
 
 `sweep_source` is **the most dangerous function here**. It refuses without
 `enumeration_complete`, and refuses to delete more than 50% of a source without
