@@ -1,19 +1,19 @@
 # Implementation status
 
-As of `feat/receipts-ledger`, 2026-09-27. Phase 1 and 1.6 are on `main` (PR #1).
+As of `feat/receipts-ledger` at `48ec15e`, 2026-10-19. Phase 1 and 1.6 are on `main` (PR #1).
 
-**Phase 1 is built and running. Phase 2's receipts are built and verified on real receipts; git/web sources and page transcription are next.**
+**Phase 1 is built and running. Phase 2 is in progress: receipts (2a, 2e) are built and verified on real receipts; PDF page transcription (2b) is built and verified on a real page, uncommitted; Tesseract (2c) and git/web sources (2d) are not started.**
 
 ## Summary
 
 | | |
 |---|---|
-| Branch | `feat/receipts-ledger` — receipts, verified end to end; ready to merge |
-| Tests | **182 passing** (80 pipeline, 48 receipts, 40 security, 14 vault ingest) |
-| Open tier | 22 active documents (+1 retracted), 1,182 chunks; `manuals` and `notes` populated |
-| Retrieval | `make eval`: hit@3 **73%**, hit@1 53%, MRR 0.652 over 15 questions; a model reads ~2,980 chars per search |
-| Vault | 12 documents: 9 transcripts (500 chunks, 2026-09-21) and 3 receipts; ledger of 3 rows, 2 flagged. All three gates exercised end to end |
-| Stack | 3 containers up, all four running as the host user (vault since 2026-09-27); llama-server serves `qwen3-coder-next` + `qwen3-vl` (router); `make doctor` 10 ok, 6 warn, 0 fail |
+| Branch | `feat/receipts-ledger` — receipts verified end to end, plus contents-page removal; page transcription (2b) in the working tree |
+| Tests | **213 passing** (84 pipeline, 48 receipts, 40 security, 27 transcription, 14 vault ingest) |
+| Open tier | 38 active documents (+1 retracted), 1,229 chunks: `manuals` 641, `notes` 588 |
+| Retrieval | `make eval`: hit@3 **80%**, hit@1 53%, MRR 0.656 over 15 questions; a model reads ~2,920 chars per search |
+| Vault | Sealed at this refresh, so counts are as of 2026-09-27: 12 documents, 9 transcripts (500 chunks) and 3 receipts; ledger of 3 rows, 2 flagged. All three gates exercised end to end |
+| Stack | 3 containers up, all running as the host user; llama-server serves `qwen3-coder-next` + `qwen3-vl` (router); `make doctor` 10 ok, 6 warn, 0 fail |
 
 The warnings are six empty inbox domains, which is expected. Nothing is
 waiting on a human any more — see [Blocked on you](#blocked-on-you).
@@ -34,6 +34,7 @@ Legend: **done** = built, tested and exercised against real data ·
 | Claude Code transcript extraction | done | Tool calls collapsed, results dropped except errors |
 | Token-accurate chunking | done | Truncation-free tokenizer clone |
 | PDF section chunking | done | Headings by font size (`pdftohtml -xml`); a chunk per section with a `title > heading path` breadcrumb ([ADR-025](decisions.md#adr-025-pdf-chunks-follow-section-headings)) |
+| PDF contents-page removal | done | `_is_contents_page`: mostly dot-leader lines whose page numbers exist and mostly ascend |
 | Markdown table header repetition | done | Whitespace tables deliberately excluded |
 | Sensitivity scan + quarantine | done | Luhn-checked; findings never echo the secret |
 | Tier routing | done | `tier_of()` raises rather than defaults |
@@ -41,7 +42,8 @@ Legend: **done** = built, tested and exercised against real data ·
 | Disappearance sweep (`sweep_source`) | done | Two guards, tombstone-aware |
 | Git sources | not started | `sources.yaml` rejects the type on purpose |
 | Web sources | not started | Same |
-| OCR for scanned PDFs | not started | Documents marked `ocr_required`, backlog reported |
+| PDF page transcription (VLM) | done | Pages without a text layer automatically, per page, ≤30 per document; others via `rag transcribe`; numbers checked against the text layer; cached by file hash ([ADR-030](decisions.md#adr-030-pdf-pages-the-text-layer-cannot-serve-are-read-by-the-vision-model)) |
+| Bulk OCR (Tesseract) | not started | Phase 2c; scans past the automatic limit stay `ocr_required` until `rag transcribe` |
 | Receipt/VLM extraction | done | `extract/receipt.py` via `parse_worker`, by domain; tested end to end against a stub of llama-server ([ADR-026](decisions.md#adr-026-receipts-are-read-by-a-vision-model-and-validated-in-python)) |
 
 ### Storage and retrieval
@@ -86,7 +88,7 @@ Legend: **done** = built, tested and exercised against real data ·
 
 | Component | Status | Notes |
 |---|---|---|
-| Makefile control plane | done | 29 targets, reachable from any directory via `rag` |
+| Makefile control plane | done | 34 targets, reachable from any directory via `rag` |
 | `make doctor` preflight | done | |
 | Open-tier MCP server | done | 4 tools, verified over the wire |
 | Vault MCP server | done | 4 tools, verified to fail closed over the wire |
@@ -128,6 +130,7 @@ from unit tests.
 | Extraction holds no key | A fresh interpreter importing `parse_worker` pulls in neither `keyagent` nor `crypto` |
 | `mcp-server` cannot reach the vault | No DNS, and a raw-IP connect to `mcp-vault` times out between bridges |
 | Section chunking improves retrieval | `make eval` before/after on 14 questions: hit@3 71%→79%, hit@1 36%→57%, top-3 size −36%; SH-01A poly-mode answer 8th→2nd (ADR-025) |
+| Contents pages leave the index | `manuals` went from 872 chunks to 641, exactly the 231 contents-page chunks; `make eval` hit@3 80% afterwards |
 | Trimming shortens a real answer | Same SH-01A question in Open WebUI: 3 min 26 s before, 88 s after (the cap, trimming and sections together) |
 | Reindex keeps tombstones | `rag reindex SOURCE=inbox:manuals`: 872 chunks re-embedded, `skipped(retracted): 1`, IntelliFlo row still `retracted` |
 | MCP servers read state on a read-only mount | `fetch_context`, `list_sources`, `get_index_status` all failed while `rag.db` was WAL; all return data after the switch to a rollback journal |
@@ -138,6 +141,9 @@ from unit tests.
 | A second ingest keeps filed receipts | Empty inbox run after filing: all 3 documents and blobs intact (the sweep used to delete them) |
 | Re-read replaces, never doubles | `rag receipts-reread`: PDF's line items now sum to its subtotal exactly; still 3 rows |
 | The approval flow works on the ledger | Open WebUI: `query_ledger` → PENDING → `rag approve` → allowed, $414.62 across both copies, `needs_review_count` 2 |
+| A real page is transcribed and passes the number check | IntelliFlo p30 (spec tables) via `qwen3-vl`: ~60 s cold; both tables exact, all 33 numbers found in the text layer; the requested page's reading `used`, 2026-10-19 |
+| A scan of the same page reaches the index | Image-only PDF of p30, no text layer: transcribed automatically to the same tables |
+| A runaway reading is stopped | Asked for JSON, the model looped on `\n` past 6,000 tokens; now plain text with `max_tokens` on every vision request, and a capped reading is rejected ([ADR-030](decisions.md#adr-030-pdf-pages-the-text-layer-cannot-serve-are-read-by-the-vision-model)) |
 | The vault's socket is private | From the worker: vault files readable, socket absent, `control.send` → ControlForbidden |
 
 ## Known gaps
@@ -154,11 +160,12 @@ Ordered by how likely they are to bite.
    order cannot spell is left glued (Roland's `KEYTRANSPOSE`).
 3. **Whitespace-aligned tables in PDFs are not detected as tables.** Deliberate
    — a whitespace gutter cannot distinguish a data table from two-column prose,
-   and guessing reintroduces the exact failure just fixed. The Phase 2 vision
-   pass is the fix.
-4. **Scanned PDFs are not indexed at all.** Below 100 chars/page there is no
-   text layer; those documents are marked `ocr_required` and reported rather
-   than silently making the index look complete.
+   and guessing reintroduces the exact failure just fixed. Send the page with
+   `rag transcribe`; nothing finds it for you.
+4. **Scanned pages are read without a check.** A page with no text layer has
+   nothing to check the model's numbers against. A scan past 30 pages waits for
+   `rag transcribe`, and a vault PDF is read only from a vault inbox
+   ([ADR-030](decisions.md#adr-030-pdf-pages-the-text-layer-cannot-serve-are-read-by-the-vision-model)).
 5. **Vault-tier sources do not ingest on a schedule.** The worker derives the
    key from a passphrase typed at a terminal ([ADR-020](decisions.md#adr-020-the-ingestion-worker-prompts-for-the-passphrase)),
    so a cron run queues them and says so. Open-tier sources are unaffected.
@@ -206,6 +213,8 @@ verified end to end.
 
 | Commit | What |
 |---|---|
+| `48ec15e` | Drop PDF contents pages before chunking |
+| `29c4719` | Docs: receipts verified on real receipts; vault user; model roles |
 | `1c78f3f` | Receipts: prompt by input, USD dates, merchant contains, `receipts-reread` |
 | `78778f5` | Run mcp-vault as the host user; keep its control socket private |
 | `adb6161` | Receipts into the ledger, read by a vision model (Phase 2a + 2e) |

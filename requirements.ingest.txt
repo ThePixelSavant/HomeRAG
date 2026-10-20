@@ -18,7 +18,10 @@ cryptography>=42.0
 
 # Per-source cron cadences from sources.yaml.
 croniter>=2.0.0
-# Calls llama-server for VLM receipt extraction.
+# Calls llama-server for VLM receipt extraction and page transcription.
 httpx>=0.27.0
+# Scales receipt photos and rendered PDF pages for the vision model. fastembed
+# also pulls it in, but two modules import it directly now.
+Pillow>=10.0
 
 pytest>=8.0.0

@@ -40,6 +40,7 @@ Consequences you must preserve when changing [app/pipeline/sync.py](app/pipeline
 make build && make up      # llm-net must exist first: cd ~/Dev/LLM && docker compose up -d
 make doctor                # run this before trusting anything
 make ingest / query / list / status / add / reindex / rebuild-index
+make transcribe URI=<pdf> PAGES=3,5-7|all   # vision-read PDF pages (ADR-030)
 make eval                  # retrieval eval: tests/retrieval/questions.yaml
 make lifecycle / supersede / stale / retract / restore
 make unlock / lock / vault-list / vault-query / vault-lifecycle / approve / vault-audit
@@ -146,6 +147,32 @@ threshold separates the glued pages from good ones. A PDF whose *stored* order
 is scrambled would defeat this; none seen yet, and the Phase 2 VLM pass is the
 answer if one appears. The extractor no longer sets `flagged_pages`; the column
 and `make status` line remain for whatever flags pages next.
+
+### PDF pages read by the vision model
+
+`extract/transcribe.py`, given a `PagePlan` by the caller (ADR-030). Pages
+under 100 characters go to `qwen3-vl` automatically, **per page** (a
+per-document average let scanned inserts vanish), capped at
+`transcribe_max_auto_pages`; past that the document waits for
+`rag transcribe`, which is also how a human sends a page the text layer
+mangles. The answer is markdown, so tables reach the table-aware chunker and
+headings feed `_split_sections`.
+
+- **Numbers are checked, not trusted.** On a page with a text layer, a reading
+  containing any number the layer lacks is `rejected` and the page keeps its
+  `pdftotext` text. Scans have nothing to check against.
+- **Asked for as plain text, capped by `max_tokens`.** As a JSON string the
+  first real page transcribed correctly and then emitted `\n` until the
+  context filled. A capped-out reading is `rejected`, not `failed`.
+- **The cache** (`page_transcriptions` in `rag.db`, keyed by doc, page and file
+  hash) is written only after a scan of what it stores, and is not cleared by
+  `rebuild-index`. Everything but `failed` is cached, so a bad page costs the
+  model once. Retraction and the sweep delete it.
+- **Vault: inbox only.** The parse worker cannot open the vault, so it has no
+  cache; a consumed inbox file is read once anyway. A vault source indexed in
+  place would re-buy every page every run, so it never transcribes.
+- **`state` must not import `transcribe`** — the MCP server imports `state`
+  and has no Pillow.
 
 ### Citations
 
@@ -322,6 +349,7 @@ images scaled to 1536 px. A markdown note under `receipts` is still text.
 | Vault inbox sweep | A vault inbox file is **consumed** into a blob when filed, so the next run finds the folder empty. The sweep treated that as disappearance and deleted every receipt and its blob. Vault `INBOX` sources are never swept; their documents leave only by retraction. |
 | `FORCE=1` does not re-embed | It only overrides the sweep's deletion floor. A document re-embeds when its **extracted text** changes, so a chunking-only change reaches the index through `rag reindex`, which blanks the stored hashes (never deletes rows: that dropped the retracted tombstone and every lifecycle flag). |
 | Fingerprint guard | Dimension alone cannot detect a model swap — bge-base, nomic-v1.5, gte-base and arctic-m are all 768-dim. |
+| llama-server router and disconnects | A client that times out or is killed does **not** stop generation: an abandoned looping request ran on toward its 32k context until `POST /models/unload {"model": "qwen3-vl"}`. `vlm` sends `max_tokens` on every request for this reason; never drop it. |
 | `rag.db` journal mode | **Not WAL.** A WAL file opens read-only only if its `-wal`/`-shm` exist or can be created; the worker deletes them on exit and the readers' `:ro` mount can't recreate them, so every MCP state read failed. `_connect` sets `DELETE` on each write open, which also converts an old file. |
 
 ## Storage layout
@@ -344,14 +372,11 @@ over that.
 
 ## Phase 2 (in progress)
 
-Receipt extraction into the ledger is built (see *Receipts and the ledger*)
-and waits on the vision model being served. Not yet built: git/web sources with Crawl4AI
-(**ingest image only** — Playwright is 1-2 GB); tesseract for bulk scanned OCR.
-`sources.yaml` rejects `git`/`web` types until then rather than failing obscurely.
-
-The vision model added for receipts is also a layout extractor for manuals:
-render a page with `pdftoppm` (already installed), ask for markdown, and the
-table-aware chunker handles the result. `-raw` removed most of its original
-work queue; what is left is pages with no text layer and whitespace-aligned
-tables, and it needs a new trigger since the extractor no longer flags pages. Tesseract keeps the narrower job — bulk
-plain-text OCR where structure is not the content.
+Built: receipts into the ledger (2a, 2e; see *Receipts and the ledger*) and
+PDF page transcription (2b; see *PDF pages read by the vision model*). Not yet
+built: git/web sources with Crawl4AI (**ingest image only** — Playwright is
+1-2 GB); tesseract for bulk scanned OCR, which keeps the narrower job of
+plain-text OCR where structure is not the content and a minute a page is too
+dear. `sources.yaml` rejects `git`/`web` types until then rather than failing
+obscurely. Whitespace-aligned tables are still not detected automatically;
+`rag transcribe` is the manual route.

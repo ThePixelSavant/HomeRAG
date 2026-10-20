@@ -23,6 +23,7 @@ from app import documents
 from app.config import settings
 from app.domains import DOMAIN_TIERS, Tier, UnknownDomainError, domains_in, tier_of
 from app.pipeline import embedder, qdrant_store, state, sync
+from app.pipeline.extract import transcribe
 from app.sources import INBOX, Source, SourceConfigError, all_sources
 from app.vault.crypto import WrongPassphrase
 from app.vault.keyagent import AGENT
@@ -244,6 +245,8 @@ def _print_results(run_id: str, results: list) -> None:
                              ("pages flagged for review", result.flagged_pages),
                              ("receipts read", result.receipts_read),
                              ("receipts needing review (rag ledger-review)", result.receipts_flagged),
+                             ("pages read by the vision model", result.pages_transcribed),
+                             ("of those, rejected: numbers not in the text layer", result.pages_rejected),
                              ("failed", result.failed)):
             if count:
                 print(f"      {label}: {count}")
@@ -354,6 +357,9 @@ def _apply(conn, row, lifecycle: str, **fields) -> None:
         # them. The state row stays behind as the tombstone.
         qdrant_store.delete_doc(row["doc_id"])
         conn.execute("UPDATE documents SET chunk_count=0 WHERE doc_id=?", (row["doc_id"],))
+        # Cached page readings are the document's text too. The request (page
+        # numbers only) stays, so a restore reads the same pages again.
+        state.delete_transcriptions(conn, row["doc_id"])
     else:
         qdrant_store.set_lifecycle(
             row["doc_id"],
@@ -429,6 +435,43 @@ def cmd_restore(args) -> int:
     if was == documents.RETRACTED:
         print("Its chunks were deleted. Run `make ingest` to re-index it.")
     return 0
+
+
+def cmd_transcribe(args) -> int:
+    """Have the vision model read named pages of an open-tier PDF (ADR-030).
+
+    For pages the text layer mangles -- a whitespace-aligned table -- and for
+    a scanned document past the automatic page limit. The request is stored,
+    so a changed file is read again on the same pages; the named pages' cached
+    readings are dropped, so they are read fresh now. Then the document's
+    source is ingested, which is where the reading actually happens.
+    """
+    with state.writer() as conn:
+        row = _resolve_one(conn, args.uri, args.domain)
+        if not row["uri"].lower().endswith(".pdf"):
+            raise SystemExit(f"{row['uri']} is not a PDF; only PDF pages can be transcribed.")
+        if row["lifecycle"] in documents.TOMBSTONED:
+            raise SystemExit(f"{row['uri']} is retracted. `make restore` it first.")
+        if args.clear:
+            state.set_transcription_request(conn, row["doc_id"], None)
+            print(f"{row['uri']}: request cleared. Pages without a text layer are still read "
+                  "automatically; the rest go back to the text layer.")
+        else:
+            try:
+                pages, all_pages = transcribe.parse_pages(args.pages)
+            except ValueError as exc:
+                raise SystemExit(f"PAGES: {exc}. Use e.g. PAGES=12 or PAGES=3,5-7 or PAGES=all.") from None
+            spec = transcribe.format_pages(pages, all_pages)
+            state.set_transcription_request(conn, row["doc_id"], spec)
+            state.delete_transcriptions(conn, row["doc_id"], None if all_pages else pages)
+            print(f"{row['uri']}: page(s) {spec} will be read by {settings.vision_model}, "
+                  "about a minute a page on this CPU.")
+            print("A reading whose numbers are not all in the page's text layer is rejected "
+                  "and the page keeps its pdftotext text (see `rag status`).")
+    sources = [s for s in all_sources() if s.id == row["source_id"]]
+    if not sources:
+        raise SystemExit(f"Source {row['source_id']!r} is not in sources.yaml any more; nothing to ingest.")
+    return _run(sources, force=False, dry_run=False)
 
 
 def cmd_list(args) -> int:
@@ -621,6 +664,8 @@ def cmd_status(args) -> int:
         payload["documents_by_status"] = state.count_by_status(conn)
         payload["documents_by_lifecycle"] = state.count_by_lifecycle(conn)
         payload["flagged_pages"] = [dict(r) for r in state.flagged_pages(conn)]
+        payload["transcribed_pages"] = state.transcription_counts(conn)
+        payload["rejected_transcriptions"] = [dict(r) for r in state.rejected_transcriptions(conn)]
         payload["quarantined_open"] = len(state.open_quarantine(conn))
         payload["sources"] = [dict(r) for r in state.all_sources(conn)]
         payload["last_runs"] = [dict(r) for r in state.last_runs(conn, 5)]
@@ -655,6 +700,11 @@ def cmd_status(args) -> int:
         print(f"pages flagged for review: {total} across {len(flagged)} document(s)")
         for row in flagged[:5]:
             print(f"    {row['flagged_pages']:3d}  {row['uri']}  ({row['domain']})")
+    transcribed = payload["transcribed_pages"]
+    if transcribed:
+        print(f"pages read by the vision model: {transcribed}")
+        for row in payload["rejected_transcriptions"]:
+            print(f"    rejected  {row['uri']} page {row['page']}: {row['detail']}")
     if payload["quarantined_open"]:
         print(f"  !! {payload['quarantined_open']} quarantined document(s) awaiting review")
     vault = payload.get("vault") or {}
@@ -792,6 +842,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("uri")
     p.add_argument("--domain")
     p.set_defaults(func=cmd_restore)
+
+    p = sub.add_parser("transcribe", help="have the vision model read pages of an open-tier PDF")
+    p.add_argument("uri")
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument("--pages", help="12, 3,5-7 or all")
+    group.add_argument("--clear", action="store_true", help="drop the request")
+    p.add_argument("--domain")
+    p.set_defaults(func=cmd_transcribe)
 
     p = sub.add_parser("list", help="every open-tier document")
     p.add_argument("--domain")

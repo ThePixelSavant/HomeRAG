@@ -112,19 +112,21 @@ never participate in supersession. A corrected receipt is a **duplicate**
 problem — same merchant, date and total — which is a separate check, not a
 version problem.
 
-### b. VLM page transcription — *changes the OCR plan*
+### b. VLM page transcription · *done* ([ADR-030](decisions.md#adr-030-pdf-pages-the-text-layer-cannot-serve-are-read-by-the-vision-model))
 
 The vision model added for receipts is also the right layout extractor for
 manuals. Render a page with `pdftoppm` (already installed, no new dependency),
 ask for markdown, feed the result to the table chunker from Phase 1.5.
 
-One mechanism fixes column scrambling, broken tables, and scanned pages with no
-text layer at once.
+Built as two triggers. Pages without a text layer are read automatically, per
+page, capped per document; anything else is sent by a human with
+`rag transcribe`. On a page with a text layer every transcribed number must be
+in that layer, or the reading is rejected. Readings are cached by file hash.
 
-Scope it to pages that need it. `-raw` extraction (ADR-024) fixed the column
-scrambling this was first meant for, and the extractor no longer flags pages,
-so the queue is now pages marked `ocr_required` plus whitespace-aligned tables,
-which still need a detector.
+Still open: **a detector for whitespace-aligned tables.** ADR-024 found no
+threshold that separates them from two-column prose, so for now they are found
+by reading a bad answer and sent with `rag transcribe`. Vault sources indexed
+in place do not transcribe (no cache is possible from the keyless worker).
 
 ### c. Tesseract, in a narrower role
 

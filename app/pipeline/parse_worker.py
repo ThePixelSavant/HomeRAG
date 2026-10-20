@@ -38,8 +38,9 @@ from pathlib import Path
 
 from app import receipts
 from app.pipeline import classify, embedder, extract
+from app.pipeline.extract import transcribe
 from app.pipeline.extract.base import EMPTY, OCR_REQUIRED, OK, doc_id_for
-from app.sources import TRANSCRIPTS
+from app.sources import INBOX, TRANSCRIPTS
 from app.vault import store as vault_store
 
 logger = logging.getLogger(__name__)
@@ -78,7 +79,17 @@ def _parse_one(source: dict, rel_uri: str, known_hash: str | None) -> dict:
 
         doc = extract_receipt(path)
     else:
-        doc = extract.extract(path)
+        # A vault INBOX file is read once and then consumed into a blob, so
+        # its pages can go to the vision model with no cache behind them. A
+        # source indexed in place would buy every page again on every run, and
+        # its cache would have to live in the vault, which this process must
+        # never open -- so those keep plain ocr_required (ADR-030).
+        plan = None
+        if source["type"] == INBOX and path.suffix.lower() == ".pdf":
+            plan = transcribe.PagePlan(file_hash=transcribe.file_hash(path))
+        doc = extract.extract(path, plan=plan)
+        if plan is not None:
+            record["transcribed"] = {page: t.status for page, t in plan.produced.items()}
     if doc is None:
         record["outcome"] = SKIPPED_EMPTY
         return record
@@ -89,6 +100,7 @@ def _parse_one(source: dict, rel_uri: str, known_hash: str | None) -> dict:
     # document, each silently overwriting the last.
     doc.rel_uri = rel_uri
     record["flagged_pages"] = len(doc.extra.get("flagged_pages") or ())
+    record["transcription"] = doc.extra.get("transcription")
 
     if doc.status == OCR_REQUIRED:
         record["outcome"] = OCR

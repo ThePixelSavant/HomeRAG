@@ -9,7 +9,7 @@ WORKER     = $(COMPOSE) run --rm ingestion-worker
 VAULTEXEC  = docker exec -it mcp-vault python -m app.vaultctl
 VAULTRUN   = docker exec mcp-vault python -m app.vaultctl
 
-.PHONY: up down logs build doctor warm-cache ingest reindex add query eval status \
+.PHONY: up down logs build doctor warm-cache ingest reindex transcribe add query eval status \
         rebuild-index review-quarantine supersede stale retract restore lifecycle list \
         unlock lock vault-status vault-query vault-list vault-lifecycle \
         approve vault-audit ledger ledger-review ledger-resolve receipts-reread test
@@ -42,6 +42,10 @@ ingest:                 ## Sync all sources (SOURCE=id DOMAIN=d FORCE=1 to narro
 reindex:                ## Force a full re-embed of one source: make reindex SOURCE=id
 	@test -n "$(SOURCE)" || { echo "usage: make reindex SOURCE=<source-id>"; exit 2; }
 	$(WORKER) reindex $(SOURCE)
+
+transcribe:             ## Vision-read PDF pages: make transcribe URI=<uri> PAGES=3,5-7|all  (or CLEAR=1)
+	@test -n "$(URI)" -a -n "$(PAGES)$(CLEAR)" || { echo "usage: make transcribe URI=<uri> PAGES=3,5-7|all  (or CLEAR=1)"; exit 2; }
+	$(WORKER) transcribe "$(URI)" $(if $(CLEAR),--clear,--pages "$(PAGES)") $(if $(DOMAIN),--domain $(DOMAIN))
 
 # The worker mounts ./data, LOCAL_DOCS_PATH and CLAUDE_PROJECTS_PATH and
 # nothing else, so a file anywhere else on the host -- ~/Documents, ~/Downloads,

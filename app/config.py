@@ -84,12 +84,27 @@ class Settings(BaseSettings):
     # A photographed receipt costs ~1,500 image tokens plus the projector's
     # encode, prefilled on the CPU at ~70 tokens/s: minutes, not seconds.
     vision_timeout_seconds: int = 600
+    # The cap on one answer, enforced by llama-server. A receipt reading is a
+    # few hundred tokens and a dense manual page ~2,000; a looping model would
+    # otherwise generate until the 32k context fills -- most of an hour at
+    # ~10 tokens/s -- because the router does not stop when the client leaves.
+    vision_max_tokens: int = 4096
     # Long edge a receipt image is scaled to before it is sent. A 12 MP phone
     # photo at full size would be ~15k image tokens; 1536 px keeps small print
     # legible at a tenth of that.
     receipt_image_max_px: int = 1536
     # A scanned PDF past this many pages is not a receipt.
     receipt_max_pages: int = 3
+
+    # --- Vision model (PDF page transcription) ---
+    # Long edge a PDF page is rendered at. A letter page at 1536 px is ~140 dpi,
+    # which keeps 8pt body text legible for ~1,800 image tokens.
+    transcribe_image_max_px: int = 1536
+    # Pages a single document may send to the model WITHOUT being asked to. A
+    # page costs about a minute of CPU, so a scanned 400-page book would be a
+    # day of inference nobody chose; past this the document waits for
+    # `rag transcribe`.
+    transcribe_max_auto_pages: int = 30
 
     @property
     def allowed_emails(self) -> list[str]:

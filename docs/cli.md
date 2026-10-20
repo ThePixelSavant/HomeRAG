@@ -139,6 +139,40 @@ that way. For an embedding-model change use `rebuild-index`.
 Lifecycle survives: a stale or superseded document stays flagged, and a
 retracted one stays out — its tombstone is left alone and it is not re-read.
 
+### `rag transcribe` — have the vision model read PDF pages
+
+```bash
+rag transcribe URI=<pdf> PAGES=12          # one page
+rag transcribe URI=<pdf> PAGES=3,5-7       # a list and a range
+rag transcribe URI=<pdf> PAGES=all         # every page
+rag transcribe URI=<pdf> CLEAR=1           # drop the request
+```
+
+Pages **without a text layer** (a scan, or a scanned insert in a digital
+manual) are read by `qwen3-vl` automatically on every ingest, up to
+`TRANSCRIBE_MAX_AUTO_PAGES` (30) per document. Use `transcribe` for the rest:
+
+- a page whose text layer mangles it — a whitespace-aligned table comes out as
+  loose columns; transcribed, it is a markdown table whose header is repeated
+  on every chunk;
+- a scanned document past the automatic limit — the ingest note and its
+  `ocr_required` status name the command to run.
+
+The request is remembered, so a changed file is read again on the same pages.
+The named pages' cached readings are dropped, so they are read fresh; then the
+document's source is ingested. Budget about a minute a page of CPU, more for a
+dense one.
+
+**A reading can be rejected.** On a page that has a text layer, every number
+the model writes must appear in that layer; otherwise the page keeps its
+`pdftotext` text and `rag status` lists it with the numbers that did not match.
+The same goes for a reading that never ends (the model looping) — it is cut off
+at `VISION_MAX_TOKENS` and rejected. Rejections are cached, so a bad page costs
+the model once; ask again with `transcribe` after a prompt or model change.
+
+Open tier only. A vault PDF is read automatically when it is dropped into a
+vault inbox (it is consumed once, so no cache is needed) and never otherwise.
+
 ---
 
 ## Finding things

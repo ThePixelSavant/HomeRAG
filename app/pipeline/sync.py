@@ -34,6 +34,7 @@ from app import documents, receipts
 from app.config import settings
 from app.domains import Tier
 from app.pipeline import chunker, classify, embedder, extract, parse_worker, qdrant_store, state
+from app.pipeline.extract import transcribe
 from app.pipeline.extract.base import EMPTY, OCR_REQUIRED, OK, doc_id_for
 from app.sources import INBOX, LOCAL, TRANSCRIPTS, Source
 from app.vault import blobs as vault_blobs
@@ -77,6 +78,10 @@ class SourceResult:
     # must check before their amounts can be trusted.
     receipts_read: int = 0
     receipts_flagged: int = 0
+    # PDF pages the vision model read this run (cached readings not counted),
+    # and how many of those failed the number check against the text layer.
+    pages_transcribed: int = 0
+    pages_rejected: int = 0
     failed: int = 0
     enumeration_complete: bool = False
     error: str | None = None
@@ -249,6 +254,66 @@ def _quarantine(conn, source: Source, path: Path, result: SourceResult, scan) ->
 
 
 # --------------------------------------------------------------------------
+# Page transcription (ADR-030)
+# --------------------------------------------------------------------------
+
+
+def _page_plan(conn, doc_id: str, path: Path) -> transcribe.PagePlan:
+    """What the vision model may read in this PDF, and what it already has."""
+    file_hash = transcribe.file_hash(path)
+    request = state.transcription_request(conn, doc_id)
+    requested, requested_all = transcribe.parse_pages(request) if request else (set(), False)
+    cached = {
+        row["page"]: transcribe.Transcription(row["status"], row["text"], row["detail"])
+        for row in state.transcriptions(conn, doc_id, file_hash)
+    }
+    return transcribe.PagePlan(
+        file_hash=file_hash, requested=requested, requested_all=requested_all, cached=cached
+    )
+
+
+def _store_transcriptions(conn, doc_id: str, plan: transcribe.PagePlan) -> None:
+    """Cache this run's readings, unless they hold something the scan flags.
+
+    Runs before the document's own scan, so it scans what it stores: the
+    readings that will be indexed AND the details of rejected ones, which name
+    the numbers the model read. A document that trips the scan is quarantined
+    a moment later, and its pages are simply read again if it ever returns.
+    """
+    if not plan.produced:
+        return
+    stored = "\n".join(f"{t.text}\n{t.detail or ''}" for t in plan.produced.values())
+    if classify.scan(stored).sensitive:
+        return
+    state.save_transcriptions(
+        conn, doc_id, plan.file_hash,
+        {page: (t.status, t.text, t.detail) for page, t in plan.produced.items()},
+        model=settings.vision_model, prompt_version=transcribe.PROMPT_VERSION,
+    )
+
+
+def _count_transcription(uri: str, info: dict | None, produced: dict[int, str], result: SourceResult) -> None:
+    """Fold one document's transcription outcome into the run summary.
+
+    `produced` is {page: status} for readings made this run, from either tier.
+    """
+    result.pages_transcribed += sum(s in (transcribe.USED, transcribe.REJECTED) for s in produced.values())
+    result.pages_rejected += sum(s == transcribe.REJECTED for s in produced.values())
+    info = info or {}
+    failed = sum(s == transcribe.FAILED for s in (info.get("pages") or {}).values())
+    if failed:
+        result.notes.append(
+            f"{uri}: {failed} page(s) not transcribed (is llama-server serving "
+            f"{settings.vision_model}?); the next run retries"
+        )
+    if info.get("deferred"):
+        result.notes.append(
+            f"{uri}: {info['deferred']} page(s) without a text layer, over the automatic limit "
+            f"of {settings.transcribe_max_auto_pages}. To read them: rag transcribe URI={uri} PAGES=all"
+        )
+
+
+# --------------------------------------------------------------------------
 # Open tier
 # --------------------------------------------------------------------------
 
@@ -418,6 +483,9 @@ def _write_vault_record(vconn, source: Source, record: dict, run_id: str, result
     """
     doc_id = record["doc_id"]
     outcome = record.get("outcome")
+    _count_transcription(
+        record["rel_uri"], record.get("transcription"), record.get("transcribed") or {}, result
+    )
 
     if outcome == parse_worker.SKIPPED_RETRACTED:
         result.skipped_retracted += 1
@@ -672,7 +740,9 @@ def sync_source(source: Source, run_id: str, *, force: bool = False, dry_run: bo
                     result.skipped_retracted += 1
                     continue
 
-                doc = extract.extract(path)
+                doc_id = doc_id_for(source.id, rel_uri)
+                plan = _page_plan(conn, doc_id, path) if path.suffix.lower() == ".pdf" else None
+                doc = extract.extract(path, plan=plan)
                 if doc is None:
                     continue
                 # Extractors only see one file, so they default rel_uri to the
@@ -681,6 +751,12 @@ def sync_source(source: Source, run_id: str, *, force: bool = False, dry_run: bo
                 # CLAUDE.md under a tree collide into one document, each
                 # silently overwriting the last.
                 doc.rel_uri = rel_uri
+                if plan is not None:
+                    _store_transcriptions(conn, doc_id, plan)
+                    _count_transcription(
+                        rel_uri, doc.extra.get("transcription"),
+                        {p: t.status for p, t in plan.produced.items()}, result,
+                    )
                 if doc.status == OCR_REQUIRED:
                     result.ocr_required += 1
                     state.upsert_document(

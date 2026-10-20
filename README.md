@@ -99,6 +99,7 @@ rag warm-cache                   # download and load the embedding models
 rag add <file> <domain> [--move]
 rag ingest [SOURCE=id] [DOMAIN=d] [FORCE=1]
 rag reindex SOURCE=id            # after changing chunking or extraction
+rag transcribe URI=<pdf> PAGES=3,5-7|all [CLEAR=1]   # vision-read PDF pages the text layer mangles
 rag eval                         # rank known answers: hit@1 / hit@3 / MRR
 rag list [--domain d] [--match x] [--all]
 rag query "..." [--limit N] [--domain d] [--stale] [--superseded] [--dense]

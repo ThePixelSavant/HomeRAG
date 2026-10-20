@@ -785,3 +785,59 @@ queried 2023.
 
 **Revisit if:** a GPU makes long-context prefill cheap, or a vision model with
 linear attention and a compact tool format appears.
+
+## ADR-030: PDF pages the text layer cannot serve are read by the vision model
+
+**Chosen:** `qwen3-vl` transcribes a PDF page to markdown when the page has no
+text layer (automatically, per page, at most `transcribe_max_auto_pages` = 30
+per document) or when a human names it with `rag transcribe`. On a page that
+has a text layer, every number in the transcription must also be in that
+layer, or the reading is rejected and the page keeps its `pdftotext` text.
+Readings are cached in `rag.db` by document, page and file hash.
+
+**Rejected:**
+
+- *An automatic detector for whitespace-aligned tables.* ADR-024 measured the
+  whitespace signal and found no threshold separating a table from
+  two-column prose. A human who reads a bad answer is a better trigger than a
+  guess that misfires on the prose this pipeline was just fixed for.
+- *Trusting the transcription.* The model reads well — on the IntelliFlo spec
+  page all 33 numbers (23 distinct) matched the text layer — but a misread torque
+  figure is cited with full confidence. Same rule as receipts: the model
+  copies, Python checks. Scans have nothing to check against; that is the
+  residual risk, and the reason citations stay verbatim.
+- *The document-level `ocr_required` average as the trigger.* A digital manual
+  with a few scanned pages averaged above 100 chars/page, and those pages were
+  silently dropped.
+- *Re-reading on a prompt or model change.* A corpus costs hours of CPU. The
+  prompt version is recorded; `rag transcribe` re-reads on purpose.
+- *Transcribing vault sources indexed in place.* The cache would have to live
+  in the vault, which the keyless parse worker must never open (ADR-019), so
+  every run would buy every page again. Vault *inbox* files are consumed once
+  and are read; other vault PDFs keep `ocr_required`.
+
+Measured on the live stack, 2026-10-19 (IntelliFlo install guide, page 30,
+spec tables plus two figures; 1187×1536 render, ~1,900 prompt tokens):
+
+- **About 60 s a page** on this CPU, ~300 output tokens.
+- **Asked for JSON, the model looped.** It wrote the whole page correctly and
+  then emitted `\n` inside the string until stopped — 6,000+ tokens. And the
+  llama-server router does **not** cancel generation when the client
+  disconnects, so a client timeout freed nothing; the slot had to be stopped
+  with `POST /models/unload`. Hence plain-text answers, and `max_tokens` on
+  every vision request, receipts included. A reading that hits the cap is
+  rejected and cached, never retried.
+- **Figure markers.** The model writes `<!-- Image (54, 284, 924, 465) -->`
+  for each picture, whatever the prompt says. Unstripped, the coordinates
+  rejected an exact reading (and would have been indexed as numbers on a
+  scan). HTML comments are removed before the check.
+
+The cache is written only after a scan of what it stores — the indexed text
+and the rejection details, which quote numbers — and survives
+`rebuild-index`, which would otherwise re-buy every page. Retraction and the
+sweep delete it.
+
+**Revisit if:** a GPU makes a page cost seconds (then re-reading on a prompt
+change becomes reasonable), a whitespace-table detector proves out against
+`make eval`, or a vault source indexed in place needs scans read — that needs
+a cache the parent writes and passes into the worker's job.
