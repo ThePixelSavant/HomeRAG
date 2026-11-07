@@ -100,10 +100,11 @@ rag add <file> <domain> [--move]
 rag ingest [SOURCE=id] [DOMAIN=d] [FORCE=1]
 rag reindex SOURCE=id            # after changing chunking or extraction
 rag transcribe URI=<pdf> PAGES=3,5-7|all [CLEAR=1]   # vision-read PDF pages the text layer mangles
-rag eval                         # rank known answers: hit@1 / hit@3 / MRR
+rag eval [NORECORD=1]            # rank known answers: hit@1 / hit@3 / MRR; recorded for the dashboard
 rag list [--domain d] [--match x] [--all]
 rag query "..." [--limit N] [--domain d] [--stale] [--superseded] [--dense]
 rag status [JSON=1]
+rag admin                        # open the read-only dashboard (127.0.0.1:8090)
 rag rebuild-index YES=1          # after changing EMBED_MODEL/EMBED_DIM
 rag review-quarantine            # documents the sensitivity scan held back
 
@@ -135,6 +136,20 @@ with the servers down — which is what makes it useful for telling a retrieval
 problem apart from a transport one.
 
 Every flag and the reasoning behind each command: **[docs/cli.md](docs/cli.md)**.
+
+## Dashboard
+
+`rag admin` opens a read-only dashboard at `http://127.0.0.1:8090`: chunks per
+domain, documents and their lifecycle, quarantine, recent runs, and retrieval
+eval over time (every `rag eval` is recorded). Set `REPORT_TOKEN` in `.env`
+first (`openssl rand -hex 32`) and log in with it. Open tier only, and nothing
+on it changes anything — supersede, retract and quarantine decisions stay at
+the terminal.
+
+It is a separate page rather than part of Open WebUI on purpose: that would
+need Open WebUI's Functions, which `~/Dev/LLM` keeps off because they run in
+the container that signs vault identities. See
+[ADR-031](docs/decisions.md#adr-031-a-read-only-admin-dashboard-in-the-browser-not-in-open-webui).
 
 ## Quarantine
 

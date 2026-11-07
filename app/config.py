@@ -54,6 +54,15 @@ class Settings(BaseSettings):
     mcp_port: int = 8000
     vault_port: int = 8001
 
+    # --- Admin dashboard (rag-admin, ADR-031) ---
+    # The one secret for the read-only dashboard: typed once at /login, or sent
+    # as a bearer by curl. Unset (or under 32 characters) and every page
+    # answers 404. Deliberately not Open WebUI's identity assertion: every
+    # tool server receives that, so any of them could replay it.
+    report_token: str | None = None
+    admin_host: str = "0.0.0.0"
+    admin_port: int = 8080
+
     # --- Vault access control ---
     # Shared with Open WebUI's FORWARD_USER_INFO_HEADER_JWT_SECRET. Without it,
     # identity cannot be verified and every model-initiated vault call is denied.

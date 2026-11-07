@@ -178,6 +178,34 @@ between bridges, so this is isolation and not merely a missing DNS record.
 > buys encryption without authentication, which does not stop the MITM the TLS
 > was for.
 
+### The admin dashboard
+
+`rag-admin` ([ADR-031](decisions.md#adr-031-a-read-only-admin-dashboard-in-the-browser-not-in-open-webui))
+is a read-only browser dashboard on `127.0.0.1:8090`. What bounds it:
+
+- **Nothing it can write.** `data/state` is mounted read-only and Qdrant is
+  reached with the read-only key. No vault mount, not on `vault-net`, imports
+  nothing from `app/vault/`.
+- **Open tier only**, filtered in `app/report.py` rather than trusted to the
+  data: `rag.db` records vault inbox sources and their run errors, and those
+  are dropped before rendering.
+- **Its own secret.** `REPORT_TOKEN`, at least 32 characters or every page
+  answers 404. The browser holds an HMAC of it, never the token, in an
+  `HttpOnly`, `SameSite=Strict` session cookie. Not Open WebUI's identity
+  assertion, which every tool server receives and could replay.
+- **Loopback and a pinned Host header.** Published on `127.0.0.1` only, and
+  the app refuses any Host but `127.0.0.1`/`localhost`. A DNS-rebinding page
+  would arrive under its own name and without the cookie.
+- **A strict CSP:** `script-src 'self'` with no inline script,
+  `frame-ancestors 'none'`, `default-src 'none'`.
+
+It is deliberately not an Open WebUI Function: those run in the container
+that holds the identity-signing secret, so `~/Dev/LLM` keeps them off.
+
+Other containers on `llm-net` can reach `rag-admin:8080`. The token is what
+stops them: they can send any Host header they like, so the Host check guards
+against browsers, not containers.
+
 ## The three gates
 
 All in one place, [app/vault/service.py](../app/vault/service.py), applied in
