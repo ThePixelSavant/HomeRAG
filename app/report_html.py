@@ -113,8 +113,10 @@ td.uri { word-break: break-all; }
 .bars .fill { height: 10px; background: var(--bar); border-radius: 0 4px 4px 0; min-width: 2px; }
 .bars .n { font-variant-numeric: tabular-nums; color: var(--text-2); font-size: 12px; }
 .empty { color: var(--muted); font-style: italic; }
-.chart { position: relative; }
-.chart svg { width: 100%; height: auto; display: block; }
+/* The SVG scales as a whole, text included: bounded so labels stay ~10-14px.
+   On a phone the chart scrolls sideways in its own box, not the page. */
+.chart { position: relative; overflow-x: auto; }
+.chart svg { width: 100%; min-width: 560px; max-width: 820px; height: auto; display: block; }
 .chart text { fill: var(--muted); font-size: 11px; }
 .legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--text-2); margin: 4px 0 6px; }
 .legend i { display: inline-block; width: 12px; height: 2px; vertical-align: middle; margin-right: 5px; }
@@ -495,6 +497,8 @@ def render_login(error: str | None = None) -> str:
         '<p class="sub">Read-only. Paste REPORT_TOKEN from ~/Dev/RAG/.env.</p>'
         f"{err}"
         '<form method="post" action="/login">'
+        # Browsers expect a username beside a password field; the server ignores it.
+        '<input type="text" name="username" value="rag-admin" autocomplete="username" hidden>'
         '<input type="password" name="token" autocomplete="current-password" '
         'aria-label="token" autofocus required>'
         "<button>Log in</button></form></div>"
