@@ -40,9 +40,12 @@ Consequences you must preserve when changing [app/pipeline/sync.py](app/pipeline
 make build && make up      # llm-net must exist first: cd ~/Dev/LLM && docker compose up -d
 make doctor                # run this before trusting anything
 make ingest / query / list / status / add / reindex / rebuild-index
+make transcribe URI=<pdf> PAGES=3,5-7|all   # vision-read PDF pages (ADR-030)
 make eval                  # retrieval eval: tests/retrieval/questions.yaml
 make lifecycle / supersede / stale / retract / restore
 make unlock / lock / vault-list / vault-query / vault-lifecycle / approve / vault-audit
+make ledger / ledger-review / ledger-resolve   # receipts, in exact cents
+make receipts-reread [URI=...]   # re-read filed receipts from their encrypted originals
 make test                  # pytest inside the worker image
 ```
 
@@ -118,6 +121,12 @@ without `heading_path` (transcript turns) pack exactly as before. Tune against
 `make eval`, not intuition: 120 looked safer and dropped hit@3 from 79% to
 57%. ADR-025.
 
+**Contents pages are dropped** (`_is_contents_page`: mostly dot-leader lines
+whose page numbers exist and mostly ascend). Their entries are heading-sized,
+so the section split made each line its own chunk — 231 of 872 manual chunks,
+matching every query and answering none. Mostly ascending, not strictly:
+`-raw` reads a two-column contents page in stored order.
+
 ### PDF extraction: `-raw`, re-spaced from reading order
 
 Every page is `pdftotext -raw`: text in the order the PDF stores it. That keeps
@@ -138,6 +147,32 @@ threshold separates the glued pages from good ones. A PDF whose *stored* order
 is scrambled would defeat this; none seen yet, and the Phase 2 VLM pass is the
 answer if one appears. The extractor no longer sets `flagged_pages`; the column
 and `make status` line remain for whatever flags pages next.
+
+### PDF pages read by the vision model
+
+`extract/transcribe.py`, given a `PagePlan` by the caller (ADR-030). Pages
+under 100 characters go to `qwen3-vl` automatically, **per page** (a
+per-document average let scanned inserts vanish), capped at
+`transcribe_max_auto_pages`; past that the document waits for
+`rag transcribe`, which is also how a human sends a page the text layer
+mangles. The answer is markdown, so tables reach the table-aware chunker and
+headings feed `_split_sections`.
+
+- **Numbers are checked, not trusted.** On a page with a text layer, a reading
+  containing any number the layer lacks is `rejected` and the page keeps its
+  `pdftotext` text. Scans have nothing to check against.
+- **Asked for as plain text, capped by `max_tokens`.** As a JSON string the
+  first real page transcribed correctly and then emitted `\n` until the
+  context filled. A capped-out reading is `rejected`, not `failed`.
+- **The cache** (`page_transcriptions` in `rag.db`, keyed by doc, page and file
+  hash) is written only after a scan of what it stores, and is not cleared by
+  `rebuild-index`. Everything but `failed` is cached, so a bad page costs the
+  model once. Retraction and the sweep delete it.
+- **Vault: inbox only.** The parse worker cannot open the vault, so it has no
+  cache; a consumed inbox file is read once anyway. A vault source indexed in
+  place would re-buy every page every run, so it never transcribes.
+- **`state` must not import `transcribe`** — the MCP server imports `state`
+  and has no Pillow.
 
 ### Citations
 
@@ -206,7 +241,9 @@ column in `SCHEMA` never reaches a live database — `_ADDED_COLUMNS` +
   upsert. A no-op when nothing shrank, and it repairs prior partial failures.
 - **Disappearance**: every run stamps `last_seen_run`; unchanged docs get it
   refreshed without re-embedding, then `sweep_source` deletes what the run did
-  not touch.
+  not touch. **`touch_doc` runs after every document, changed or not**: an
+  upsert stamps only the chunks that changed, and touching only unchanged
+  documents let a one-paragraph edit cost a document its other chunks.
 
 `sweep_source` is **the most dangerous function here**. It refuses without
 `enumeration_complete`, and refuses to delete more than 50% of a source without
@@ -243,10 +280,66 @@ not HTTP — an unlock endpoint here would be reachable from every container on
 one-shot container cannot unlock the vault: it would derive a key into its own
 memory and exit.
 
+**Nothing joins `vault-net` except `mcp-vault` and `open-webui`** — no new
+service, sidecar or `network_mode: container:` here or in `~/Dev/LLM`. Open
+WebUI sends the identity assertion to every tool server, so `mcp-server` holds
+a valid one every turn, and the vault accepts any bearer until `exp` (no
+audience or one-time check). Being unable to reach `mcp-vault` is what stops
+it. Verify with `~/Dev/LLM/scripts/check-vault-net.sh`.
+
 Identity comes from Open WebUI's **signed HS256 assertion**, not the plaintext
 `X-OpenWebUI-User-*` headers, which anything reaching the port could set. There
 is no model identifier in any forwarded header, so keeping vault tools off
 frontier presets is configuration, and the approval prompt is the backstop.
+
+**`vaultctl` runs in a fresh interpreter** (`docker exec`), whose key agent is
+empty. Anything that reads or writes the vault must therefore be an action on
+`control.sock`, executed in the server (`control._cli_actions`). A command that
+calls `service`/`AGENT` directly in `vaultctl` can only ever report "sealed";
+list, query, ledger and lifecycle shipped that way and never worked.
+
+**The socket's location is the boundary, not its permissions.** `mcp-vault` and
+the worker both run as uid 1000 (the vault needs its files readable by the
+worker), so `control.sock` lives on a tmpfs private to the vault container
+(`settings.vault_control_socket`, `/run/vault`) — never on `./data/vault`, which
+the worker mounts. Put it back on the shared directory and the parse worker can
+read an unlocked vault.
+
+### Receipts and the ledger
+
+Images and PDFs filed under `receipts` (`app/receipts.py` `RECEIPT_DOMAINS`)
+are routed **by domain, not suffix** in `parse_worker` to
+`extract/receipt.py`, which asks the vision model (`settings.vision_model`,
+`qwen3-vl` on llama-server's router) for a JSON reading: an e-receipt's text
+layer when it has one, since that is far cheaper than an image; otherwise
+images scaled to 1536 px. A markdown note under `receipts` is still text.
+
+- **The prompt depends on the input** (`receipts.prompt_for`). Text-layer rules
+  (wrapped descriptions, subtotal/tax are not items) fixed a real PDF and, sent
+  with a photo of the same receipt, stripped every amount from it. Test a prompt
+  change on both, then apply it to filed receipts with `rag receipts-reread`.
+- **A USD receipt's `4/12/2026` is not ambiguous**; only other currencies get
+  the month/day note. Flagging it put four US receipts in ten up for review.
+- **`query_ledger`'s merchant filter is a case-insensitive contains**, LIKE
+  wildcards escaped. The model cannot know the printed name: "Batteries Plus"
+  matched nothing exactly against "Batteries Plus Bulbs #583".
+
+- **The model copies strings; Python does arithmetic.** Amounts and dates come
+  back as printed; `receipts.parse_amount` (Decimal to integer cents) and
+  `parse_date` read them. Never ask the model for a number.
+- **The parent validates** (`sync._write_ledger` → `receipts.validate`) on the
+  raw reading, and never trusts a verdict from the parse worker. Anything
+  doubtful — lines that do not sum, no total (recorded as 0), no date (the
+  file's date is used), an ambiguous `03/04/25` — sets `needs_review` with notes.
+- **Duplicates are flagged, never merged:** same date, same cents,
+  same-looking merchant (`same_merchant` compares first words).
+- Ledger rows follow their document: `replace_ledger` on every re-index;
+  `retract` and `delete_document` delete them. A surviving row would keep
+  counting in totals.
+- **Unchanged receipts are skipped by FILE hash before the model is called**
+  (a reading costs minutes of CPU); other documents compare extracted text.
+- Review is CLI only (`rag ledger-review`, `rag ledger-resolve`), for the same
+  reason lifecycle is.
 
 ## Gotchas that have already bitten
 
@@ -258,8 +351,12 @@ frontier presets is configuration, and the approval prompt is the backstop.
 | Qdrant image digest | Snapshot restore needs a matching minor version, so `:latest` breaks migration. Pinned by digest with a rollback comment. |
 | Glob matching | `fnmatch("a.md", "**/*")` is **False** — `**/` needs a literal slash. `_matches` handles the prefix; an empty `include` means everything. |
 | Bind-mounted files | Docker creates a *directory* when a bind-mounted file is missing. Mount directories: `data/state/` and `data/vault/` are separate so `mcp-server` gets state read-only and no vault mount at all. |
+| Vault ingestion vs file ownership | `mcp-vault` stayed root after the others moved to 1000, and its `0600` files shut the worker out: every vault ingest failed with `Permission denied: vault.salt`. Everything is 1000 now; the socket moved to a private tmpfs so the shared uid does not hand it to the worker. |
+| RAG chat model | `qwen3-vl` renders tool schemas as full JSON (~3x Coder-Next's tokens) and uses full attention in every layer, so each step slows as a chat grows (86 → 18 tok/s by 14k tokens). On the SH-01A question it guessed a wrong answer where Coder-Next found the section. It reads receipts; Coder-Next answers chats. New Open WebUI presets default every built-in tool ON — ~9k tokens of definitions per prompt. |
+| Vault inbox sweep | A vault inbox file is **consumed** into a blob when filed, so the next run finds the folder empty. The sweep treated that as disappearance and deleted every receipt and its blob. Vault `INBOX` sources are never swept; their documents leave only by retraction. |
 | `FORCE=1` does not re-embed | It only overrides the sweep's deletion floor. A document re-embeds when its **extracted text** changes, so a chunking-only change reaches the index through `rag reindex`, which blanks the stored hashes (never deletes rows: that dropped the retracted tombstone and every lifecycle flag). |
 | Fingerprint guard | Dimension alone cannot detect a model swap — bge-base, nomic-v1.5, gte-base and arctic-m are all 768-dim. |
+| llama-server router and disconnects | A client that times out or is killed does **not** stop generation: an abandoned looping request ran on toward its 32k context until `POST /models/unload {"model": "qwen3-vl"}`. `vlm` sends `max_tokens` on every request for this reason; never drop it. |
 | `rag.db` journal mode | **Not WAL.** A WAL file opens read-only only if its `-wal`/`-shm` exist or can be created; the worker deletes them on exit and the readers' `:ro` mount can't recreate them, so every MCP state read failed. `_connect` sets `DELETE` on each write open, which also converts an old file. |
 
 ## Storage layout
@@ -280,15 +377,13 @@ Qdrant is a **derived index, not the source of truth** — deterministic point I
 mean `make rebuild-index` reconstructs it exactly. Snapshots are an optimisation
 over that.
 
-## Phase 2 (not yet built)
+## Phase 2 (in progress)
 
-VLM receipt extraction + `ledger` + `query_ledger`; git/web sources with Crawl4AI
-(**ingest image only** — Playwright is 1-2 GB); tesseract for bulk scanned OCR.
-`sources.yaml` rejects `git`/`web` types until then rather than failing obscurely.
-
-The vision model added for receipts is also a layout extractor for manuals:
-render a page with `pdftoppm` (already installed), ask for markdown, and the
-table-aware chunker handles the result. `-raw` removed most of its original
-work queue; what is left is pages with no text layer and whitespace-aligned
-tables, and it needs a new trigger since the extractor no longer flags pages. Tesseract keeps the narrower job — bulk
-plain-text OCR where structure is not the content.
+Built: receipts into the ledger (2a, 2e; see *Receipts and the ledger*) and
+PDF page transcription (2b; see *PDF pages read by the vision model*). Not yet
+built: git/web sources with Crawl4AI (**ingest image only** — Playwright is
+1-2 GB); tesseract for bulk scanned OCR, which keeps the narrower job of
+plain-text OCR where structure is not the content and a minute a page is too
+dear. `sources.yaml` rejects `git`/`web` types until then rather than failing
+obscurely. Whitespace-aligned tables are still not detected automatically;
+`rag transcribe` is the manual route.

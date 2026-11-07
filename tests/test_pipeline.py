@@ -433,6 +433,47 @@ def test_respace_uses_the_fewest_pieces():
     )
 
 
+def test_contents_pages_are_recognised_in_both_leader_styles():
+    from app.pipeline.extract.pdf import _is_contents_page
+
+    arturia = "Table Of Contents\n" + "\n".join(
+        f"1.{i}. Section {i} " + "." * 60 + f" {5 + i}" for i in range(8)
+    )
+    dell = "Contents | 3\nContents\n" + "\n".join(
+        f"Replacing Part {i}" + " ." * 20 + f" {9 + 2 * i}" for i in range(8)
+    )
+    assert _is_contents_page(arturia, page_count=120)
+    assert _is_contents_page(dell, page_count=120)
+
+
+def test_contents_page_tolerates_a_two_column_order():
+    """`-raw` reads Analog Lab's two columns in stored order: mostly ascending."""
+    from app.pipeline.extract.pdf import _is_contents_page
+
+    pages = [12, 12, 16, 6, 7, 19, 26, 50, 64, 67, 68, 8, 70, 71, 78, 80]
+    text = "\n".join(f"Entry {i} ..........{p}" for i, p in enumerate(pages))
+    assert _is_contents_page(text, page_count=120)
+
+
+def test_leaders_that_are_not_contents_are_kept():
+    from app.pipeline.extract.pdf import _is_contents_page
+
+    # A spec table: leaders, bare integers, in no order.
+    specs = "\n".join(
+        f"{name} ........ {n}" for name, n in
+        [("Keys", 25), ("Pads", 16), ("Knobs", 16), ("Steps", 64), ("Weight", 2),
+         ("Patterns", 16), ("Voices", 4), ("Outputs", 8)]
+    )
+    assert not _is_contents_page(specs, page_count=120)
+    # A body page with a stray leader line or two.
+    body = "Press SHIFT and turn the knob.\n" * 20 + "See Tempo ........ 11\n" * 2
+    assert not _is_contents_page(body, page_count=120)
+    # Page numbers the document does not have.
+    assert not _is_contents_page(
+        "\n".join(f"Part {i} ........ {900 + i}" for i in range(8)), page_count=120
+    )
+
+
 def test_pages_are_extracted_in_stored_order(tmp_path, monkeypatch):
     """Every page takes `-raw`, re-spaced from reading order, and says so."""
     from app.pipeline.extract import pdf
@@ -975,3 +1016,74 @@ def test_scheduling_a_review_does_not_erase_the_existing_reason(state_db):
     assert row["lifecycle_reason"] == "hardware decommissioned"
     assert row["review_after"] == "2027-01-01"
     assert row["lifecycle"] == STALE
+
+
+# --- the sweep after a partial change -----------------------------------------
+
+
+def test_a_partly_changed_document_keeps_its_unchanged_chunks(tmp_path, monkeypatch):
+    """Editing one paragraph re-embeds one chunk. The others must still be
+    marked as seen this run, or the sweep deletes them.
+
+    Found by the first ingest with page transcription: a cover page added to
+    two manuals left 367 unchanged chunks on the old run marker. The 50% floor
+    refused that sweep; smaller edits had not been so lucky, and RAG/CLAUDE.md,
+    RAG/README.md and the XPS manual had lost chunks.
+    """
+    from app.pipeline import embedder, qdrant_store, state, sync
+    from app.sources import LOCAL, Source
+
+    monkeypatch.setattr(settings, "state_db_path", tmp_path / "rag.db")
+    state.init()
+    points: dict[tuple[str, int], dict] = {}
+
+    def upsert(new):
+        for p in new:
+            points[(p["doc_id"], p["chunk_index"])] = dict(p["payload"])
+
+    def touch(doc_id, run_id):
+        for (d, _), payload in points.items():
+            if d == doc_id:
+                payload["last_seen_run"] = run_id
+
+    def tail(doc_id, n):
+        for key in [k for k in points if k[0] == doc_id and k[1] >= n]:
+            del points[key]
+
+    def sweep(source_id, run_id, **kw):
+        stale = [k for k, p in points.items() if p["last_seen_run"] != run_id]
+        for key in stale:
+            del points[key]
+        return len(stale)
+
+    monkeypatch.setattr(qdrant_store, "existing_chunks", lambda doc_id: {
+        i: p["content_hash"] for (d, i), p in points.items() if d == doc_id
+    })
+    monkeypatch.setattr(qdrant_store, "make_point", lambda **kw: kw)
+    monkeypatch.setattr(qdrant_store, "upsert_chunks", upsert)
+    monkeypatch.setattr(qdrant_store, "touch_doc", touch)
+    monkeypatch.setattr(qdrant_store, "delete_doc_tail", tail)
+    monkeypatch.setattr(qdrant_store, "sweep_source", sweep)
+    monkeypatch.setattr(embedder, "embed_passages", lambda texts: [[0.0]] * len(texts))
+    monkeypatch.setattr(embedder, "sparse_passages", lambda texts: [None] * len(texts))
+    monkeypatch.setattr(settings, "chunk_target_tokens", 60)
+    monkeypatch.setattr(settings, "chunk_max_tokens", 80)
+
+    docs = tmp_path / "notes"
+    docs.mkdir()
+    sections = [f"## Section {n}\n\n" + f"Paragraph {n} says something specific. " * 8 for n in range(4)]
+    note = docs / "note.md"
+    note.write_text("# Note\n\n" + "\n\n".join(sections))
+    source = Source(id="notes-dir", type=LOCAL, domain="notes", path=docs)
+
+    sync.sync_source(source, "run-1")
+    before = len(points)
+    assert before >= 4
+
+    sections[2] = sections[2].replace("specific", "different")
+    note.write_text("# Note\n\n" + "\n\n".join(sections))
+    result = sync.sync_source(source, "run-2")
+
+    assert 0 < result.chunks_upserted < before, "only the edited section is re-embedded"
+    assert result.chunks_deleted == 0
+    assert len(points) == before

@@ -25,14 +25,16 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from app import documents
+from app import documents, receipts
 from app.config import settings
 from app.domains import Tier
 from app.pipeline import chunker, classify, embedder, extract, parse_worker, qdrant_store, state
+from app.pipeline.extract import transcribe
 from app.pipeline.extract.base import EMPTY, OCR_REQUIRED, OK, doc_id_for
 from app.sources import INBOX, LOCAL, TRANSCRIPTS, Source
 from app.vault import blobs as vault_blobs
@@ -72,6 +74,14 @@ class SourceResult:
     # counting it as failed makes `failed` mean nothing.
     docs_empty: int = 0
     flagged_pages: int = 0
+    # Receipts written to the ledger this run, and how many of those a human
+    # must check before their amounts can be trusted.
+    receipts_read: int = 0
+    receipts_flagged: int = 0
+    # PDF pages the vision model read this run (cached readings not counted),
+    # and how many of those failed the number check against the text layer.
+    pages_transcribed: int = 0
+    pages_rejected: int = 0
     failed: int = 0
     enumeration_complete: bool = False
     error: str | None = None
@@ -244,6 +254,66 @@ def _quarantine(conn, source: Source, path: Path, result: SourceResult, scan) ->
 
 
 # --------------------------------------------------------------------------
+# Page transcription (ADR-030)
+# --------------------------------------------------------------------------
+
+
+def _page_plan(conn, doc_id: str, path: Path) -> transcribe.PagePlan:
+    """What the vision model may read in this PDF, and what it already has."""
+    file_hash = transcribe.file_hash(path)
+    request = state.transcription_request(conn, doc_id)
+    requested, requested_all = transcribe.parse_pages(request) if request else (set(), False)
+    cached = {
+        row["page"]: transcribe.Transcription(row["status"], row["text"], row["detail"])
+        for row in state.transcriptions(conn, doc_id, file_hash)
+    }
+    return transcribe.PagePlan(
+        file_hash=file_hash, requested=requested, requested_all=requested_all, cached=cached
+    )
+
+
+def _store_transcriptions(conn, doc_id: str, plan: transcribe.PagePlan) -> None:
+    """Cache this run's readings, unless they hold something the scan flags.
+
+    Runs before the document's own scan, so it scans what it stores: the
+    readings that will be indexed AND the details of rejected ones, which name
+    the numbers the model read. A document that trips the scan is quarantined
+    a moment later, and its pages are simply read again if it ever returns.
+    """
+    if not plan.produced:
+        return
+    stored = "\n".join(f"{t.text}\n{t.detail or ''}" for t in plan.produced.values())
+    if classify.scan(stored).sensitive:
+        return
+    state.save_transcriptions(
+        conn, doc_id, plan.file_hash,
+        {page: (t.status, t.text, t.detail) for page, t in plan.produced.items()},
+        model=settings.vision_model, prompt_version=transcribe.PROMPT_VERSION,
+    )
+
+
+def _count_transcription(uri: str, info: dict | None, produced: dict[int, str], result: SourceResult) -> None:
+    """Fold one document's transcription outcome into the run summary.
+
+    `produced` is {page: status} for readings made this run, from either tier.
+    """
+    result.pages_transcribed += sum(s in (transcribe.USED, transcribe.REJECTED) for s in produced.values())
+    result.pages_rejected += sum(s == transcribe.REJECTED for s in produced.values())
+    info = info or {}
+    failed = sum(s == transcribe.FAILED for s in (info.get("pages") or {}).values())
+    if failed:
+        result.notes.append(
+            f"{uri}: {failed} page(s) not transcribed (is llama-server serving "
+            f"{settings.vision_model}?); the next run retries"
+        )
+    if info.get("deferred"):
+        result.notes.append(
+            f"{uri}: {info['deferred']} page(s) without a text layer, over the automatic limit "
+            f"of {settings.transcribe_max_auto_pages}. To read them: rag transcribe URI={uri} PAGES=all"
+        )
+
+
+# --------------------------------------------------------------------------
 # Open tier
 # --------------------------------------------------------------------------
 
@@ -335,8 +405,11 @@ def _sync_open_doc(conn, source: Source, path: Path, doc, run_id: str, result: S
     # Unconditional: a no-op when nothing shrank, and it repairs a prior
     # partial failure.
     qdrant_store.delete_doc_tail(doc_id, len(chunks))
-    if not changed:
-        qdrant_store.touch_doc(doc_id, run_id)
+    # Also unconditional. Only the CHANGED chunks were upserted with this run's
+    # marker; the rest of the document still carries the last one, and the
+    # sweep deletes whatever this run did not mark. Touching only when nothing
+    # changed let a one-paragraph edit cost a document its other chunks.
+    qdrant_store.touch_doc(doc_id, run_id)
 
     state.upsert_document(
         conn, doc_id=doc_id, source_id=source.id, domain=source.domain, tier=Tier.OPEN.value,
@@ -410,6 +483,9 @@ def _write_vault_record(vconn, source: Source, record: dict, run_id: str, result
     """
     doc_id = record["doc_id"]
     outcome = record.get("outcome")
+    _count_transcription(
+        record["rel_uri"], record.get("transcription"), record.get("transcribed") or {}, result
+    )
 
     if outcome == parse_worker.SKIPPED_RETRACTED:
         result.skipped_retracted += 1
@@ -466,6 +542,9 @@ def _write_vault_record(vconn, source: Source, record: dict, run_id: str, result
         ],
     )
 
+    if record.get("receipt") is not None:
+        _write_ledger(vconn, source, record, result)
+
     # The original is sensitive too. Inbox drops are consumed; sources indexed
     # in place (transcripts, mounted dirs) are left alone -- we do not own them.
     if source.type == INBOX:
@@ -473,6 +552,110 @@ def _write_vault_record(vconn, source: Source, record: dict, run_id: str, result
 
     result.chunks_upserted += len(chunks)
     result.docs_indexed += 1
+
+
+def _write_ledger(vconn, source: Source, record: dict, result: SourceResult) -> None:
+    """Validate a receipt reading and write its ledger row.
+
+    Validation happens HERE, in the process holding the key, on the raw
+    reading -- never on a verdict computed by the parse worker, which read the
+    attacker-influenced file. A possible duplicate (same date, same amount,
+    same-looking merchant, different document) is flagged, never merged: the
+    same receipt photographed twice and two identical coffees on one day look
+    alike, and only a human can tell them apart.
+    """
+    doc_id = record["doc_id"]
+    row = receipts.validate(
+        record["receipt"],
+        fallback_date=dt.datetime.fromtimestamp(record.get("mtime") or 0, dt.timezone.utc).date().isoformat(),
+        extracted_by=record.get("extractor") or "vlm",
+        source_id=source.id,
+        domain=source.domain,
+    )
+    duplicates = sorted({
+        match["uri"]
+        for match in vault_store.ledger_matches(
+            vconn, row["txn_date"], row["amount_cents"], exclude_doc_id=doc_id
+        )
+        if receipts.same_merchant(match["merchant"], row["merchant"])
+    })
+    if duplicates and row["amount_cents"]:
+        note = f"possible duplicate of {', '.join(duplicates)}"
+        row["needs_review"] = 1
+        row["review_notes"] = f"{row['review_notes']}; {note}" if row["review_notes"] else note
+    vault_store.replace_ledger(vconn, doc_id, [row])
+    result.receipts_read += 1
+    result.receipts_flagged += row["needs_review"]
+
+
+def reread_receipts(run_id: str, *, uri: str | None = None) -> SourceResult:
+    """Read filed receipts again, from their encrypted originals.
+
+    For when the reading improved -- a better prompt, a better model. The
+    inbox copies were consumed when the receipts were filed, so the only
+    originals are the encrypted blobs, and decrypting one needs the key this
+    process holds. Parsing must still never happen here, so each original is
+    decrypted into a private in-memory directory (/dev/shm, mode 0700) and
+    handed to the keyless parse worker exactly like an inbox drop; the reading
+    comes back through the same validation and write path, replacing the
+    document's chunks and its ledger row by doc_id. The plaintext is deleted
+    when the batch is done.
+
+    The source passed on is LOCAL, not INBOX, so the existing encrypted
+    original is kept rather than stored a second time.
+    """
+    result = SourceResult(source_id="receipts (re-read)")
+    vconn = AGENT.connect()
+    vault_store.init(vconn)
+    try:
+        placeholders = ",".join("?" for _ in receipts.RECEIPT_DOMAINS)
+        sql = (
+            "SELECT d.doc_id, d.source_id, d.domain, d.uri, d.mtime FROM documents d "
+            f"JOIN blobs b ON b.doc_id = d.doc_id WHERE d.domain IN ({placeholders}) "
+            "AND d.lifecycle = ?"
+        )
+        params: list = [*sorted(receipts.RECEIPT_DOMAINS), documents.ACTIVE]
+        if uri:
+            sql += " AND d.uri = ?"
+            params.append(uri)
+        rows = [
+            r for r in vconn.execute(sql, params).fetchall()
+            if Path(r["uri"]).suffix.lower() in receipts.RECEIPT_SUFFIXES
+        ]
+        batches: dict[tuple[str, str], list] = {}
+        for row in rows:
+            batches.setdefault((row["source_id"], row["domain"]), []).append(row)
+
+        shm = Path("/dev/shm")
+        for (source_id, domain), docs in batches.items():
+            with tempfile.TemporaryDirectory(dir=shm if shm.is_dir() else None, prefix="reread-") as tmp:
+                os.chmod(tmp, 0o700)
+                files = []
+                for doc in docs:
+                    target = Path(tmp) / doc["uri"]
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    with os.fdopen(fd, "wb") as out:
+                        out.write(vault_blobs.load(vconn, AGENT.key(), doc["doc_id"]))
+                    # The file's date is the fallback when no date is read;
+                    # keep the original's, not the moment it was decrypted.
+                    if doc["mtime"]:
+                        os.utime(target, (doc["mtime"], doc["mtime"]))
+                    files.append(target)
+                result.docs_seen += len(files)
+
+                source = Source(id=source_id, type=LOCAL, domain=domain, path=Path(tmp))
+                for record in _run_parse_worker(source, files, known={}, tombstoned=()):
+                    try:
+                        _write_vault_record(vconn, source, record, run_id, result)
+                    except Exception as exc:  # noqa: BLE001 - one bad record must not kill the run
+                        logger.exception("Failed to store %s", record.get("rel_uri"))
+                        result.failed += 1
+                        result.notes.append(f"{record.get('rel_uri')}: {type(exc).__name__}: {exc}")
+                vconn.commit()
+    finally:
+        vconn.close()
+    return result
 
 
 def _ingest_vault_source(
@@ -557,7 +740,9 @@ def sync_source(source: Source, run_id: str, *, force: bool = False, dry_run: bo
                     result.skipped_retracted += 1
                     continue
 
-                doc = extract.extract(path)
+                doc_id = doc_id_for(source.id, rel_uri)
+                plan = _page_plan(conn, doc_id, path) if path.suffix.lower() == ".pdf" else None
+                doc = extract.extract(path, plan=plan)
                 if doc is None:
                     continue
                 # Extractors only see one file, so they default rel_uri to the
@@ -566,6 +751,12 @@ def sync_source(source: Source, run_id: str, *, force: bool = False, dry_run: bo
                 # CLAUDE.md under a tree collide into one document, each
                 # silently overwriting the last.
                 doc.rel_uri = rel_uri
+                if plan is not None:
+                    _store_transcriptions(conn, doc_id, plan)
+                    _count_transcription(
+                        rel_uri, doc.extra.get("transcription"),
+                        {p: t.status for p, t in plan.produced.items()}, result,
+                    )
                 if doc.status == OCR_REQUIRED:
                     result.ocr_required += 1
                     state.upsert_document(
@@ -608,7 +799,12 @@ def sync_source(source: Source, run_id: str, *, force: bool = False, dry_run: bo
                 except qdrant_store.SweepRefused as exc:
                     result.notes.append(str(exc))
                     logger.warning("Sweep refused for %s: %s", source.id, exc)
-            else:
+            elif source.type != INBOX:
+                # Not for a vault INBOX: its files are consumed into encrypted
+                # blobs as they are ingested, so an empty drop folder is the
+                # normal state, not a disappearance. Sweeping it deleted every
+                # receipt, blob included, on the run after it was filed. A
+                # vault inbox document leaves only by retraction.
                 for row in vault_store.documents_missing_run(vconn, source.id, run_id):
                     vault_store.delete_document(vconn, row["doc_id"])
                     vault_blobs.delete(vconn, row["doc_id"])

@@ -48,6 +48,21 @@ Headings are found by FONT SIZE, from `pdftohtml -xml` (the same poppler that
 provides `pdftotext`). As text they are indistinguishable from table cells --
 `MONO Monophonic` looks like a heading -- but every manual indexed sets its
 headings at least 2pt above body text. See `_headings` for the filters.
+
+### Why contents pages are dropped
+
+A table of contents names every topic in the manual, so it matches every
+query on vocabulary and answers none of them. Worse, its entries are set at
+heading size, so the section split cut each line into a chunk of its own: 195
+of the first 1,182 chunks were contents lines, and "torque specification"
+returned two of them in the top three. `_is_contents_page` finds them by
+their dot leaders; see there for why that cannot catch a spec table.
+
+### Pages the text layer cannot serve
+
+Given a `transcribe.PagePlan`, pages without a text layer -- and pages a
+human named -- are read by the vision model instead, as markdown whose
+headings feed the same section split. See transcribe.py and ADR-030.
 """
 
 from __future__ import annotations
@@ -59,7 +74,9 @@ import subprocess
 from collections import Counter
 from pathlib import Path
 
+from app.pipeline import vlm
 from app.pipeline.chunker import TextBlock
+from app.pipeline.extract import transcribe
 from app.pipeline.extract.base import (
     BLOCKS,
     EMPTY,
@@ -76,6 +93,8 @@ MIN_CHARS_PER_PAGE = 100
 
 MODE_RAW = "raw"
 MODE_READING = "reading"
+# A page read by the vision model (see transcribe.py).
+MODE_VLM = "vlm"
 
 _TOKEN_RE = re.compile(r"\S+")
 
@@ -113,6 +132,19 @@ _PAGE_RE = re.compile(r"<page ([^>]*)>(.*?)</page>", re.DOTALL)
 _TEXT_RE = re.compile(r"<text ([^>]*)>(.*?)</text>", re.DOTALL)
 _TAG_RE = re.compile(r"<[^>]+>")
 _LETTER_RE = re.compile(r"[^\W\d_]")
+
+# A contents line ends in a dot leader -- packed (Arturia) or spaced (Dell) --
+# and a bare page number. Measured on the seven manuals indexed so far, every
+# page with such a line is a contents page and every contents page is at least
+# 80% of them; the rest are wrapped titles and running headers.
+_CONTENTS_LINE_RE = re.compile(r"(?:\.\s?){4,}\s*(\d{1,4})\s*$")
+CONTENTS_MIN_LINES = 5
+CONTENTS_MIN_SHARE = 0.5
+# `-raw` reads a two-column contents page in stored order, so its page numbers
+# only mostly ascend: Analog Lab's steps back three times in 36. A spec table
+# that happened to end its rows in bare integers would ascend about half the
+# time.
+CONTENTS_MIN_ASCENDING = 0.75
 
 _PAGES_RE = re.compile(r"^Pages:\s+(\d+)", re.MULTILINE)
 _TITLE_RE = re.compile(r"^Title:\s+(.+)$", re.MULTILINE)
@@ -182,6 +214,19 @@ def _respace(raw: str, reading: str) -> str:
         return " ".join(pieces) if pieces and len(pieces) > 1 else token
 
     return _TOKEN_RE.sub(lambda m: split(m.group()), raw)
+
+
+def _is_contents_page(text: str, page_count: int) -> bool:
+    """Whether a page is a table of contents: mostly leader lines whose page
+    numbers exist in the document and mostly ascend."""
+    lines = [line for line in text.splitlines() if line.strip()]
+    numbers = [int(m.group(1)) for line in lines if (m := _CONTENTS_LINE_RE.search(line))]
+    if len(numbers) < CONTENTS_MIN_LINES or len(numbers) < CONTENTS_MIN_SHARE * len(lines):
+        return False
+    if not all(1 <= n <= page_count for n in numbers):
+        return False
+    ascending = sum(a <= b for a, b in zip(numbers, numbers[1:]))
+    return ascending >= CONTENTS_MIN_ASCENDING * (len(numbers) - 1)
 
 
 def _squash(text: str) -> str:
@@ -334,13 +379,75 @@ def _split_sections(
     return sections, path
 
 
+def _transcribe_pages(
+    path: Path, layers: dict[int, tuple[str, str]], plan: transcribe.PagePlan, doc: RawDoc
+) -> dict[int, str]:
+    """Page -> markdown, for the pages the vision model read successfully.
+
+    Requested pages always go; pages without a text layer go automatically
+    unless more of them than `plan.max_auto_pages` would need a model call, in
+    which case none do and the document says so. Cached readings cost nothing
+    and are always used. After the first time the model cannot be reached,
+    the rest of the document is not attempted: every further page would wait
+    out the same failure.
+    """
+    requested = [p for p in layers if plan.is_requested(p)]
+    auto = [
+        p for p, (text, _) in layers.items()
+        if plan.auto and not plan.is_requested(p) and transcribe.lacks_text(text, MIN_CHARS_PER_PAGE)
+    ]
+    uncached = [p for p in auto if p not in plan.cached]
+    deferred = 0
+    if len(uncached) > plan.max_auto_pages:
+        deferred = len(uncached)
+        auto = [p for p in auto if p in plan.cached]
+
+    readings: dict[int, str] = {}
+    outcomes: dict[int, str] = {}
+    unreachable = False
+    for page in sorted({*requested, *auto}):
+        text, layer = layers[page]
+        result = plan.cached.get(page)
+        if result is None:
+            if unreachable:
+                outcomes[page] = transcribe.FAILED
+                continue
+            try:
+                # Only a page with a real text layer can be checked against it.
+                result = transcribe.transcribe(
+                    path, page, layer, check=not transcribe.lacks_text(text, MIN_CHARS_PER_PAGE)
+                )
+            except vlm.VisionError as exc:
+                logger.warning("%s page %d: vision model unavailable, not transcribed: %s", path.name, page, exc)
+                unreachable = True
+                outcomes[page] = transcribe.FAILED
+                continue
+            except (subprocess.SubprocessError, OSError, KeyError) as exc:
+                logger.warning("%s page %d: not transcribed: %s", path.name, page, exc)
+                outcomes[page] = transcribe.FAILED
+                continue
+            plan.produced[page] = result
+        if result.status == transcribe.REJECTED:
+            logger.warning("%s page %d: transcription rejected, %s", path.name, page, result.detail)
+        outcomes[page] = result.status
+        if result.status == transcribe.USED:
+            readings[page] = result.text
+
+    if outcomes or deferred:
+        doc.extra["transcription"] = {"pages": outcomes, "deferred": deferred}
+    return readings
+
+
 class PdfExtractor:
     name = "pdftotext"
 
     def matches(self, path: Path) -> bool:
         return path.suffix.lower() == ".pdf"
 
-    def extract(self, path: Path) -> RawDoc:
+    def extract(self, path: Path, plan: transcribe.PagePlan | None = None) -> RawDoc:
+        """Extract every page; with a `plan`, some pages come from the vision
+        model instead of the text layer. Without one, nothing is transcribed
+        -- the caller decides, because only it knows where the cache lives."""
         stat = path.stat()
         doc = RawDoc(
             rel_uri=path.name,
@@ -363,22 +470,40 @@ class PdfExtractor:
         headings = _headings(path)
         heading_path: list[tuple[int, str]] = []
 
-        blocks, total_chars = [], 0
+        # Every page's text layer first: the vision pass needs all of them to
+        # decide which pages to send, and to check what comes back.
+        layers: dict[int, tuple[str, str]] = {}
         for page in range(1, page_count + 1):
             raw = _page_text(path, page, MODE_RAW)
             reading = _page_text(path, page, MODE_READING)
-            text = _respace(raw, reading).strip()
+            layers[page] = (_respace(raw, reading).strip(), f"{raw}\n{reading}")
+        transcribed = _transcribe_pages(path, layers, plan, doc) if plan is not None else {}
+
+        blocks, total_chars, contents = [], 0, []
+        for page in range(1, page_count + 1):
+            if page in transcribed:
+                text, page_headings = transcribe.markdown_headings(transcribed[page])
+                mode = MODE_VLM
+            else:
+                text, page_headings, mode = layers[page][0], headings.get(page, []), MODE_RAW
 
             if not text:
                 continue
+            # Counted before the skip: a contents page has a text layer, and
+            # the scanned-PDF check below must not think otherwise.
             total_chars += len(text)
-            if not headings:
+            if _is_contents_page(text, page_count):
+                contents.append(page)
+                continue
+            if not headings and mode == MODE_RAW:
                 blocks.append(
                     TextBlock(text=text, kind="page", extra={"page": page, "extract_mode": MODE_RAW})
                 )
                 continue
 
-            sections, heading_path = _split_sections(text, headings.get(page, []), heading_path)
+            # A transcribed page brings its own headings, as markdown, so it
+            # is cut into sections even in a document with no font headings.
+            sections, heading_path = _split_sections(text, page_headings, heading_path)
             for body, crumb, starts in sections:
                 blocks.append(
                     TextBlock(
@@ -386,7 +511,7 @@ class PdfExtractor:
                         kind="section",
                         extra={
                             "page": page,
-                            "extract_mode": MODE_RAW,
+                            "extract_mode": mode,
                             "heading_path": crumb,
                             "section_start": starts,
                         },
@@ -394,18 +519,39 @@ class PdfExtractor:
                 )
 
         doc.extra["page_count"] = page_count
+        if contents:
+            logger.info("%s: skipped contents pages %s", path.name, contents)
 
+        info = doc.extra.get("transcription", {})
+        deferred = info.get("deferred", 0)
+        waiting = (
+            f"; {deferred} page(s) need the vision model, over the automatic limit of "
+            f"{plan.max_auto_pages} -- rag transcribe URI={path.name} PAGES=all"
+            if deferred and plan is not None else ""
+        )
+        # Every page without a text layer has been read or found blank, so a
+        # thin document is genuinely thin, not unread. Calling it
+        # ocr_required would keep it out of the index and buy its pages again
+        # on every run.
+        settled = (
+            plan is not None and plan.auto and not deferred
+            and transcribe.FAILED not in (info.get("pages") or {}).values()
+        )
         if not blocks:
+            if settled:
+                doc.status = EMPTY
+                doc.status_detail = f"no text on any of {page_count} pages, vision model included"
+                return doc
             doc.status = OCR_REQUIRED
-            doc.status_detail = f"no text layer across {page_count} pages"
+            doc.status_detail = f"no text layer across {page_count} pages{waiting}"
             return doc
 
         chars_per_page = total_chars / page_count
-        if chars_per_page < MIN_CHARS_PER_PAGE:
+        if chars_per_page < MIN_CHARS_PER_PAGE and not settled:
             doc.status = OCR_REQUIRED
             doc.status_detail = (
                 f"{chars_per_page:.0f} chars/page over {page_count} pages, below the "
-                f"{MIN_CHARS_PER_PAGE} threshold -- likely scanned"
+                f"{MIN_CHARS_PER_PAGE} threshold -- likely scanned{waiting}"
             )
             # Keep the blocks: a later OCR pass can merge rather than redo.
             doc.blocks = blocks

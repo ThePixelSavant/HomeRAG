@@ -139,6 +139,40 @@ that way. For an embedding-model change use `rebuild-index`.
 Lifecycle survives: a stale or superseded document stays flagged, and a
 retracted one stays out — its tombstone is left alone and it is not re-read.
 
+### `rag transcribe` — have the vision model read PDF pages
+
+```bash
+rag transcribe URI=<pdf> PAGES=12          # one page
+rag transcribe URI=<pdf> PAGES=3,5-7       # a list and a range
+rag transcribe URI=<pdf> PAGES=all         # every page
+rag transcribe URI=<pdf> CLEAR=1           # drop the request
+```
+
+Pages **without a text layer** (a scan, or a scanned insert in a digital
+manual) are read by `qwen3-vl` automatically on every ingest, up to
+`TRANSCRIBE_MAX_AUTO_PAGES` (30) per document. Use `transcribe` for the rest:
+
+- a page whose text layer mangles it — a whitespace-aligned table comes out as
+  loose columns; transcribed, it is a markdown table whose header is repeated
+  on every chunk;
+- a scanned document past the automatic limit — the ingest note and its
+  `ocr_required` status name the command to run.
+
+The request is remembered, so a changed file is read again on the same pages.
+The named pages' cached readings are dropped, so they are read fresh; then the
+document's source is ingested. Budget about a minute a page of CPU, more for a
+dense one.
+
+**A reading can be rejected.** On a page that has a text layer, every number
+the model writes must appear in that layer; otherwise the page keeps its
+`pdftotext` text and `rag status` lists it with the numbers that did not match.
+The same goes for a reading that never ends (the model looping) — it is cut off
+at `VISION_MAX_TOKENS` and rejected. Rejections are cached, so a bad page costs
+the model once; ask again with `transcribe` after a prompt or model change.
+
+Open tier only. A vault PDF is read automatically when it is dropped into a
+vault inbox (it is consumed once, so no cache is needed) and never otherwise.
+
 ---
 
 ## Finding things
@@ -382,6 +416,71 @@ transport, chat and message ids, and row count. Denials are recorded too. The
 query is stored as a hash, not as text, so the audit log is not a second
 unencrypted copy of what you searched for.
 
+### Receipts
+
+Drop a photo (`.jpg`, `.png`, `.webp`) or a PDF into `data/inbox/receipts/`
+and run `rag ingest`. The vision model reads it into the ledger, and the
+original is encrypted into the vault and deleted from the inbox. A PDF
+e-receipt with a text layer is read as text, which is much faster than a photo
+on this CPU. Every reading is checked: lines that don't sum, a total that
+doesn't add up, no date, an ambiguous date, or the same receipt filed twice
+all flag the row for review rather than being corrected or dropped.
+
+#### `rag ledger` — totals in exact cents
+
+```bash
+rag ledger [START=2026-09-01] [END=2026-09-30] [MERCHANT="Costco"] [CATEGORY=dining] [GROUP=month|merchant|category]
+```
+
+The same query `query_ledger` gives a model, run as you: sums come from SQL
+over integer cents, never from reading text. `needs_review_count` says how many
+rows in the total are flagged. `MERCHANT` matches part of the name in any case,
+so `MERCHANT="batteries plus"` finds "Batteries Plus Bulbs #583".
+
+#### `rag ledger-review` — what needs a human
+
+```bash
+rag ledger-review [JSON=1]
+```
+
+```
+  #7  2026-09-24  Blue Bottle Coffee  12.62 USD  [dining]
+      from coffee-b.jpg
+      - possible duplicate of coffee-a.jpg
+```
+
+#### `rag ledger-resolve` — correct or confirm
+
+```bash
+rag ledger-resolve ID=7                              # confirm the reading as it is
+rag ledger-resolve ID=7 TOTAL=12.62 DATE=2026-09-24  # correct it
+rag ledger-resolve ID=9 MERCHANT="Costco" CATEGORY=groceries
+```
+
+Values are read with the same rules as the model's: `TOTAL=$1,234.56` or
+`TOTAL=12,49` both work, and a date in the future or before 2000 is refused.
+The flag is cleared, the old notes are kept after the resolution, and the
+change is recorded in the audit log. A duplicate you do not want is removed by
+retracting its document: `rag vault-lifecycle URI=coffee-b.jpg STATE=retracted
+REASON="duplicate"`, which also deletes its ledger row.
+
+#### `rag receipts-reread` — read filed receipts again
+
+```bash
+rag receipts-reread                              # every filed receipt
+rag receipts-reread URI=IMG20260927113610.jpg    # just one
+```
+
+For when the reading improves — a better prompt, a better model — after the
+inbox copies were consumed. It asks for the passphrase, decrypts each original
+into memory (`/dev/shm`), has the keyless parse worker read it exactly as a new
+receipt, and replaces that receipt's chunks and ledger row. Flags are
+re-evaluated from scratch; a row you resolved by hand is re-read like any other,
+so re-resolve it if the reading still needs you.
+
+There is no MCP tool for any of this: a model may not decide that a figure is
+right.
+
 ---
 
 ## Health and maintenance
@@ -397,9 +496,10 @@ Reachability, paths, embedding fingerprint, per-source file counts, backlogs.
 a failure, because that is also what a broken mount looks like and the
 distinction matters to the sweep.
 
-Vault state reads `not readable from here (by design)` — the control socket is
-`0600` and owned by the vault container's user, while the worker now runs
-unprivileged. Use `rag vault-status`.
+Vault state reads `not readable from here (by design)` — the control socket
+exists only inside the vault container, on a private tmpfs, so the worker (which
+parses untrusted files) cannot reach it. Use `rag vault-status`, which runs
+there.
 
 ### `rag eval` — measure retrieval
 

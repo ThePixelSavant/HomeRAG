@@ -643,3 +643,201 @@ retracted tombstone, so reindex re-indexed a retracted document.
 
 **Revisit if:** a manual sets headings at body size (bold only), or the eval
 set grows enough to tune the floor honestly.
+
+## ADR-026: Receipts are read by a vision model and validated in Python
+
+**Chosen:** Images and PDFs filed under `receipts` are sent to the vision
+model (Qwen3-VL-30B-A3B, served beside Coder-Next by llama-server's router)
+for a JSON reading, constrained by a schema. Amounts and dates come back as
+printed strings; `app/receipts.py` turns them into integer cents and ISO dates
+and checks the arithmetic. Anything doubtful is written to the ledger with
+`needs_review` and its reasons; possible duplicates are flagged, never merged.
+
+**Rejected:** Asking the model for numbers; trusting the parse worker's own
+verdict; dropping receipts that fail validation; auto-merging duplicates; an
+MCP tool for review.
+
+- **Strings, not numbers.** A model asked for a number rounds, drops a sign,
+  or quietly adds things up. Asked to copy text, it only has to read.
+  `Decimal` does the rest, and an ambiguous `03/04/25` is read where the
+  ambiguity can be noted.
+- **The parent validates.** The reading crosses from the process that parsed
+  attacker-influenced bytes; the key-holding parent re-runs `validate` on the
+  raw reading. The JSON schema guarantees the answer parses, not that it is
+  right.
+- **Flag, don't drop.** A receipt whose total cannot be read gets a row at 0
+  cents, flagged. Leaving it out would make a total silently short;
+  `needs_review_count` on every `query_ledger` response is how a total says
+  how far to trust it.
+- **Duplicates are a human's call.** The same receipt photographed twice and
+  two identical coffees on one day look the same. The match is loose on
+  merchant (first word) because the date and amount already matched exactly.
+- **Text before pixels.** An e-receipt's text layer is sent as text: a few
+  hundred tokens against ~1,500 image tokens plus the projector's encode, all
+  prefilled on the CPU. Photos are scaled to 1536 px on the long edge; full
+  size would be ~15k tokens.
+- **Skip unchanged by file hash, before the model is called.** Every other
+  document compares extracted text, but here extraction IS the model call.
+
+Measured on real receipts (2026-09-27), Qwen3-VL-30B-A3B Q4_K_M on the CPU:
+
+| Receipt | Input | Prompt tokens | Time |
+|---|---|---:|---:|
+| Anthropic e-receipt (PDF) | text layer | 306 | 6.5 s |
+| Batteries Plus (PDF) | text layer | 582 | 34 s (525 tokens of line items written) |
+| Batteries Plus (phone photo, 7.8 MB) | image | 1,820 | 62 s |
+
+Every total, date, merchant and card read correctly. Validation flagged what
+was actually wrong: the photo read a "Reg Price 10.00" as a charge on a line
+billed at 0.00 (items + tax 217.31 against a total of 207.31), and the photo
+was flagged as a duplicate of the PDF of the same receipt. Two changes came
+from that run:
+
+- **The prompt depends on the input.** Rules for a text layer's wrapped
+  descriptions fixed the PDF exactly (7 items summing to the printed subtotal)
+  and, sent with the photo, stripped every amount from it. `prompt_for` now
+  gives images only the charged-amount rule.
+- **A USD receipt's `4/12/2026` is month/day by convention** and is no longer
+  flagged as ambiguous.
+
+`rag receipts-reread` exists because the reading improves after the inbox copies
+are consumed: it decrypts each original into `/dev/shm`, reads it in the keyless
+parse worker, and replaces the rows by doc_id.
+
+**Revisit if:** receipts arrive in volume enough that a reading's cost per page
+matters more than its accuracy, or a smaller vision model turns out good
+enough.
+
+## ADR-027: The vault CLI runs inside the vault server
+
+**Chosen:** Every `vaultctl` command that reads or writes the vault (list,
+query, ledger, lifecycle, ledger review) is an action on `control.sock`,
+executed in the server process that holds the key.
+
+**Rejected:** Calling the service layer from `vaultctl` directly.
+
+`vaultctl` runs through `docker exec`, which starts a fresh interpreter with an
+empty key agent. Called directly, those commands could only ever report
+"sealed". They were written that way, passed their tests (which unlock in the
+same process), and never worked against the running stack. Unlock, approve
+and audit already went over the socket, which is why they did.
+
+The socket is `0600` and owned by the vault container's user, who can already
+approve a model's request or read the server's memory, so the new actions
+widen nothing. Gate 3 is skipped for them as it always was for the CLI: a human
+is at the terminal.
+
+## ADR-028: The vault runs as the host user; its socket stays private
+
+**Chosen:** `mcp-vault` runs as uid 1000 like every other container, owns the
+vault files, and keeps its control socket on a tmpfs inside its own container
+(`/run/vault/control.sock`), not on the `./data/vault` bind mount.
+
+**Rejected:** Leaving the vault on root and sharing its files through a group;
+running the worker as root for vault runs; keeping the socket on the shared
+directory.
+
+When the other containers moved to 1000, the vault stayed root, deliberately,
+because re-owning its secret material deserved its own sealed, backed-up step.
+The cost turned out to be total: the worker must read `vault.salt` and
+`vault.verifier` and write `vault.db`, and root-owned `0600` files made every
+vault-tier ingest fail. The migration was done sealed, with a backup and
+checksums before and after, and only ownership changed.
+
+Sharing a uid removes file permissions as the line between the vault and the
+worker, and the worker mounts `./data/vault`. The socket reads the vault while
+it is unlocked, so it moved off that mount to where only processes inside the
+vault container can reach it. Every legitimate caller already runs there
+(`docker exec`). A group would have kept root in the vault but added the moving
+part declined earlier; root for the worker would have put root back into the
+process that parses untrusted receipts.
+
+## ADR-029: Qwen3-VL reads receipts; Coder-Next answers chats
+
+**Chosen:** llama-server's router serves both models. `qwen3-vl` reads
+receipts at ingest. RAG chats run on `qwen3-coder-next`, with Open WebUI's
+built-in tools off.
+
+**Rejected:** Qwen3-VL for everything, which was the first plan, made on a
+measurement that hid the problem.
+
+On a short 1,500-token prompt Qwen3-VL was faster (86 vs 63 tokens/s prefill).
+In a real multi-step RAG chat it was not:
+
+- Its chat template writes each tool as a full JSON schema, about three times
+  Coder-Next's rendering: a new chat's first step was ~8k tokens against 2.5k.
+- It uses full attention in every layer, so each step slows as the chat grows:
+  18 tokens/s by 14k tokens. Coder-Next is mostly linear-attention layers and
+  held about 60 at a similar length.
+- It chose tools worse. Asked how to set the SH-01A to poly mode, it searched
+  once with a phrasing known to miss, then answered confidently and wrongly
+  ("no dedicated polysynth mode"). Coder-Next found the Assign Mode section.
+
+Receipts are short, single-turn and visual, which is what it is good at, and its
+reading was accurate on every receipt tried.
+
+Separately: Open WebUI creates new presets with built-in tools, web search,
+image generation, code interpreter, terminal and memory all ON. Their tool
+definitions took a Coder-Next chat's first step from 2.5k to 9k tokens (134 s).
+Turn them off in RAG presets, and put `Today is {{CURRENT_DATE}}` in the system
+prompt: without the built-in timestamp tool the model guessed the year and
+queried 2023.
+
+**Revisit if:** a GPU makes long-context prefill cheap, or a vision model with
+linear attention and a compact tool format appears.
+
+## ADR-030: PDF pages the text layer cannot serve are read by the vision model
+
+**Chosen:** `qwen3-vl` transcribes a PDF page to markdown when the page has no
+text layer (automatically, per page, at most `transcribe_max_auto_pages` = 30
+per document) or when a human names it with `rag transcribe`. On a page that
+has a text layer, every number in the transcription must also be in that
+layer, or the reading is rejected and the page keeps its `pdftotext` text.
+Readings are cached in `rag.db` by document, page and file hash.
+
+**Rejected:**
+
+- *An automatic detector for whitespace-aligned tables.* ADR-024 measured the
+  whitespace signal and found no threshold separating a table from
+  two-column prose. A human who reads a bad answer is a better trigger than a
+  guess that misfires on the prose this pipeline was just fixed for.
+- *Trusting the transcription.* The model reads well — on the IntelliFlo spec
+  page all 33 numbers (23 distinct) matched the text layer — but a misread torque
+  figure is cited with full confidence. Same rule as receipts: the model
+  copies, Python checks. Scans have nothing to check against; that is the
+  residual risk, and the reason citations stay verbatim.
+- *The document-level `ocr_required` average as the trigger.* A digital manual
+  with a few scanned pages averaged above 100 chars/page, and those pages were
+  silently dropped.
+- *Re-reading on a prompt or model change.* A corpus costs hours of CPU. The
+  prompt version is recorded; `rag transcribe` re-reads on purpose.
+- *Transcribing vault sources indexed in place.* The cache would have to live
+  in the vault, which the keyless parse worker must never open (ADR-019), so
+  every run would buy every page again. Vault *inbox* files are consumed once
+  and are read; other vault PDFs keep `ocr_required`.
+
+Measured on the live stack, 2026-10-19 (IntelliFlo install guide, page 30,
+spec tables plus two figures; 1187×1536 render, ~1,900 prompt tokens):
+
+- **About 60 s a page** on this CPU, ~300 output tokens.
+- **Asked for JSON, the model looped.** It wrote the whole page correctly and
+  then emitted `\n` inside the string until stopped — 6,000+ tokens. And the
+  llama-server router does **not** cancel generation when the client
+  disconnects, so a client timeout freed nothing; the slot had to be stopped
+  with `POST /models/unload`. Hence plain-text answers, and `max_tokens` on
+  every vision request, receipts included. A reading that hits the cap is
+  rejected and cached, never retried.
+- **Figure markers.** The model writes `<!-- Image (54, 284, 924, 465) -->`
+  for each picture, whatever the prompt says. Unstripped, the coordinates
+  rejected an exact reading (and would have been indexed as numbers on a
+  scan). HTML comments are removed before the check.
+
+The cache is written only after a scan of what it stores — the indexed text
+and the rejection details, which quote numbers — and survives
+`rebuild-index`, which would otherwise re-buy every page. Retraction and the
+sweep delete it.
+
+**Revisit if:** a GPU makes a page cost seconds (then re-reading on a prompt
+change becomes reasonable), a whitespace-table detector proves out against
+`make eval`, or a vault source indexed in place needs scans read — that needs
+a cache the parent writes and passes into the worker's job.

@@ -19,7 +19,8 @@ Defended against:
 | A model deciding on its own to read financial records | Per-request approval, granted at a TTY |
 | A prompt-injected model exfiltrating vault data | Same, plus a typed confirmation naming the principal and query |
 | Another container on `llm-net` reaching vault data | `mcp-vault` is not on `llm-net`; identity gate; no unlock endpoint on the network |
-| A compromised `mcp-server` ARP-spoofing the identity assertion | `mcp-vault` sits on a separate `vault-net` bridge with only `open-webui`; `mcp-server` runs `cap_drop: [NET_RAW]` |
+| A compromised `mcp-server` replaying the identity assertion it is handed every turn | It cannot reach `mcp-vault`: separate `vault-net` bridge with only `open-webui`; verified by `~/Dev/LLM/scripts/check-vault-net.sh` |
+| A compromised `mcp-server` ARP-spoofing the `open-webui` ↔ `mcp-vault` hop | Not in that broadcast domain; `mcp-server` runs `cap_drop: [NET_RAW]` |
 | Someone reading `vault.db` off the disk or a backup | SQLCipher AES-256; the key is never on disk |
 | Sensitive text recovered from a vector | Sensitive data never gets a Qdrant vector at all |
 | A misfiled sensitive document reaching the open tier | Pre-embedding sensitivity scan → quarantine |
@@ -70,6 +71,57 @@ that holds the design up is that a passphrase is typed at a terminal and a
 model has no terminal, so vault-tier sources simply do not ingest unattended.
 They queue until someone runs `make ingest` interactively.
 
+### Receipts are read by a model, and the model's answer is not trusted
+
+A receipt in a vault inbox is decoded (Pillow, `pdftoppm`) in the keyless
+parse worker, like any other vault document, and then sent to llama-server's
+vision model. Three consequences:
+
+- **The receipt leaves the worker, over `llm-net`.** It is plaintext HTTP on a
+  Docker bridge to a process shared with Open WebUI's chats, and it stays in
+  that process's KV cache until evicted. Every container on `llm-net` drops
+  `NET_RAW` (`mcp-server` and `ingestion-worker` here; `llama-server` and
+  `open-webui` in `~/Dev/LLM`), so no peer can ARP-spoof onto the path.
+  llama-server's `/slots` reports token counts, never prompt text — checked,
+  not assumed.
+- **The answer is constrained in shape, not in truth.** A JSON schema compiles
+  into a grammar, so the reading always parses; nothing makes it correct. The
+  key-holding parent re-runs validation itself on the raw reading
+  (`app/receipts.py`) rather than trusting any verdict computed in the process
+  that read the attacker-influenced file. Amounts are parsed from the printed
+  strings with `Decimal`. A card number is cut to its last four before it can
+  reach the ledger, and the text is redacted before it is embedded.
+- **A doubtful figure is flagged, never silently summed.** `needs_review` rows
+  still count in totals, and `needs_review_count` on every `query_ledger`
+  response says how much of a total to distrust. Clearing a flag is a human's
+  call at a terminal (`rag ledger-resolve`). There is no MCP tool for it, for
+  the same reason there is none for lifecycle.
+
+### The vault CLI runs inside the vault server
+
+`vaultctl` is started by `docker exec`, in a fresh interpreter whose key agent
+is empty. So every command that reads or writes the vault — list, query,
+ledger, lifecycle, ledger review — runs in the server process as an action
+on `control.sock`, as unlock and approve always did. Gate 1 applies as usual;
+gate 3 is skipped because a human is at the terminal.
+
+**Where the socket lives is the boundary.** It is on a tmpfs private to the
+vault container (`/run/vault`), not on the `./data/vault` bind mount. Since
+2026-09-27 the vault and the ingestion worker run as the same uid (1000), so
+file permissions no longer separate them; the mount does. The worker needs
+the vault's files, never its socket, and a socket on the shared directory would
+be reachable from the parse worker — the process that reads untrusted files —
+while the vault is unlocked. Nothing is widened for the one caller that does
+reach it: anything that can `docker exec` into `mcp-vault` could already
+approve a model's pending request, or read the server's memory outright.
+
+**Re-reading filed receipts** (`rag receipts-reread`) is the one path that
+decrypts an original outside a query. The ingestion worker holds the key,
+decrypts each original into a `0700` directory on `/dev/shm` (memory, not disk),
+and hands it to the keyless parse worker exactly like an inbox drop; the
+plaintext is deleted when the batch finishes. The key-holder still never
+parses.
+
 ### Network segmentation
 
 `mcp-vault` is deliberately **not** on `llm-net`. It sits on `vault-net`, a
@@ -84,9 +136,28 @@ documents is its whole job. Left on the same bridge it could have sat between
 of a reply to a request you had legitimately approved.
 
 Segmenting is a stronger guarantee than encrypting traffic the attacker can
-still see, and it costs no certificates. `mcp-vault` makes no outbound network
-calls and `vaultctl` reaches it over the bind-mounted `control.sock`, so it
-loses nothing by being unreachable from everything else.
+still see, and it costs no certificates.
+
+**The assertion is not secret from `mcp-server`.** Open WebUI attaches it to
+every tool-server connection (`utils/tools.py`, 0.13.0) and to every
+llama-server request, so `mcp-server` receives a valid one each turn without
+spoofing anything. `identity.verify` checks signature, issuer, `exp`, email
+and role — not audience, and not single use — so any holder can present it
+until it expires (300 s). Open WebUI mints one token per user, not per
+destination, so an audience claim is not available to check. Reachability is
+therefore the control: **no container other than `open-webui` and
+`mcp-vault` may join `vault-net`**, and neither may lend its network
+namespace (`network_mode: container:`). Approval (gate 3) still stands behind
+this, but it should not be the only thing.
+
+Since 2026-11-07 `vault-net` is `internal` (no gateway: `mcp-vault` has no
+route off the host), `mcp-vault` publishes no host port and runs with
+`cap_drop: [ALL]` and `no-new-privileges`, and `make up` fails if
+`~/Dev/LLM/scripts/check-vault-net.sh` does. The host itself can still reach
+`mcp-vault` on its bridge IP; on the host the boundary is the docker group and
+`.env`, not the network. `mcp-vault` makes no outbound network
+calls and `vaultctl` reaches it over `control.sock` from inside the same
+container, so it loses nothing by being unreachable from everything else.
 
 `mcp-server` and `ingestion-worker` additionally run with
 `cap_drop: [NET_RAW]`, which removes the spoofing primitive from the two

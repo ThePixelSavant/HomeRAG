@@ -99,6 +99,7 @@ rag warm-cache                   # download and load the embedding models
 rag add <file> <domain> [--move]
 rag ingest [SOURCE=id] [DOMAIN=d] [FORCE=1]
 rag reindex SOURCE=id            # after changing chunking or extraction
+rag transcribe URI=<pdf> PAGES=3,5-7|all [CLEAR=1]   # vision-read PDF pages the text layer mangles
 rag eval                         # rank known answers: hit@1 / hit@3 / MRR
 rag list [--domain d] [--match x] [--all]
 rag query "..." [--limit N] [--domain d] [--stale] [--superseded] [--dense]
@@ -120,6 +121,10 @@ rag vault-query Q="..."          # human path: no approval needed
 rag vault-lifecycle URI=<uri> STATE=<state> [REASON="..."]
 rag approve [CODE=123456]        # release one pending model request
 rag vault-audit [N=50]
+rag ledger [START=] [END=] [GROUP=month]   # receipt totals, exact cents
+rag ledger-review                # receipts flagged for a human
+rag ledger-resolve ID=n [TOTAL=] [DATE=] [MERCHANT=] [CATEGORY=]
+rag receipts-reread [URI=...]    # re-read filed receipts from their encrypted originals
 
 rag test
 rag help                         # shorthands plus every Makefile target
@@ -247,12 +252,17 @@ WEBUI_AUTH=true
 WEBUI_SECRET_KEY=<openssl rand -hex 32>                     # stable, or registrations are wiped
 ENABLE_FORWARD_USER_INFO_HEADERS=true
 FORWARD_USER_INFO_HEADER_JWT_SECRET=<openssl rand -hex 32>  # must equal VAULT_JWT_SECRET here
-ENABLE_PLUGINS=false
+ENABLE_PLUGINS=true     # since Open WebUI 0.12.0, false also disables MCP servers
+ENABLE_TOOLS=false      # what ENABLE_PLUGINS=false used to do, minus the tool servers
+ENABLE_FUNCTIONS=false
 ```
+
+(The three plugin switches are set in `~/Dev/LLM/docker-compose.yml`; see
+`~/Dev/LLM/docs/open-webui.md`.)
 
 Leave `FORWARD_USER_INFO_HEADER_JWT_EXPIRES_SECONDS` at its 300 s default.
 Open WebUI mints the assertion once, when it opens the MCP session at the start
-of a turn (`utils/middleware.py:connect_mcp_server`), and reuses it for every
+of a turn (`utils/tools.py:connect_mcp_server` in 0.13.0), and reuses it for every
 tool call in that turn — so the clock starts *before* the model prefills and
 generates. A shorter window expires mid-turn on a long prompt and surfaces as
 an intermittent `IDENTITY_REJECTED` that looks exactly like a mismatched
@@ -270,13 +280,13 @@ Three settings decide whether this works at all, and getting any of them wrong
 produces a silent failure that looks like the model simply choosing not to
 search:
 
-- **Auth: None.** The dialog defaults to Bearer. Left blank, Open WebUI sends
-  `Authorization: Bearer ` — an empty header value, which `h11` rejects. The
-  connection dies before a byte is sent, so **the MCP server logs nothing at
-  all**, indistinguishable from never being called.
-- **Connection type: MCP, not OpenAPI.** OpenAPI is the dialog default and is
-  dispatched through a path that `ENABLE_PLUGINS=false` has already emptied.
-  The symptom is `GET /mcp/openapi.json → 404` in the server log.
+- **Auth: None.** The dialog defaults to Bearer. Left blank, Open WebUI 0.11.x
+  sent `Authorization: Bearer ` — an empty header value, which `h11` rejects,
+  so the connection died before a byte was sent and **the MCP server logged
+  nothing at all**. 0.13.0 omits the empty header; None is still correct.
+- **Connection type: MCP, not OpenAPI.** OpenAPI is the dialog default; it
+  fetches a spec from `/mcp`, which serves JSON-RPC, and gets no tools. The
+  symptom is `GET /mcp/openapi.json → 404` in the server log.
 - **Turn off the model preset's `builtin_tools` capability** — the master
   switch, not a category under it. Otherwise ~15 of Open WebUI's own tools
   compete with these 8, and the model will search its (empty) Knowledge feature

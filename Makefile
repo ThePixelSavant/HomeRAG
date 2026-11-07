@@ -8,16 +8,23 @@ WORKER     = $(COMPOSE) run --rm ingestion-worker
 # key into its own memory and then exit.
 VAULTEXEC  = docker exec -it mcp-vault python -m app.vaultctl
 VAULTRUN   = docker exec mcp-vault python -m app.vaultctl
+# Owned by ~/Dev/LLM, which owns vault-net. Fails if anything but open-webui
+# and mcp-vault can reach the vault.
+VAULTNET_CHECK = $(HOME)/Dev/LLM/scripts/check-vault-net.sh
 
-.PHONY: up down logs build doctor warm-cache ingest reindex add query eval status \
+.PHONY: up check-vault-net down logs build doctor warm-cache ingest reindex transcribe add query eval status \
         rebuild-index review-quarantine supersede stale retract restore lifecycle list \
         unlock lock vault-status vault-query vault-list vault-lifecycle \
-        approve vault-audit test
+        approve vault-audit ledger ledger-review ledger-resolve receipts-reread test
 
 ## --- stack ---------------------------------------------------------------
 
-up:                     ## Start qdrant, mcp-server and mcp-vault
+up:                     ## Start qdrant, mcp-server and mcp-vault, then verify vault-net
 	$(COMPOSE) up -d
+	@$(VAULTNET_CHECK) || { echo "vault-net isolation FAILED -- see above; stop with 'make down' and fix before use"; exit 1; }
+
+check-vault-net:        ## Verify only open-webui and mcp-vault can reach the vault
+	@$(VAULTNET_CHECK)
 
 down:
 	$(COMPOSE) down
@@ -42,6 +49,10 @@ ingest:                 ## Sync all sources (SOURCE=id DOMAIN=d FORCE=1 to narro
 reindex:                ## Force a full re-embed of one source: make reindex SOURCE=id
 	@test -n "$(SOURCE)" || { echo "usage: make reindex SOURCE=<source-id>"; exit 2; }
 	$(WORKER) reindex $(SOURCE)
+
+transcribe:             ## Vision-read PDF pages: make transcribe URI=<uri> PAGES=3,5-7|all  (or CLEAR=1)
+	@test -n "$(URI)" -a -n "$(PAGES)$(CLEAR)" || { echo "usage: make transcribe URI=<uri> PAGES=3,5-7|all  (or CLEAR=1)"; exit 2; }
+	$(WORKER) transcribe "$(URI)" $(if $(CLEAR),--clear,--pages "$(PAGES)") $(if $(DOMAIN),--domain $(DOMAIN))
 
 # The worker mounts ./data, LOCAL_DOCS_PATH and CLAUDE_PROJECTS_PATH and
 # nothing else, so a file anywhere else on the host -- ~/Documents, ~/Downloads,
@@ -144,6 +155,22 @@ vault-lifecycle:        ## make vault-lifecycle URI=<uri> STATE=retracted REASON
 	@test -n "$(URI)" -a -n "$(STATE)" || { echo 'usage: make vault-lifecycle URI=<uri> STATE=<state> [REASON="..."]'; exit 2; }
 	@$(VAULTRUN) lifecycle "$(URI)" $(STATE) $(if $(REASON),--reason "$(REASON)") \
 	  $(if $(NEW),--superseded-by "$(NEW)") $(if $(DOMAIN),--domain $(DOMAIN))
+
+ledger:                 ## Receipt totals in exact cents: make ledger [START=] [END=] [MERCHANT=] [GROUP=month]
+	@$(VAULTRUN) ledger $(if $(START),--start $(START)) $(if $(END),--end $(END)) \
+	  $(if $(MERCHANT),--merchant "$(MERCHANT)") $(if $(CATEGORY),--category $(CATEGORY)) \
+	  $(if $(GROUP),--group-by $(GROUP)) $(if $(LIMIT),--limit $(LIMIT))
+
+receipts-reread:        ## Re-read filed receipts from their encrypted originals: make receipts-reread [URI=IMG_1.jpg]
+	$(WORKER) receipts-reread $(if $(URI),--uri "$(URI)")
+
+ledger-review:          ## Ledger rows flagged for a human, with why
+	@$(VAULTRUN) ledger-review $(if $(JSON),--json)
+
+ledger-resolve:         ## Correct/confirm a flagged row: make ledger-resolve ID=n [TOTAL=] [DATE=] [MERCHANT=] [CATEGORY=]
+	@test -n "$(ID)" || { echo 'usage: make ledger-resolve ID=<n> [TOTAL=12.49] [DATE=2026-09-24] [MERCHANT=..] [CATEGORY=..]'; exit 2; }
+	@$(VAULTRUN) ledger-resolve $(ID) $(if $(TOTAL),--total "$(TOTAL)") $(if $(DATE),--date "$(DATE)") \
+	  $(if $(MERCHANT),--merchant "$(MERCHANT)") $(if $(CATEGORY),--category $(CATEGORY))
 
 approve:                ## Release one pending request: make approve CODE=123456
 	@$(VAULTEXEC) approve $(if $(CODE),--code $(CODE))

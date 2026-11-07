@@ -231,6 +231,51 @@ def replace_chunks(conn, doc_id: str, rows: list[dict]) -> None:
     )
 
 
+LEDGER_COLUMNS = (
+    "doc_id", "source_id", "domain", "txn_date", "merchant", "amount_cents", "currency",
+    "category", "payment_method", "description", "line_items", "confidence",
+    "extracted_by", "needs_review", "review_notes", "created_at",
+)
+
+
+def replace_ledger(conn, doc_id: str, rows: list[dict]) -> None:
+    """Replace a document's ledger rows wholesale, as replace_chunks does.
+
+    Re-indexing a receipt must replace its row, not add a second one: a
+    doubled row doubles the receipt in every sum.
+    """
+    conn.execute("DELETE FROM ledger WHERE doc_id=?", (doc_id,))
+    if rows:
+        columns = ", ".join(LEDGER_COLUMNS)
+        values = ", ".join(f":{c}" for c in LEDGER_COLUMNS)
+        conn.executemany(
+            f"INSERT INTO ledger ({columns}) VALUES ({values})",
+            [{c: row.get(c) for c in LEDGER_COLUMNS} | {"doc_id": doc_id} for row in rows],
+        )
+
+
+def ledger_matches(conn, txn_date: str, amount_cents: int, *, exclude_doc_id: str):
+    """Other documents' ledger rows on the same date for the same amount.
+
+    The candidates for a duplicate. Merchant names are compared by the caller,
+    loosely, because the same shop reads as "COSTCO WHOLESALE #123" on one
+    photo and "Costco" on the next.
+    """
+    return conn.execute(
+        """SELECT l.id, l.doc_id, l.merchant, d.uri
+           FROM ledger l JOIN documents d ON d.doc_id = l.doc_id
+           WHERE l.txn_date=? AND l.amount_cents=? AND l.doc_id<>?""",
+        (txn_date, amount_cents, exclude_doc_id),
+    ).fetchall()
+
+
+def ledger_for_review(conn):
+    return conn.execute(
+        """SELECT l.*, d.uri FROM ledger l JOIN documents d ON d.doc_id = l.doc_id
+           WHERE l.needs_review=1 ORDER BY l.txn_date, l.id"""
+    ).fetchall()
+
+
 def delete_document(conn, doc_id: str) -> None:
     old = [r["chunk_id"] for r in conn.execute(
         "SELECT chunk_id FROM chunks WHERE doc_id=?", (doc_id,)
@@ -238,6 +283,7 @@ def delete_document(conn, doc_id: str) -> None:
     if old:
         conn.executemany("DELETE FROM chunks_fts WHERE chunk_id=?", [(c,) for c in old])
     conn.execute("DELETE FROM chunks WHERE doc_id=?", (doc_id,))
+    conn.execute("DELETE FROM ledger WHERE doc_id=?", (doc_id,))
     conn.execute("DELETE FROM documents WHERE doc_id=?", (doc_id,))
 
 
@@ -315,7 +361,9 @@ def due_for_review(conn, today: str):
 
 
 def retract(conn, doc_id: str, reason: str) -> None:
-    """Drop the chunks, vectors and FTS rows; keep the row as a tombstone.
+    """Drop the chunks, vectors, FTS rows and ledger rows; keep the row as a
+    tombstone. A retracted receipt whose ledger row survived would go on
+    counting in every total `query_ledger` returns.
 
     The encrypted blob is the caller's job -- app/vault/blobs.py owns that file
     and this module deliberately does not touch the filesystem.
@@ -326,6 +374,7 @@ def retract(conn, doc_id: str, reason: str) -> None:
     if old:
         conn.executemany("DELETE FROM chunks_fts WHERE chunk_id=?", [(c,) for c in old])
     conn.execute("DELETE FROM chunks WHERE doc_id=?", (doc_id,))
+    conn.execute("DELETE FROM ledger WHERE doc_id=?", (doc_id,))
     conn.execute("UPDATE documents SET chunk_count=0 WHERE doc_id=?", (doc_id,))
     set_lifecycle(conn, doc_id, documents.RETRACTED, reason=reason)
 

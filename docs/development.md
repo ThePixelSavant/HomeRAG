@@ -73,6 +73,12 @@ between a component and its environment.
 | `rag reindex` deleted the retracted tombstone and every lifecycle flag, so it re-indexed a retracted document | No test ran reindex over a source holding a non-active document |
 | `FORCE=1` was assumed to re-embed; a chunking-only change reached the index as nothing | Tests call the chunker directly; the skip is in `sync`'s hash check |
 | RRF ties came back in arbitrary order, so `make eval` moved between runs | Unit tests assert on scores, not on the order of equal ones |
+| A vault inbox's second run deleted every receipt it had filed, blob included: the files are consumed into the vault, and the sweep read the empty folder as disappearance | No test ran a vault inbox twice |
+| `vault-list`, `vault-query`, `vault-lifecycle` and `ledger` could only ever say "sealed": `vaultctl` runs in a fresh `docker exec` interpreter with an empty key agent | Tests unlock and call the CLI in one process |
+| Every vault ingest failed once the worker ran as 1000: `mcp-vault` stayed root and its `0600` files shut the worker out | Tests create the vault as the user running them |
+| `query_ledger` matched merchants exactly; the model asked for "Batteries Plus" and the receipt said "Batteries Plus Bulbs #583" | Test fixtures used the exact stored name |
+| A prompt rule that fixed a PDF's line items stripped every amount from a photo of the same receipt | The model was stubbed; only a real model shows how it reads an instruction |
+| A partly changed document lost its unchanged chunks to the sweep: only re-embedded chunks got the run marker, and `touch_doc` ran only when nothing changed. Found when page transcription added a cover chunk to two manuals and the sweep refused 367 "stale" points; `RAG/CLAUDE.md`, `RAG/README.md` and the XPS manual had already lost 4 chunks between them | Tests stubbed Qdrant out entirely, so no test held per-point run markers; `test_a_partly_changed_document_keeps_its_unchanged_chunks` now does |
 
 The grant-expiry and approval-binding bugs share a shape worth naming: **a test that acts instantly cannot
 catch a window that is too short for a human**, and **a test that reuses one

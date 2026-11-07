@@ -19,6 +19,7 @@ from app.pipeline.extract.base import (
 )
 from app.pipeline.extract.pdf import PdfExtractor
 from app.pipeline.extract.text import TextExtractor
+from app.pipeline.extract.transcribe import PagePlan
 from app.pipeline.extract.transcript import TranscriptExtractor
 
 # Order matters only where suffixes overlap, which today they do not.
@@ -36,11 +37,15 @@ def dispatch(path: Path) -> Extractor | None:
     return None
 
 
-def extract(path: Path) -> RawDoc | None:
+def extract(path: Path, plan: PagePlan | None = None) -> RawDoc | None:
+    """`plan` lets a PDF's pages be read by the vision model; other
+    extractors have no pages and ignore it."""
     extractor = dispatch(path)
     if extractor is None:
         return None
     try:
+        if plan is not None and isinstance(extractor, PdfExtractor):
+            return extractor.extract(path, plan=plan)
         return extractor.extract(path)
     except Exception as exc:  # noqa: BLE001 - one bad file must not kill a run
         return RawDoc(
@@ -61,6 +66,7 @@ __all__ = [
     "OK",
     "TEXT",
     "Extractor",
+    "PagePlan",
     "RawDoc",
     "PdfExtractor",
     "TextExtractor",

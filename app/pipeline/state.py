@@ -100,6 +100,33 @@ CREATE TABLE IF NOT EXISTS quarantine (
     resolution  TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_quarantine_open ON quarantine(resolved_at);
+
+-- Pages read by the vision model (ADR-030). A cache, because a page costs a
+-- minute of CPU: keyed by document and page, valid only while the file still
+-- hashes to `file_hash`. Deliberately NOT cleared by rebuild-index, which
+-- deletes `documents` rows and would otherwise re-buy every page. A rejected
+-- reading keeps no text -- it never passed the check, so it is never indexed.
+CREATE TABLE IF NOT EXISTS page_transcriptions (
+    doc_id         TEXT NOT NULL,
+    page           INTEGER NOT NULL,
+    file_hash      TEXT NOT NULL,
+    status         TEXT NOT NULL,
+    text           TEXT NOT NULL DEFAULT '',
+    detail         TEXT,
+    model          TEXT NOT NULL,
+    prompt_version INTEGER NOT NULL,
+    created_at     TEXT NOT NULL,
+    PRIMARY KEY (doc_id, page)
+);
+
+-- Pages a human asked to have transcribed (`rag transcribe`): "3,5-7" or
+-- "all". Kept apart from the cache so that a changed file is read again on the
+-- same pages without being asked twice.
+CREATE TABLE IF NOT EXISTS transcription_requests (
+    doc_id       TEXT PRIMARY KEY,
+    pages        TEXT NOT NULL,
+    requested_at TEXT NOT NULL
+);
 """
 
 # Columns added after the first release. `CREATE TABLE IF NOT EXISTS` is a
@@ -333,6 +360,8 @@ def touch_document(conn: sqlite3.Connection, doc_id: str, run_id: str) -> None:
 
 def delete_document(conn: sqlite3.Connection, doc_id: str) -> None:
     conn.execute("DELETE FROM documents WHERE doc_id=?", (doc_id,))
+    conn.execute("DELETE FROM page_transcriptions WHERE doc_id=?", (doc_id,))
+    conn.execute("DELETE FROM transcription_requests WHERE doc_id=?", (doc_id,))
 
 
 def documents_missing_run(
@@ -440,6 +469,90 @@ def tombstones(conn: sqlite3.Connection, source_id: str | None = None) -> dict[s
         sql += " AND source_id=?"
         params.append(source_id)
     return {row["doc_id"]: row for row in conn.execute(sql, params)}
+
+
+# --------------------------------------------------------------------------
+# Page transcriptions (ADR-030)
+# --------------------------------------------------------------------------
+
+
+def transcriptions(conn: sqlite3.Connection, doc_id: str, file_hash: str) -> list[sqlite3.Row]:
+    """Cached readings still valid for this exact file."""
+    return conn.execute(
+        "SELECT * FROM page_transcriptions WHERE doc_id=? AND file_hash=? ORDER BY page",
+        (doc_id, file_hash),
+    ).fetchall()
+
+
+def save_transcriptions(
+    conn: sqlite3.Connection, doc_id: str, file_hash: str, readings: dict[int, tuple[str, str, str | None]],
+    *, model: str, prompt_version: int,
+) -> None:
+    """`readings` is {page: (status, text, detail)}. Replaces those pages."""
+    now = utcnow()
+    conn.executemany(
+        "INSERT OR REPLACE INTO page_transcriptions "
+        "(doc_id, page, file_hash, status, text, detail, model, prompt_version, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            (doc_id, page, file_hash, status, text, detail, model, prompt_version, now)
+            for page, (status, text, detail) in sorted(readings.items())
+        ],
+    )
+
+
+def delete_transcriptions(conn: sqlite3.Connection, doc_id: str, pages: set[int] | None = None) -> None:
+    """Forget cached readings: all of a document's, or just these pages."""
+    if pages is None:
+        conn.execute("DELETE FROM page_transcriptions WHERE doc_id=?", (doc_id,))
+    else:
+        conn.executemany(
+            "DELETE FROM page_transcriptions WHERE doc_id=? AND page=?",
+            [(doc_id, page) for page in sorted(pages)],
+        )
+
+
+def transcription_request(conn: sqlite3.Connection, doc_id: str) -> str | None:
+    row = conn.execute(
+        "SELECT pages FROM transcription_requests WHERE doc_id=?", (doc_id,)
+    ).fetchone()
+    return row["pages"] if row else None
+
+
+def set_transcription_request(conn: sqlite3.Connection, doc_id: str, pages: str | None) -> None:
+    """Record which pages a human wants read by the model; None clears it."""
+    if pages is None:
+        conn.execute("DELETE FROM transcription_requests WHERE doc_id=?", (doc_id,))
+        return
+    conn.execute(
+        "INSERT INTO transcription_requests (doc_id, pages, requested_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(doc_id) DO UPDATE SET pages=excluded.pages, requested_at=excluded.requested_at",
+        (doc_id, pages, utcnow()),
+    )
+
+
+def transcription_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    """Cached readings by outcome; {} against a database that predates them,
+    for the same reason as count_by_lifecycle."""
+    try:
+        rows = conn.execute(
+            "SELECT status, COUNT(*) n FROM page_transcriptions GROUP BY status"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return {}
+    return {r["status"]: r["n"] for r in rows}
+
+
+def rejected_transcriptions(conn: sqlite3.Connection, limit: int = 5) -> list[sqlite3.Row]:
+    try:
+        return conn.execute(
+            "SELECT d.uri, t.page, t.detail FROM page_transcriptions t "
+            "JOIN documents d USING (doc_id) WHERE t.status='rejected' "
+            "ORDER BY d.uri, t.page LIMIT ?",
+            (limit,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
 
 
 def flagged_pages(conn: sqlite3.Connection) -> list[sqlite3.Row]:

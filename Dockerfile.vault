@@ -1,19 +1,18 @@
 FROM python:3.12-slim
 
-# DELIBERATELY still root, unlike Dockerfile.ingest and Dockerfile.mcp.
+# Runs as the host user, like the other three. It was the last one on root, and
+# that broke vault ingestion outright: the unprivileged ingestion worker must
+# read vault.salt and vault.verifier and write vault.db and blobs/, and
+# root-owned 0600 files shut it out.
 #
-# Not an oversight and not a judgement that root is fine here -- this is the
-# process holding the key, so it has the strongest case of the three. The
-# blocker is migration, not design: vault.salt, vault.verifier, vault.db and
-# control.sock on the live volume are root-owned 0600, and switching the user
-# means chown'ing files that are the vault's secret material while the thing
-# is in daily use. That is a change to make deliberately, with the vault
-# sealed and a backup taken, not as a side effect of tidying file ownership.
-#
-# To do it later: seal the vault, back up ./data/vault, chown -R to RAG_UID,
-# add the same groupadd/useradd/USER block as Dockerfile.mcp, and confirm
-# `make unlock` still derives the key and the control socket is still
-# reachable from `docker exec`.
+# The control socket does NOT move with the files. It lives on a tmpfs inside
+# this container (/run/vault, see docker-compose.yml), not on the ./data/vault
+# bind mount: the worker runs as the same uid and mounts that directory, so a
+# socket there would be reachable from the process that parses untrusted
+# files. `make unlock` and every vault CLI command run here via `docker exec`.
+ARG RAG_UID=1000
+ARG RAG_GID=1000
+
 WORKDIR /app
 
 ENV FASTEMBED_CACHE_PATH=/models
@@ -23,6 +22,13 @@ RUN pip install --no-cache-dir -r requirements.vault.txt
 
 COPY app/ app/
 COPY sources.yaml .
+
+RUN groupadd -g "$RAG_GID" app \
+    && useradd -u "$RAG_UID" -g "$RAG_GID" -m -s /usr/sbin/nologin app \
+    && mkdir -p /models \
+    && chown -R "$RAG_UID:$RAG_GID" /app /models
+
+USER app
 
 RUN python -c "from app.pipeline.embedder import warm_cache; warm_cache()"
 

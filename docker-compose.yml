@@ -5,9 +5,12 @@ services:
   #
   # Pinned by digest: snapshot restore requires a matching minor version, so a
   # silent `latest` bump between taking a backup and restoring it breaks the
-  # migration. Rollback digest: (record the previous digest here on upgrade)
+  # migration. Current: v1.20.0.
+  # Rollback digest: sha256:057ee3a8da769fe7310dd3537b4dc7583bf87a95ce8ac43c0af5a46bc580d1fc
+  # (v1.19.0); storage backup from before the bump is
+  # data/qdrant-backup-2026-11-05-pre-1.20.tar.gz.
   qdrant:
-    image: qdrant/qdrant@sha256:057ee3a8da769fe7310dd3537b4dc7583bf87a95ce8ac43c0af5a46bc580d1fc
+    image: qdrant/qdrant@sha256:9bfc89f9914fc14876a88c05270685921a55b8877b254a98bcc1cc2f0a424cd2
     container_name: qdrant
     restart: unless-stopped
     # Non-root. Third-party image, so this is set here rather than baked in.
@@ -90,25 +93,55 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.vault
+      args:
+        RAG_UID: ${RAG_UID:-1000}
+        RAG_GID: ${RAG_GID:-1000}
     container_name: mcp-vault
     restart: unless-stopped
-    ports:
-      - "127.0.0.1:${VAULT_PORT:-8001}:8001"
+    user: "${RAG_UID:-1000}:${RAG_GID:-1000}"
+    # NO `ports:`. Nothing used the published 127.0.0.1:8001 (Open WebUI
+    # connects over vault-net, vaultctl over control.sock), and vault-net is
+    # `internal`, which refuses to publish ports anyway. VAULT_PORT in .env is
+    # still the port the server listens on inside the container.
+    #
+    # This does NOT hide the vault from the host: the host has an address on
+    # every bridge and can still connect to mcp-vault's vault-net IP directly.
+    # The network boundary is container-to-container. On the host the boundary
+    # is the docker group (docker exec reaches vaultctl) and .env (mode 600,
+    # holds the JWT secret) -- anything with those needs no network path.
+    #
+    # Unprivileged uid, high port, no raw sockets: it needs no capabilities.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     env_file:
       - .env
     environment:
       VAULT_DB_PATH: /data/vault/vault.db
       VAULT_BLOBS_PATH: /data/vault/blobs
+      VAULT_CONTROL_SOCKET: /run/vault/control.sock
       STATE_DB_PATH: /data/state/rag.db
       DATA_ROOT: /data
     volumes:
       - ./data/vault:/data/vault
       - ./data/state:/data/state:ro
+    # The control socket lives here, in memory, private to this container --
+    # NOT on ./data/vault. The ingestion worker runs as the same uid and mounts
+    # that directory; a socket there would be reachable from the process that
+    # parses untrusted files. `make unlock` and the vault CLI run in this
+    # container via `docker exec`, so they are the only callers.
+    tmpfs:
+      - /run/vault:mode=0700,uid=${RAG_UID:-1000},gid=${RAG_GID:-1000}
     # Deliberately NOT on llm-net. vault-net carries only this container and
     # open-webui, so mcp-server is not in the same broadcast domain and cannot
     # ARP-spoof the hop the identity assertion travels on. This service makes no
     # outbound network calls, and vaultctl reaches it over control.sock, so
     # being unreachable from everything else costs nothing.
+    #
+    # Nothing else may join vault-net or use `network_mode: container:mcp-vault`:
+    # every tool server holds a valid identity assertion each turn, so
+    # reachability is the boundary. `make up` runs check-vault-net.sh.
     networks:
       - vault-net
     logging:
