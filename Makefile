@@ -15,11 +15,11 @@ VAULTNET_CHECK = $(HOME)/Dev/LLM/scripts/check-vault-net.sh
 .PHONY: up check-vault-net down logs build doctor warm-cache ingest reindex transcribe add query eval status \
         rebuild-index review-quarantine supersede stale retract restore lifecycle list \
         unlock lock vault-status vault-query vault-list vault-lifecycle \
-        approve vault-audit ledger ledger-review ledger-resolve receipts-reread test
+        approve vault-audit ledger ledger-review ledger-resolve receipts-reread admin test
 
 ## --- stack ---------------------------------------------------------------
 
-up:                     ## Start qdrant, mcp-server and mcp-vault, then verify vault-net
+up:                     ## Start qdrant, mcp-server, mcp-vault and rag-admin, then verify vault-net
 	$(COMPOSE) up -d
 	@$(VAULTNET_CHECK) || { echo "vault-net isolation FAILED -- see above; stop with 'make down' and fix before use"; exit 1; }
 
@@ -76,14 +76,21 @@ query:                  ## Search the open tier: make query Q="priming the pump"
 	$(WORKER) query "$(Q)" $(if $(DOMAINS),--domains $(DOMAINS)) $(if $(LIMIT),--limit $(LIMIT)) \
 	  $(if $(SUPERSEDED),--include-superseded) $(if $(STALE),--include-stale) $(ARGS)
 
-eval:                   ## Rank known answers in search: make eval [FILE=tests/retrieval/q.yaml] [JSON=1]
-	$(WORKER) eval $(if $(FILE),--file $(FILE)) $(if $(JSON),--json) $(ARGS)
+eval:                   ## Rank known answers in search, and record the run: make eval [FILE=tests/retrieval/q.yaml] [JSON=1] [NORECORD=1]
+	$(WORKER) eval $(if $(FILE),--file $(FILE)) $(if $(JSON),--json) $(if $(NORECORD),--no-record) $(ARGS)
 
 status:                 ## Index health, per-domain counts, vault state, backlogs
 	$(WORKER) status $(if $(JSON),--json)
 
 review-quarantine:      ## Documents the sensitivity scan held back from indexing
 	$(WORKER) review-quarantine
+
+# The read-only dashboard served by rag-admin (ADR-031). Log in with
+# REPORT_TOKEN from .env.
+admin:                  ## Open the read-only dashboard in a browser
+	@echo "http://127.0.0.1:$(or $(ADMIN_PORT),8090)/  (log in with REPORT_TOKEN from .env)"
+	@test -n "$(REPORT_TOKEN)" || echo "REPORT_TOKEN is not set in .env: every page will answer 404"
+	@command -v xdg-open >/dev/null && xdg-open "http://127.0.0.1:$(or $(ADMIN_PORT),8090)/" >/dev/null 2>&1 || true
 
 # Drops the collection and re-embeds every open-tier document. Required after
 # changing EMBED_MODEL or EMBED_DIM. The vault is NOT touched.

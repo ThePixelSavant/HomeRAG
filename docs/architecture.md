@@ -28,13 +28,16 @@ the Makefile.
                               └─▶ vault.db (write, needs unlock) ─┘
 
    make unlock ──▶ unix socket ──▶ mcp-vault (the process holding the key)
+
+   you (browser) ──▶ rag-admin :8090 ──▶ rag.db (read-only) + Qdrant (read-only key)
+                     read-only dashboard, open tier only (ADR-031)
 ```
 
-Three containers plus a one-shot worker, on two external networks owned by
+Four containers plus a one-shot worker, on two external networks owned by
 `~/Dev/LLM`; this stack joins them rather than creating them.
 
-- `llm-net` — `qdrant` and `mcp-server`, alongside `open-webui` and
-  `llama-server`.
+- `llm-net` — `qdrant`, `mcp-server` and `rag-admin`, alongside `open-webui`
+  and `llama-server`.
 - `vault-net` — `mcp-vault` and `open-webui`, and nothing else. `mcp-server`
   parses untrusted documents and is deliberately not in the broadcast domain
   the identity assertion travels through. See
@@ -262,6 +265,7 @@ a boilerplate paragraph.
 | ↳ `parse_worker` child | no | no | **never opened** | **no** — and it imports nothing that could hold one |
 | `mcp-server` | read | **read-only mount** | **not mounted** | no |
 | `mcp-vault` | not installed | read-only mount | read-write | **yes** |
+| `rag-admin` | read (read-only key) | **read-only mount** | **not mounted** | no |
 
 The worker's parent holds a key because it writes the encrypted store, so
 extraction was moved out of it: every parser reads attacker-influenced bytes,
@@ -281,6 +285,7 @@ process with them. See
 | `ingestion-worker` | **1000:1000** | Opens untrusted input, and writes bind-mounted `./data` — as root it left host files nobody could edit without sudo |
 | `mcp-server` | **1000:1000** | The HTTP surface the model talks to |
 | `mcp-vault` | **1000:1000** | Holds the key. Migrated 2026-09-27, sealed and backed up first |
+| `rag-admin` | **1000:1000** | Read-only dashboard; `cap_drop: [ALL]`, `no-new-privileges` |
 | `qdrant` | **1000:1000** | Set in compose, since it is a third-party image |
 
 `RAG_UID`/`RAG_GID` are build args and compose variables, defaulting to

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import hashlib
 import json
 import logging
 import shutil
@@ -609,7 +610,8 @@ def cmd_eval(args) -> int:
     hit@3 is the number that matters, and the size of those 3 is what gets
     prefilled. Ranks are searched to `--depth` so a near miss shows as one.
     """
-    questions = yaml.safe_load(Path(args.file).read_text())["questions"]
+    raw = Path(args.file).read_bytes()
+    questions = yaml.safe_load(raw)["questions"]
     rows = []
     for q in questions:
         hits = qdrant_store.search(q["question"], limit=args.depth, domains=domains_in(Tier.OPEN))
@@ -628,6 +630,19 @@ def cmd_eval(args) -> int:
         f"mrr@{args.depth}": sum(1 / r["rank"] for r in rows if r["rank"]) / total,
         "mean_top3_chars": round(sum(r["top3_chars"] for r in rows) / total),
     }
+    # Kept so the admin report can chart retrieval over time (ADR-031). The
+    # file hash marks where the question set changed, so a jump across it is
+    # not mistaken for a retrieval change.
+    if not args.no_record:
+        with state.writer() as conn:
+            state.record_eval(
+                conn,
+                questions_file=args.file,
+                questions_hash=hashlib.sha256(raw).hexdigest(),
+                depth=args.depth,
+                summary=summary,
+                per_question=rows,
+            )
     if args.json:
         print(json.dumps({"summary": summary, "questions": rows}, indent=2))
         return 0
@@ -806,6 +821,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--file", default="tests/retrieval/questions.yaml")
     p.add_argument("--depth", type=int, default=10, help="how far down to look for the answer")
     p.add_argument("--json", action="store_true")
+    p.add_argument("--no-record", action="store_true",
+                   help="do not save this run to the eval history")
     p.set_defaults(func=cmd_eval)
 
     p = sub.add_parser("status")

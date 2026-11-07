@@ -13,6 +13,7 @@ lies about what is actually retrievable.
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 import uuid
@@ -126,6 +127,26 @@ CREATE TABLE IF NOT EXISTS transcription_requests (
     doc_id       TEXT PRIMARY KEY,
     pages        TEXT NOT NULL,
     requested_at TEXT NOT NULL
+);
+
+-- One row per `make eval` (ADR-031), so retrieval quality has a history the
+-- admin report can chart. `questions_hash` marks where the question set
+-- changed: a jump across one is not a retrieval change. A new table is safe
+-- here (unlike a new column), but readers must still tolerate its absence.
+CREATE TABLE IF NOT EXISTS eval_runs (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_at              TEXT NOT NULL,
+    questions_file      TEXT NOT NULL,
+    questions_hash      TEXT NOT NULL,
+    embed_model         TEXT NOT NULL,
+    chunk_target_tokens INTEGER NOT NULL,
+    depth               INTEGER NOT NULL,
+    questions           INTEGER NOT NULL,
+    hit1                REAL NOT NULL,
+    hit3                REAL NOT NULL,
+    mrr                 REAL NOT NULL,
+    mean_top3_chars     INTEGER NOT NULL,
+    per_question        TEXT NOT NULL
 );
 """
 
@@ -609,3 +630,48 @@ def resolve_quarantine(conn: sqlite3.Connection, quarantine_id: int, resolution:
         "UPDATE quarantine SET resolved_at=?, resolution=? WHERE id=?",
         (utcnow(), resolution, quarantine_id),
     )
+
+
+# --------------------------------------------------------------------------
+# Retrieval eval history (ADR-031)
+# --------------------------------------------------------------------------
+
+
+def record_eval(
+    conn: sqlite3.Connection,
+    *,
+    questions_file: str,
+    questions_hash: str,
+    depth: int,
+    summary: dict,
+    per_question: list[dict],
+) -> None:
+    conn.execute(
+        "INSERT INTO eval_runs (run_at, questions_file, questions_hash, embed_model, "
+        "chunk_target_tokens, depth, questions, hit1, hit3, mrr, mean_top3_chars, per_question) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            utcnow(), questions_file, questions_hash, settings.embed_model,
+            settings.chunk_target_tokens, depth, summary["questions"],
+            summary["hit@1"], summary["hit@3"], summary[f"mrr@{depth}"],
+            summary["mean_top3_chars"], json.dumps(per_question),
+        ),
+    )
+
+
+def eval_history(conn: sqlite3.Connection, limit: int = 50) -> list[dict]:
+    """Recorded eval runs, oldest first; [] against a database that predates
+    the table, for the same reason as count_by_lifecycle."""
+    try:
+        rows = conn.execute(
+            "SELECT * FROM (SELECT * FROM eval_runs ORDER BY id DESC LIMIT ?) ORDER BY id",
+            (limit,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    out = []
+    for row in rows:
+        entry = dict(row)
+        entry["per_question"] = json.loads(entry["per_question"])
+        out.append(entry)
+    return out

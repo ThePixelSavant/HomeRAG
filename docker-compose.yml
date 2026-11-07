@@ -87,6 +87,61 @@ services:
       options:
         tag: "mcp-server"
 
+  # Read-only admin dashboard, opened in a browser at http://127.0.0.1:8090
+  # (ADR-031). Not inside Open WebUI: a pipe there needs ENABLE_FUNCTIONS, and
+  # ~/Dev/LLM keeps that off. Same image as mcp-server, different command.
+  # Kept out of mcp-server so the model-facing server is unchanged and this
+  # gets only what it needs: state read-only, Qdrant's read-only key, llm-net
+  # (to reach Qdrant), no capabilities.
+  rag-admin:
+    build:
+      context: .
+      dockerfile: Dockerfile.mcp
+      args:
+        RAG_UID: ${RAG_UID:-1000}
+        RAG_GID: ${RAG_GID:-1000}
+    container_name: rag-admin
+    restart: unless-stopped
+    user: "${RAG_UID:-1000}:${RAG_GID:-1000}"
+    command: ["python", "-m", "app.admin_server"]
+    # Host loopback only. The app also refuses any Host header but
+    # 127.0.0.1/localhost, and every page needs REPORT_TOKEN.
+    ports:
+      - "127.0.0.1:${ADMIN_PORT:-8090}:8080"
+    # NOT env_file: .env, which would hand this container the vault JWT secret
+    # it has no use for. Only what the report reads.
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_API_KEY: ${QDRANT_READ_ONLY_API_KEY:-}
+      COLLECTION_NAME: ${COLLECTION_NAME:-docs}
+      EMBED_MODEL: ${EMBED_MODEL:-BAAI/bge-small-en-v1.5}
+      EMBED_DIM: ${EMBED_DIM:-384}
+      CHUNK_TARGET_TOKENS: ${CHUNK_TARGET_TOKENS:-400}
+      STATE_DB_PATH: /data/state/rag.db
+      REPORT_TOKEN: ${REPORT_TOKEN:-}
+    volumes:
+      - ./data/state:/data/state:ro
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    # Never vault-net: see mcp-vault below.
+    networks:
+      - llm-net
+    logging:
+      driver: journald
+      options:
+        tag: "rag-admin"
+
   # Vault MCP server. Separate process so the in-memory key never shares an
   # address space with the untrusted open-tier query surface.
   mcp-vault:

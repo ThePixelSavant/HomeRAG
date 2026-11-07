@@ -46,6 +46,7 @@ make lifecycle / supersede / stale / retract / restore
 make unlock / lock / vault-list / vault-query / vault-lifecycle / approve / vault-audit
 make ledger / ledger-review / ledger-resolve   # receipts, in exact cents
 make receipts-reread [URI=...]   # re-read filed receipts from their encrypted originals
+make admin                 # read-only dashboard, 127.0.0.1:8090 (ADR-031)
 make test                  # pytest inside the worker image
 ```
 
@@ -340,6 +341,27 @@ images scaled to 1536 px. A markdown note under `receipts` is still text.
   (a reading costs minutes of CPU); other documents compare extracted text.
 - Review is CLI only (`rag ledger-review`, `rag ledger-resolve`), for the same
   reason lifecycle is.
+
+### The admin dashboard
+
+`rag-admin` (ADR-031): [app/admin_server.py](app/admin_server.py) serves
+[app/report.py](app/report.py)'s data, rendered by
+[app/report_html.py](app/report_html.py), at `127.0.0.1:8090`.
+
+- **Read-only.** State mounted `:ro`, Qdrant's read-only key. Lifecycle,
+  uploads and quarantine decisions stay CLI-only. A write path needs its own ADR.
+- **Open tier only, filtered in `report.py`**, not trusted to the data:
+  `rag.db` records vault inbox sources (`inbox:receipts`) and run notes carry
+  their errors. Run notes are never shown. New views must filter the same
+  way; `test_no_view_shows_vault_data` seeds vault rows to catch it.
+- **Not an Open WebUI Function.** Those run in the container holding the JWT
+  signing secret, on `vault-net`; `~/Dev/LLM` keeps `ENABLE_FUNCTIONS=false`.
+  Do not "integrate" the dashboard by turning them on.
+- **`REPORT_TOKEN`, not the identity assertion.** Under 32 characters means
+  404 everywhere. The container gets only the variables it reads, not
+  `env_file: .env`, so it never sees the vault JWT secret.
+- **No inline script** (CSP `script-src 'self'`): page JS goes in
+  `report_html.CHART_JS`, served from `/admin/static/`.
 
 ## Gotchas that have already bitten
 

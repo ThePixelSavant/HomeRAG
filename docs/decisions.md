@@ -841,3 +841,61 @@ sweep delete it.
 change becomes reasonable), a whitespace-table detector proves out against
 `make eval`, or a vault source indexed in place needs scans read — that needs
 a cache the parent writes and passes into the worker's job.
+
+## ADR-031: A read-only admin dashboard, in the browser, not in Open WebUI
+
+**Chosen:** a separate `rag-admin` container serves a read-only dashboard at
+`http://127.0.0.1:8090`: index overview, documents, lifecycle flags,
+quarantine and retrieval eval history. It is the `mcp-server` image with a
+different command (`python -m app.admin_server`). It mounts `data/state`
+read-only, holds Qdrant's read-only key, joins `llm-net` only to reach Qdrant,
+and drops every capability. One secret, `REPORT_TOKEN`, is typed once at
+`/login` (the browser then holds an HMAC of it in an `HttpOnly`,
+`SameSite=Strict` cookie) or sent as a bearer by `curl`. Unset or under 32
+characters, every page answers 404. `make eval` now records each run in
+`rag.db` (`eval_runs`) so there is a history to chart.
+
+**Rejected:**
+
+- *An Open WebUI pipe ("RAG Admin" model rendering the page as a chat
+  embed).* Built first, then dropped: pipes are Functions, and `~/Dev/LLM`
+  runs Open WebUI with `ENABLE_FUNCTIONS=false` because function code runs in
+  the container that holds `FORWARD_USER_INFO_HEADER_JWT_SECRET` and sits on
+  `vault-net`. Any function could mint a valid identity assertion for any
+  user and reach `mcp-vault`, leaving only gate 3 (a human's approval) in the
+  way. A dashboard is not worth that.
+- *Gating on Open WebUI's identity assertion and its `role` claim.* Every
+  tool server receives that assertion every turn, and it is accepted until
+  `exp`, so any of them could replay an admin's (see
+  [security-model.md](security-model.md#network-segmentation)).
+- *A route on `mcp-server`.* `MCPServer.custom_route` would have worked, but it
+  puts a second surface in the process the model talks to, and it is the wrong
+  home if write actions are ever added.
+- *PHP, Node, or Datasette over `rag.db`.* What is open-tier is decided by
+  `domains_in`, `tier_of` and the lifecycle rules in Python. A second
+  implementation that drifts is how a vault row ends up on a page, and
+  Datasette would show every table unfiltered. The security comes from the
+  container's mounts, network and token, not from the language.
+- *Write actions (supersede, retract, upload, quarantine decisions).* They
+  decide what the system believes or what gets embedded, and stay at the
+  terminal for the same reasons as lifecycle ([ADR-012](#adr-012-lifecycle-is-separate-from-status) and the missing MCP
+  lifecycle tool). Adding them here would need its own ADR: a writable mount,
+  CSRF protection, and the tier routing invariant on an HTTP path.
+
+**Open tier only, enforced in `app/report.py`:** documents filtered by
+`tier='open'` and an open domain; sources and quarantine rows by open domain.
+`rag.db` records the vault inbox sources (`inbox:receipts`) and a run's notes
+carry every failing source's error text, so runs are shown only through their
+open sources and their notes never. Quarantine shows rule names, not the
+finding detail. A test seeds vault rows next to open ones and checks that no
+view, HTML or JSON, mentions them.
+
+**The page:** no external scripts, fonts or styles (the stack is offline);
+one script, served by `rag-admin` itself, so the CSP is `script-src 'self'`
+with no inline script; `frame-ancestors 'none'`; `no-store`. The Host header
+must be `127.0.0.1` or `localhost`, which, with the cookie, blocks a
+DNS-rebinding page.
+
+**Revisit if:** the stack moves off this host (then TLS in front of
+`rag-admin`, as for every other port), or write actions are wanted from a
+browser.

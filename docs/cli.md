@@ -504,7 +504,7 @@ there.
 ### `rag eval` — measure retrieval
 
 ```bash
-rag eval [FILE=tests/retrieval/questions.yaml] [JSON=1]
+rag eval [FILE=tests/retrieval/questions.yaml] [JSON=1] [NORECORD=1]
 ```
 
 Asks each question in the file and reports the rank at which the known answer
@@ -516,6 +516,11 @@ results by default, and the size of those 3 is what the model must read.
 
 Run it before and after any change to extraction or chunking, and add a
 question whenever a real one comes back wrong.
+
+Each run is recorded in `rag.db` (`eval_runs`) with a hash of the question
+file, the embedding model and the chunk size, and charted in the dashboard
+(`rag admin`). A changed question set is marked on the chart rather than read
+as a retrieval change. `NORECORD=1` skips the record for a throwaway run.
 
 ```
   sh01a-poly       rank    2  top-3  4013 chars
@@ -532,6 +537,31 @@ rag status [JSON=1]
 
 Point counts per domain, documents by status and lifecycle, pages flagged
 for review, quarantine backlog, source history.
+
+### `rag admin` — the read-only dashboard
+
+```bash
+rag admin
+```
+
+Prints and opens `http://127.0.0.1:8090` (`ADMIN_PORT`), served by the
+`rag-admin` container that `rag up` starts. Log in with `REPORT_TOKEN` from
+`.env` (`openssl rand -hex 32`; under 32 characters and every page answers
+404). Closing the browser logs out.
+
+Views: **Overview** (chunks per domain, documents by status, sources and
+their last error, recent runs), **Documents** (the `rag list` inventory, with
+domain, name and lifecycle filters), **Lifecycle** (flags and reviews due),
+**Quarantine** (file, domain and rule names) and **Eval** (hit@1, hit@3 and
+MRR over recorded runs, and each question's rank against the previous run).
+
+Open tier only, and read-only: every change is still made here, at the
+terminal. The same data as JSON, for scripts:
+
+```bash
+curl -H "Authorization: Bearer $REPORT_TOKEN" \
+  'http://127.0.0.1:8090/admin/report?view=documents&domain=manuals&format=json'
+```
 
 ### `rag review-quarantine`
 
