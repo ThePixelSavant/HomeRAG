@@ -280,6 +280,13 @@ not HTTP — an unlock endpoint here would be reachable from every container on
 one-shot container cannot unlock the vault: it would derive a key into its own
 memory and exit.
 
+**Nothing joins `vault-net` except `mcp-vault` and `open-webui`** — no new
+service, sidecar or `network_mode: container:` here or in `~/Dev/LLM`. Open
+WebUI sends the identity assertion to every tool server, so `mcp-server` holds
+a valid one every turn, and the vault accepts any bearer until `exp` (no
+audience or one-time check). Being unable to reach `mcp-vault` is what stops
+it. Verify with `~/Dev/LLM/scripts/check-vault-net.sh`.
+
 Identity comes from Open WebUI's **signed HS256 assertion**, not the plaintext
 `X-OpenWebUI-User-*` headers, which anything reaching the port could set. There
 is no model identifier in any forwarded header, so keeping vault tools off

@@ -8,16 +8,23 @@ WORKER     = $(COMPOSE) run --rm ingestion-worker
 # key into its own memory and then exit.
 VAULTEXEC  = docker exec -it mcp-vault python -m app.vaultctl
 VAULTRUN   = docker exec mcp-vault python -m app.vaultctl
+# Owned by ~/Dev/LLM, which owns vault-net. Fails if anything but open-webui
+# and mcp-vault can reach the vault.
+VAULTNET_CHECK = $(HOME)/Dev/LLM/scripts/check-vault-net.sh
 
-.PHONY: up down logs build doctor warm-cache ingest reindex transcribe add query eval status \
+.PHONY: up check-vault-net down logs build doctor warm-cache ingest reindex transcribe add query eval status \
         rebuild-index review-quarantine supersede stale retract restore lifecycle list \
         unlock lock vault-status vault-query vault-list vault-lifecycle \
         approve vault-audit ledger ledger-review ledger-resolve receipts-reread test
 
 ## --- stack ---------------------------------------------------------------
 
-up:                     ## Start qdrant, mcp-server and mcp-vault
+up:                     ## Start qdrant, mcp-server and mcp-vault, then verify vault-net
 	$(COMPOSE) up -d
+	@$(VAULTNET_CHECK) || { echo "vault-net isolation FAILED -- see above; stop with 'make down' and fix before use"; exit 1; }
+
+check-vault-net:        ## Verify only open-webui and mcp-vault can reach the vault
+	@$(VAULTNET_CHECK)
 
 down:
 	$(COMPOSE) down

@@ -9,7 +9,8 @@ MCP session inside `process_chat_payload` and hands the token to
 turn. The clock therefore starts before the model prefills or generates a
 single token, which is why the assertion's lifetime is left at its 300s default
 -- a shorter window expires mid-turn on a long prompt and looks exactly like a
-mismatched secret. Verified against the running 0.11.0 image. Because it is signed with a secret only Open WebUI
+mismatched secret. Verified against 0.11.0 and again against 0.13.0
+(`utils/headers.py:_mint_forward_user_jwt`). Because it is signed with a secret only Open WebUI
 and this service share, it cannot be forged by anything else that can reach the
 port -- unlike the plaintext X-OpenWebUI-User-* headers, which anyone could set.
 
