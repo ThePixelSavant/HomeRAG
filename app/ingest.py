@@ -145,8 +145,25 @@ def cmd_doctor(args) -> int:
     if pending:
         rows.append((WARN, "quarantine", f"{pending} document(s) awaiting review (make review-quarantine)"))
 
+    rows.extend(_backup_rows())
+    failed = failed or any(r[0] == BAD for r in rows if r[1].startswith("backup"))
+
     _print_rows(rows)
     return 1 if failed else 0
+
+
+def _backup_rows() -> list[tuple[str, str, str]]:
+    with state.reader() as conn:
+        overview = state.backup_overview(conn)
+    if not any(b["kind"] == state.BACKUP_LOCAL for b in overview):
+        return [(WARN, "backup local", "never run -- `rag backup` (ADR-032)")]
+    rows = []
+    for b in overview:
+        level = {"ok": OK, "warn": WARN, "bad": BAD}[b["level"]]
+        when = f"{b['age_days']:.1f} days ago" if b["age_days"] is not None else "never"
+        detail = f"last good {when}" + (f"; {b['why']}" if b["why"] else "")
+        rows.append((level, f"backup {b['target']}", detail))
+    return rows
 
 
 # --------------------------------------------------------------------------
@@ -684,6 +701,7 @@ def cmd_status(args) -> int:
         payload["quarantined_open"] = len(state.open_quarantine(conn))
         payload["sources"] = [dict(r) for r in state.all_sources(conn)]
         payload["last_runs"] = [dict(r) for r in state.last_runs(conn, 5)]
+        payload["backups"] = state.backup_overview(conn)
 
     try:
         from app.vault import control
@@ -732,6 +750,16 @@ def cmd_status(args) -> int:
         print(f"vault: {'unlocked' if vault.get('unlocked') else 'SEALED'}  "
               f"docs={vault.get('documents','?')} chunks={vault.get('chunks_by_domain','?')} "
               f"ledger={vault.get('ledger_rows','?')} needs_review={vault.get('needs_review','?')}")
+    backups = payload["backups"]
+    if backups:
+        print("backups: " + "  ".join(
+            f"{b['target']} {b['status']}"
+            + (f" {b['age_days']:.1f}d ago" if b["age_days"] is not None else "")
+            + (" !!" if b["level"] != "ok" else "")
+            for b in backups
+        ))
+    else:
+        print("backups: none recorded -- `rag backup`")
     print("\nsources:")
     for row in payload["sources"]:
         print(f"  {row['source_id']:22s} {row['last_status'] or '-':8s} "
@@ -751,6 +779,142 @@ def cmd_rebuild_index(args) -> int:
         conn.execute("DELETE FROM documents WHERE tier=?", (Tier.OPEN.value,))
     qdrant_store.init_collection()
     return _run([s for s in all_sources() if not s.is_vault], force=True, dry_run=False)
+
+
+# --------------------------------------------------------------------------
+# backups (ADR-032)
+# --------------------------------------------------------------------------
+
+
+def _quiet_http() -> None:
+    # One line per Qdrant request buries the result in the journal.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+def cmd_backup(args) -> int:
+    from app import backup
+
+    _quiet_http()
+    try:
+        result = backup.create_bundle(keep=args.keep)
+    except (backup.BackupError, RuntimeError, OSError) as exc:
+        with state.writer() as conn:
+            state.record_backup(conn, kind=state.BACKUP_LOCAL, target="local", status="failed",
+                                detail=str(exc)[:500])
+        print(f"backup FAILED: {exc}", file=sys.stderr)
+        return 1
+    with state.writer() as conn:
+        state.record_backup(
+            conn, kind=state.BACKUP_LOCAL, target="local", status=result["status"],
+            bytes=result["bytes"], snapshot_id=result["bundle"], detail=result["detail"] or None,
+        )
+    print(f"{result['status']}: {result['bundle']}  {result['bytes'] / 1e6:.1f} MB")
+    if result["detail"]:
+        print(f"  {result['detail']}")
+    if result["pruned"]:
+        print(f"  pruned {len(result['pruned'])} older bundle(s)")
+    return 0 if result["status"] == "ok" else 1
+
+
+def cmd_backup_list(args) -> int:
+    from app import backup
+
+    _quiet_http()
+
+    bundles = backup.list_bundles()
+    if args.json:
+        print(json.dumps([json.loads((b / backup.MANIFEST).read_text()) for b in bundles], indent=2))
+        return 0
+    print(f"local bundles in {settings.backups_path}:")
+    if not bundles:
+        print("  none")
+    for b in bundles:
+        manifest = json.loads((b / backup.MANIFEST).read_text())
+        size = sum(f["size"] for f in manifest.get("files", {}).values())
+        partial = "  (no Qdrant snapshot)" if "error" in manifest.get("qdrant", {}) else ""
+        print(f"  {b.name}  {size / 1e6:7.1f} MB  {manifest.get('embed_model')}{partial}")
+    with state.reader() as conn:
+        overview = state.backup_overview(conn)
+    if overview:
+        print("\nlatest attempt per destination:")
+        for o in overview:
+            print(f"  {o['target']:12s} {o['status']:9s} {o['run_at']}  "
+                  f"{o['why'] or ''}")
+    return 0
+
+
+def cmd_backup_verify(args) -> int:
+    from app import backup
+
+    _quiet_http()
+
+    try:
+        bundle = backup.resolve_bundle(args.bundle)
+    except backup.BackupError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    passphrase = None
+    if args.vault:
+        if not sys.stdin.isatty():
+            print("--vault prompts for the passphrase and needs a terminal.", file=sys.stderr)
+            return 2
+        passphrase = getpass.getpass("Vault passphrase (to check this bundle opens): ")
+    print(f"verifying {bundle.name}")
+    ok, rows = backup.verify_bundle(bundle, passphrase=passphrase)
+    _print_rows(rows)
+    return 0 if ok else 1
+
+
+def cmd_backup_restore(args) -> int:
+    from app import backup
+
+    _quiet_http()
+
+    try:
+        bundle = backup.resolve_bundle(args.bundle)
+    except backup.BackupError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    ok, rows = backup.verify_bundle(bundle)
+    _print_rows(rows)
+    if not ok:
+        print("Refusing: this bundle does not verify.", file=sys.stderr)
+        return 1
+    manifest = json.loads((bundle / backup.MANIFEST).read_text())
+    print(f"\nRestore {bundle.name} (taken {manifest['created_at']}).")
+    for note in backup.compatibility(bundle):
+        print(f"  !! {note}")
+    print("  The current rag.db, vault and index are moved to data/pre-restore-<stamp>/, not deleted.")
+    print("  Anything ingested after the backup is lost from them; `rag ingest` re-reads what is")
+    print("  still on disk, but receipts filed since were consumed and exist only in that pre-restore copy.")
+    if not args.yes:
+        if not sys.stdin.isatty():
+            print("Not a terminal: pass --yes to confirm.", file=sys.stderr)
+            return 2
+        if input("Type 'restore' to continue: ").strip() != "restore":
+            print("aborted")
+            return 1
+    trees = {k: Path(v) for k, v in (("inbox", args.inbox), ("quarantine", args.quarantine),
+                                     ("archive", args.archive)) if v}
+    try:
+        for line in backup.restore_bundle(bundle, trees=trees):
+            print(f"  {line}")
+    except (backup.BackupError, RuntimeError) as exc:
+        print(f"restore FAILED: {exc}", file=sys.stderr)
+        return 1
+    print("\nNext: make up && make doctor, then `rag ingest` to catch up anything newer.")
+    return 0
+
+
+def cmd_backup_record(args) -> int:
+    """Called by scripts/rag-backup after each off-machine repo."""
+    with state.writer() as conn:
+        state.record_backup(
+            conn, kind=args.kind, target=args.target, status=args.status, bytes=args.bytes,
+            snapshot_id=args.snapshot_id, snapshot_count=args.snapshot_count,
+            max_age_days=args.max_age_days, detail=args.detail,
+        )
+    return 0
 
 
 def cmd_warm_cache(args) -> int:
@@ -878,6 +1042,38 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("lifecycle", help="documents that are not plainly active")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_lifecycle)
+
+    p = sub.add_parser("backup", help="take a local backup bundle (ADR-032)")
+    p.add_argument("--keep", type=int, help="local bundles to keep (default BACKUP_KEEP_LOCAL)")
+    p.set_defaults(func=cmd_backup)
+
+    p = sub.add_parser("backup-list", help="local bundles and the latest attempt per destination")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_backup_list)
+
+    p = sub.add_parser("backup-verify", help="check a bundle against its manifest")
+    p.add_argument("--bundle", help="bundle name or path (default: newest)")
+    p.add_argument("--vault", action="store_true", help="prompt for the passphrase and open the vault")
+    p.set_defaults(func=cmd_backup_verify)
+
+    p = sub.add_parser("backup-restore", help="restore a bundle (servers but qdrant stopped)")
+    p.add_argument("--bundle", required=True)
+    p.add_argument("--inbox")
+    p.add_argument("--quarantine")
+    p.add_argument("--archive")
+    p.add_argument("--yes", action="store_true")
+    p.set_defaults(func=cmd_backup_restore)
+
+    p = sub.add_parser("backup-record", help="record an off-machine attempt (scripts/rag-backup)")
+    p.add_argument("--kind", default=state.BACKUP_OFFSITE, choices=sorted(state.BACKUP_MAX_AGE_DAYS))
+    p.add_argument("--target", required=True)
+    p.add_argument("--status", required=True, choices=state.BACKUP_STATUSES)
+    p.add_argument("--bytes", type=int)
+    p.add_argument("--snapshot-id")
+    p.add_argument("--snapshot-count", type=int)
+    p.add_argument("--max-age-days", type=float)
+    p.add_argument("--detail")
+    p.set_defaults(func=cmd_backup_record)
 
     # Vault commands live in app/vaultctl.py: they run inside the vault
     # container, which deliberately lacks this module's qdrant dependency.

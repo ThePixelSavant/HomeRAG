@@ -11,11 +11,16 @@ VAULTRUN   = docker exec mcp-vault python -m app.vaultctl
 # Owned by ~/Dev/LLM, which owns vault-net. Fails if anything but open-webui
 # and mcp-vault can reach the vault.
 VAULTNET_CHECK = $(HOME)/Dev/LLM/scripts/check-vault-net.sh
+# Off-machine backups run on the host: restic, the NAS/USB mounts and the
+# restic password never enter a container (ADR-032).
+BACKUP     = scripts/rag-backup
 
 .PHONY: up check-vault-net down logs build doctor warm-cache ingest reindex transcribe add query eval status \
         rebuild-index review-quarantine supersede stale retract restore lifecycle list \
         unlock lock vault-status vault-query vault-list vault-lifecycle \
-        approve vault-audit ledger ledger-review ledger-resolve receipts-reread admin test
+        approve vault-audit ledger ledger-review ledger-resolve receipts-reread admin test \
+        backup backup-local backup-offsite backup-offsite-init backup-list backup-verify \
+        backup-restore backup-ack
 
 ## --- stack ---------------------------------------------------------------
 
@@ -184,6 +189,43 @@ approve:                ## Release one pending request: make approve CODE=123456
 
 vault-audit:            ## Every access attempt, allowed or denied
 	@$(VAULTRUN) audit $(if $(N),--limit $(N))
+
+## --- backups (ADR-032) ----------------------------------------------------
+##
+## A local bundle (rag.db, the vault as ciphertext + its salt, Qdrant
+## snapshots) in data/backups/, then restic to every repo in
+## ~/.config/rag-backup/repos.d/. Each destination is treated as hostile.
+
+# The off-machine step runs even if the local one failed: yesterday's bundle
+# and the inbox are still worth sending. Fails if either did.
+backup:                 ## Local bundle, then every off-machine repo
+	@rc=0; $(WORKER) backup || rc=$$?; $(BACKUP) offsite || rc=$$?; exit $$rc
+
+backup-local:           ## Just the local bundle in data/backups/
+	$(WORKER) backup $(if $(KEEP),--keep $(KEEP))
+
+backup-offsite:         ## Just the restic push of the newest bundle + inbox
+	@$(BACKUP) offsite
+
+backup-offsite-init:    ## Create a restic repo: make backup-offsite-init REPO=nas
+	@test -n "$(REPO)" || { echo "usage: make backup-offsite-init REPO=<name in repos.d>"; exit 2; }
+	@$(BACKUP) init $(REPO)
+
+backup-list:            ## Local bundles, latest outcome per destination, repo snapshots
+	$(WORKER) backup-list $(if $(JSON),--json)
+	@$(BACKUP) snapshots
+
+backup-verify:          ## Check a bundle: make backup-verify [BUNDLE=rag-...] [VAULT=1]
+	$(WORKER) backup-verify $(if $(BUNDLE),--bundle "$(BUNDLE)") $(if $(VAULT),--vault)
+
+# Servers but qdrant stopped first. Moves the current data aside, never deletes.
+backup-restore:         ## make backup-restore FROM=<bundle> | FROM=<repo>:<snapshot-id|latest>
+	@test -n "$(FROM)" || { echo "usage: make backup-restore FROM=<bundle name> | FROM=<repo>:<snapshot>"; exit 2; }
+	@$(BACKUP) restore "$(FROM)"
+
+backup-ack:             ## Accept a reported rollback and re-baseline: make backup-ack REPO=nas
+	@test -n "$(REPO)" || { echo "usage: make backup-ack REPO=<name>"; exit 2; }
+	@$(BACKUP) ack $(REPO)
 
 ## --- development ---------------------------------------------------------
 

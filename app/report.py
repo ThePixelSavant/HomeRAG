@@ -137,7 +137,18 @@ def overview(conn: sqlite3.Connection) -> dict:
         "sources": sources,
         "runs": runs,
         "latest_eval": (eval_history(conn, limit=1) or [None])[-1],
+        "backups": backups(conn),
     }
+
+
+# Only these fields leave report.py. `detail` is excluded on purpose: a failed
+# attempt's detail is restic's error text, which can name the repo's path.
+_BACKUP_FIELDS = ("kind", "target", "status", "run_at", "last_ok_at", "age_days", "level", "why")
+
+
+def backups(conn: sqlite3.Connection) -> list[dict]:
+    """Latest attempt per backup destination: nickname, outcome and age only."""
+    return [{k: b[k] for k in _BACKUP_FIELDS} for b in state.backup_overview(conn)]
 
 
 def document_list(

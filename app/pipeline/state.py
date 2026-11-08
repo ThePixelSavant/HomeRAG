@@ -148,6 +148,24 @@ CREATE TABLE IF NOT EXISTS eval_runs (
     mean_top3_chars     INTEGER NOT NULL,
     per_question        TEXT NOT NULL
 );
+
+-- One row per backup attempt (ADR-032), local bundle or off-machine repo.
+-- `target` is "local" or the repo's nickname from repos.d -- never its URL.
+-- For local rows `snapshot_id` is the bundle directory name. `snapshot_count`
+-- is what the off-machine repo held after the run: the next run checks it has
+-- not shrunk, which is how a repo rolled back on a hostile NAS is noticed.
+CREATE TABLE IF NOT EXISTS backup_runs (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_at         TEXT NOT NULL,
+    kind           TEXT NOT NULL,
+    target         TEXT NOT NULL,
+    status         TEXT NOT NULL,
+    bytes          INTEGER,
+    snapshot_id    TEXT,
+    snapshot_count INTEGER,
+    max_age_days   REAL,
+    detail         TEXT
+);
 """
 
 # Columns added after the first release. `CREATE TABLE IF NOT EXISTS` is a
@@ -673,5 +691,82 @@ def eval_history(conn: sqlite3.Connection, limit: int = 50) -> list[dict]:
     for row in rows:
         entry = dict(row)
         entry["per_question"] = json.loads(entry["per_question"])
+        out.append(entry)
+    return out
+
+
+# --------------------------------------------------------------------------
+# Backup history (ADR-032)
+# --------------------------------------------------------------------------
+
+BACKUP_LOCAL = "local"
+BACKUP_OFFSITE = "offsite"
+BACKUP_STATUSES = ("ok", "partial", "skipped", "failed", "rollback")
+# How old the last good backup may get before doctor complains. An off-machine
+# repo can override its own in repos.d (a USB drive kept in a drawer: 30).
+BACKUP_MAX_AGE_DAYS = {BACKUP_LOCAL: 2.0, BACKUP_OFFSITE: 3.0}
+
+
+def record_backup(
+    conn: sqlite3.Connection,
+    *,
+    kind: str,
+    target: str,
+    status: str,
+    bytes: int | None = None,  # noqa: A002 -- the column's name
+    snapshot_id: str | None = None,
+    snapshot_count: int | None = None,
+    max_age_days: float | None = None,
+    detail: str | None = None,
+) -> None:
+    if kind not in BACKUP_MAX_AGE_DAYS:
+        raise ValueError(f"unknown backup kind {kind!r}")
+    if status not in BACKUP_STATUSES:
+        raise ValueError(f"unknown backup status {status!r}; one of {', '.join(BACKUP_STATUSES)}")
+    conn.execute(
+        "INSERT INTO backup_runs (run_at, kind, target, status, bytes, snapshot_id, "
+        "snapshot_count, max_age_days, detail) VALUES (?,?,?,?,?,?,?,?,?)",
+        (utcnow(), kind, target, status, bytes, snapshot_id, snapshot_count, max_age_days, detail),
+    )
+
+
+def backup_overview(conn: sqlite3.Connection, now: datetime | None = None) -> list[dict]:
+    """The latest attempt per destination, with how stale its last good one is.
+
+    `level` is ok / warn / bad. A rollback is bad; no good backup ever, a last
+    good one older than the destination's limit, or a failed latest attempt
+    is a warning. [] against a database that predates the table.
+    """
+    now = now or datetime.now(timezone.utc)
+    try:
+        rows = conn.execute(
+            """SELECT b.*,
+                      (SELECT MAX(o.run_at) FROM backup_runs o
+                        WHERE o.kind=b.kind AND o.target=b.target AND o.status='ok') AS last_ok_at
+                 FROM backup_runs b
+                WHERE b.id IN (SELECT MAX(id) FROM backup_runs GROUP BY kind, target)
+                ORDER BY b.kind, b.target"""
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+    out = []
+    for row in rows:
+        entry = dict(row)
+        limit = entry["max_age_days"] or BACKUP_MAX_AGE_DAYS[entry["kind"]]
+        age = None
+        if entry["last_ok_at"]:
+            age = (now - datetime.fromisoformat(entry["last_ok_at"])).total_seconds() / 86400
+        if entry["status"] == "rollback":
+            level, why = "bad", "snapshots disappeared from the repo -- see `rag backup-ack`"
+        elif age is None:
+            level, why = "warn", "no good backup yet"
+        elif age > limit:
+            level, why = "warn", f"last good backup {age:.1f} days ago (limit {limit:g})"
+        elif entry["status"] in ("failed", "partial"):
+            level, why = "warn", f"latest attempt {entry['status']}"
+        else:
+            level, why = "ok", ""
+        entry.update(age_days=age, limit_days=limit, level=level, why=why)
         out.append(entry)
     return out

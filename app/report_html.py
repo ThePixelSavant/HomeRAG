@@ -141,7 +141,11 @@ form.filters label { color: var(--text-2); font-size: 12.5px; }
 code { font-size: 12.5px; }
 """
 
-_STATUS_CLASS = {"ok": "good", "running": "warning", "error": "critical"}
+_STATUS_CLASS = {
+    "ok": "good", "running": "warning", "error": "critical",
+    # backup outcomes
+    "failed": "critical", "rollback": "critical", "partial": "warning", "skipped": "warning",
+}
 
 
 def _e(value) -> str:
@@ -206,6 +210,7 @@ def _overview(d: dict) -> str:
         _tile("quarantined", d["quarantined"]),
         _tile("rejected page readings", len(d["rejected_transcriptions"])),
         _tile("latest hit@3", _pct(latest["hit3"]) if latest else "no runs"),
+        _tile("last local backup", _backup_age(d.get("backups", []))),
     ])
     parts = [
         f'<div class="sub">{_e(d["collection"])} · {_e(d["embed_model"])} ({_e(d["embed_dim"])}d)</div>',
@@ -246,8 +251,25 @@ def _overview(d: dict) -> str:
             [[_e(_date(r["started_at"])), _status(r["status"]), _e(", ".join(r["sources"]))] for r in d["runs"]],
             "No runs recorded.",
         ),
+        "<h2>Backups</h2>",
+        _table(
+            [("destination", ""), ("latest", ""), ("attempted", ""), ("last good", ""), ("note", "")],
+            [[_e(b["target"]), _status(b["status"]), _e(_date(b["run_at"])), _e(_date(b["last_ok_at"]) or "never"),
+              f'<span class="err">{_e(b["why"])}</span>' if b["level"] == "bad" else _e(b["why"])]
+             for b in d.get("backups", [])],
+            "No backups recorded. Run `rag backup`.",
+        ),
     ]
     return "".join(parts)
+
+
+def _backup_age(backups: list[dict]) -> str:
+    local = next((b for b in backups if b["kind"] == "local"), None)
+    if local is None or local["age_days"] is None:
+        return "never"
+    if local["age_days"] < 1:
+        return "today"
+    return f"{local['age_days']:.0f} d ago"
 
 
 def _documents(d: dict) -> str:

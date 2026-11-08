@@ -1,0 +1,303 @@
+#!/usr/bin/env bash
+# Off-machine backups with restic (ADR-032). Runs on the HOST, as the repo owner.
+#
+#   rag-backup offsite            push the newest local bundle + inbox to every repo
+#   rag-backup init <name>        create the restic repo named in repos.d/<name>.env
+#   rag-backup snapshots [name]   list what each repo holds
+#   rag-backup restore <from>     <bundle name|path> or <repo>:<snapshot-id>
+#   rag-backup ack <name>         accept a reported rollback and re-baseline
+#
+# Every destination is assumed hostile (the NAS gets no updates). What that
+# buys, and why each check below exists, is in ADR-032; in short:
+#   - restic encrypts and authenticates on this side; the password never leaves.
+#   - a repo that LOST snapshots since the last run is a rollback alarm, kept
+#     until acknowledged, because a deletion on a compromised box is otherwise
+#     silent.
+#   - an unreachable NAS is probed with a 5 s TCP connect before its `hard`
+#     NFS mount is touched, so a dead box cannot hang this in D state.
+#   - restore only ever reads through `restic restore` into a fresh directory.
+#
+# Config: ~/.config/rag-backup/repos.d/<name>.env, mode 0600, KEY=value only
+# (parsed, never sourced):
+#   RESTIC_REPOSITORY=/mnt/nas/dpbu/rag-restic
+#   RESTIC_PASSWORD_FILE=$HOME/.config/rag-backup/restic-password
+#   RAG_BACKUP_PROBE=192.168.50.180:2049       optional: host:port to reach first
+#   RAG_BACKUP_REQUIRE_PATH=/run/media/...     optional: skip unless mounted
+#   RAG_BACKUP_MAX_AGE_DAYS=30                 optional: doctor's staleness limit
+set -euo pipefail
+umask 077
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
+DATA="${RAG_BACKUP_DATA:-$ROOT/data}"
+CONF="${RAG_BACKUP_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/rag-backup}"
+STATE_DIR="${RAG_BACKUP_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/rag-backup}"
+RESTIC="${RESTIC:-restic}"
+TAG=rag-backup
+KEEP=(--keep-daily 7 --keep-weekly 4 --keep-monthly 6)
+READ_CHECK_DAYS=7
+
+# Nothing ambient may redirect restic: the Makefile exports all of .env.
+unset RESTIC_REPOSITORY RESTIC_REPOSITORY_FILE RESTIC_PASSWORD RESTIC_PASSWORD_FILE \
+      RESTIC_PASSWORD_COMMAND RESTIC_FROM_REPOSITORY RESTIC_FROM_PASSWORD_FILE
+
+die() { echo "rag-backup: $*" >&2; exit 1; }
+say() { echo "rag-backup: $*"; }
+
+# --------------------------------------------------------------------------
+
+check_private() {
+    local file="$1" owner mode
+    read -r owner mode < <(stat -c '%u %a' "$file")
+    [ "$owner" = "$(id -u)" ] || die "$file is not owned by you"
+    (( (8#$mode & 8#077) == 0 )) || die "$file is readable by others (mode $mode); chmod 600 it"
+}
+
+expand() {
+    local v="$1"
+    v="${v//\$\{HOME\}/$HOME}"; v="${v//\$HOME/$HOME}"
+    v="${v//\$\{USER\}/$USER}"; v="${v//\$USER/$USER}"
+    printf '%s' "$v"
+}
+
+load_repo() {
+    NAME="$1"
+    [[ "$NAME" =~ ^[A-Za-z0-9_-]+$ ]] || die "repo names are letters, digits, - and _: '$NAME'"
+    local file="$CONF/repos.d/$NAME.env" line key val
+    [ -f "$file" ] || die "no repo config $file"
+    check_private "$file"
+    REPO=; PASSFILE=; PROBE=; REQUIRE_PATH=; MAX_AGE=
+    while IFS= read -r line || [ -n "$line" ]; do
+        [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+        [[ "$line" =~ ^(.*[^[:space:]])[[:space:]]+#.*$ ]] && line="${BASH_REMATCH[1]}"
+        [[ "$line" =~ ^[[:space:]]*([A-Z_]+)=(.*)$ ]] || die "$file: cannot read '$line'"
+        key="${BASH_REMATCH[1]}"; val="${BASH_REMATCH[2]}"
+        val="${val%\"}"; val="${val#\"}"; val="${val%\'}"; val="${val#\'}"
+        val="$(expand "$val")"
+        case "$key" in
+        RESTIC_REPOSITORY) REPO="$val" ;;
+        RESTIC_PASSWORD_FILE) PASSFILE="$val" ;;
+        RAG_BACKUP_PROBE) PROBE="$val" ;;
+        RAG_BACKUP_REQUIRE_PATH) REQUIRE_PATH="$val" ;;
+        RAG_BACKUP_MAX_AGE_DAYS) MAX_AGE="$val" ;;
+        *) die "$file: unknown key $key" ;;
+        esac
+    done < "$file"
+    [ -n "$REPO" ] || die "$file: RESTIC_REPOSITORY is required"
+    [ -n "$PASSFILE" ] || die "$file: RESTIC_PASSWORD_FILE is required"
+    [ -f "$PASSFILE" ] || die "password file $PASSFILE does not exist"
+    check_private "$PASSFILE"
+    [ -z "$MAX_AGE" ] || [[ "$MAX_AGE" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "$file: RAG_BACKUP_MAX_AGE_DAYS must be a number"
+}
+
+repo_names() {
+    local f
+    for f in "$CONF"/repos.d/*.env; do
+        [ -e "$f" ] || continue
+        basename "$f" .env
+    done
+}
+
+r() { "$RESTIC" --repo "$REPO" --password-file "$PASSFILE" --retry-lock 2m "$@"; }
+
+# Before touching the path: a `hard` NFS mount of a dead NAS blocks in
+# uninterruptible sleep, beyond the reach of timeout(1) or kill.
+reachable() {
+    if [ -n "$PROBE" ]; then
+        local host="${PROBE%:*}" port="${PROBE##*:}"
+        timeout 5 bash -c 'exec 3<>"/dev/tcp/$0/$1"' "$host" "$port" 2>/dev/null \
+            || { WHY="$PROBE not answering"; return 1; }
+    fi
+    if [ -n "$REQUIRE_PATH" ]; then
+        mountpoint -q "$REQUIRE_PATH" || { WHY="$REQUIRE_PATH not mounted"; return 1; }
+    fi
+    return 0
+}
+
+# Record the outcome in rag.db for doctor, status and the dashboard. The
+# nickname goes in, never the repository URL.
+record() {
+    local status="$1"; shift
+    [ -n "${RAG_BACKUP_NO_RECORD:-}" ] && return 0
+    (cd "$ROOT" && docker compose run --rm -T ingestion-worker backup-record \
+        --target "$NAME" --status "$status" ${MAX_AGE:+--max-age-days "$MAX_AGE"} "$@" >/dev/null) \
+        || echo "rag-backup: could not record the $NAME outcome in rag.db" >&2
+}
+
+newest_bundle() {
+    local d
+    d="$(find "$DATA/backups" -mindepth 1 -maxdepth 1 -type d -name 'rag-*Z' 2>/dev/null | sort | tail -n1)"
+    [ -n "$d" ] && [ -f "$d/manifest.json" ] && printf '%s' "$d"
+}
+
+# --------------------------------------------------------------------------
+
+offsite_one() {
+    load_repo "$1"
+    local last="$STATE_DIR/$NAME.last" alarm="$STATE_DIR/$NAME.alarm" checked="$STATE_DIR/$NAME.checked"
+    local bundle snaps count prev_id prev_count out snap_id added post status detail
+    mkdir -p "$STATE_DIR"
+
+    WHY=
+    if ! reachable; then
+        say "$NAME: skipped ($WHY)"
+        record skipped --detail "$WHY"
+        return 0
+    fi
+    bundle="$(newest_bundle)" || { record failed --detail "no local bundle"; say "$NAME: no local bundle to send"; return 1; }
+
+    # Stale locks only: a crashed run's lock would otherwise fail every run after.
+    r unlock >/dev/null 2>&1 || true
+
+    snaps="$(r snapshots --json --tag "$TAG")" || { record failed --detail "cannot list snapshots"; return 1; }
+    count="$(jq length <<<"$snaps")"
+
+    # Rollback check, against what THIS machine recorded last time. The state
+    # file lives here, not on the destination, so the destination cannot edit it.
+    if [ -f "$last" ]; then
+        read -r prev_id prev_count < "$last"
+        if ! jq -e --arg id "$prev_id" 'any(.[]; .id == $id)' <<<"$snaps" >/dev/null \
+           || [ "$count" -lt "$prev_count" ]; then
+            printf '%s expected snapshot %s and >= %s snapshots; found %s\n' \
+                "$(date -u +%FT%TZ)" "${prev_id:0:8}" "$prev_count" "$count" >> "$alarm"
+            say "$NAME: !! ROLLBACK: snapshot ${prev_id:0:8} or others are gone from the repo"
+        fi
+    fi
+
+    local paths=("$bundle")
+    for d in inbox quarantine archive; do [ -d "$DATA/$d" ] && paths+=("$DATA/$d"); done
+
+    if ! out="$(r backup --json --quiet --tag "$TAG" --host rag "${paths[@]}")"; then
+        record failed --detail "restic backup failed"
+        say "$NAME: backup FAILED"
+        return 1
+    fi
+    snap_id="$(jq -r 'select(.message_type=="summary") | .snapshot_id' <<<"$out" | tail -n1)"
+    added="$(jq -r 'select(.message_type=="summary") | .data_added' <<<"$out" | tail -n1)"
+
+    # Paths change every day (the bundle's name), so group by tag or nothing
+    # would ever be forgotten.
+    if ! r forget --quiet --tag "$TAG" --group-by tags "${KEEP[@]}" --prune >/dev/null; then
+        record failed --snapshot-id "$snap_id" --detail "restic forget/prune failed"
+        return 1
+    fi
+
+    # A full read weekly: the repo is small, and a NAS that corrupts quietly
+    # should be found by us, not by a restore.
+    if [ ! -f "$checked" ] || [ -n "$(find "$checked" -mtime +"$READ_CHECK_DAYS" 2>/dev/null)" ]; then
+        if r check --read-data >/dev/null 2>&1; then
+            touch "$checked"
+        else
+            record failed --snapshot-id "$snap_id" --detail "restic check --read-data failed"
+            say "$NAME: !! restic check --read-data FAILED"
+            return 1
+        fi
+    fi
+
+    post="$(r snapshots --json --tag "$TAG" | jq length)"
+    printf '%s %s\n' "$snap_id" "$post" > "$last"
+
+    status=ok; detail=
+    if [ -f "$alarm" ]; then
+        status=rollback
+        detail="$(tail -n1 "$alarm")"
+    fi
+    record "$status" --bytes "${added:-0}" --snapshot-id "$snap_id" --snapshot-count "$post" \
+        ${detail:+--detail "$detail"}
+    say "$NAME: $status  snapshot ${snap_id:0:8}  +$(( ${added:-0} / 1024 )) KiB  ($post kept)"
+    [ "$status" = ok ]
+}
+
+cmd_offsite() {
+    local names rc=0 n
+    mapfile -t names < <(repo_names)
+    if [ "${#names[@]}" -eq 0 ]; then
+        say "no off-machine repos in $CONF/repos.d; the local bundle is the only copy"
+        return 0
+    fi
+    command -v "$RESTIC" >/dev/null || die "restic is not installed (sudo dnf install restic)"
+    command -v jq >/dev/null || die "jq is not installed"
+    mkdir -p "$STATE_DIR"
+    exec 9>"$STATE_DIR/.lock"
+    flock -n 9 || die "another off-machine backup is running"
+    for n in "${names[@]}"; do
+        ( offsite_one "$n" ) || rc=1
+    done
+    return "$rc"
+}
+
+cmd_init() {
+    [ $# -eq 1 ] || die "usage: rag-backup init <name>"
+    load_repo "$1"
+    WHY=
+    reachable || die "$NAME: $WHY"
+    r init
+    say "$NAME: initialised. Store the password in $PASSFILE somewhere OFF this machine too."
+}
+
+cmd_snapshots() {
+    local names n
+    if [ $# -ge 1 ]; then names=("$1"); else mapfile -t names < <(repo_names); fi
+    for n in "${names[@]}"; do
+        ( load_repo "$n"; WHY=
+          if reachable; then echo "== $NAME"; r snapshots --tag "$TAG"; else echo "== $NAME: $WHY"; fi )
+    done
+}
+
+cmd_ack() {
+    [ $# -eq 1 ] || die "usage: rag-backup ack <name>"
+    [[ "$1" =~ ^[A-Za-z0-9_-]+$ ]] || die "bad name"
+    local alarm="$STATE_DIR/$1.alarm"
+    [ -f "$alarm" ] && { cat "$alarm"; rm -f "$alarm"; }
+    rm -f "$STATE_DIR/$1.last"
+    say "$1: acknowledged; the next run takes a new baseline"
+}
+
+running() { [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = true ]; }
+
+cmd_restore() {
+    [ $# -eq 1 ] || die "usage: rag-backup restore <bundle name|path> | <repo>:<snapshot-id>"
+    local from="$1" c bundle target args=()
+    for c in mcp-server mcp-vault rag-admin; do
+        running "$c" && die "stop the servers first: docker compose stop mcp-server mcp-vault rag-admin"
+    done
+    running qdrant || die "qdrant must be running: docker compose up -d qdrant"
+
+    if [[ "$from" =~ ^([A-Za-z0-9_-]+):([0-9a-f]{8,64}|latest)$ ]] && [ ! -e "$from" ]; then
+        load_repo "${BASH_REMATCH[1]}"
+        local snap="${BASH_REMATCH[2]}"
+        WHY=
+        reachable || die "$NAME: $WHY"
+        target="$DATA/restore-$(date -u +%Y%m%dT%H%M%SZ)"
+        say "restoring $NAME:$snap into $target (authenticated by restic)"
+        r restore "$snap" --tag "$TAG" --target "$target"
+        bundle="$(find "$target" -type f -name manifest.json -path '*/backups/rag-*Z/manifest.json' | sort | tail -n1)"
+        [ -n "$bundle" ] || die "no bundle inside snapshot $snap"
+        bundle="$(dirname "$bundle")"
+        for c in inbox quarantine archive; do
+            local tree
+            tree="$(find "$target" -type d -path "*/data/$c" -prune 2>/dev/null | head -n1)"
+            [ -n "$tree" ] && args+=("--$c" "/data${tree#"$DATA"}")
+        done
+    else
+        if [ -d "$DATA/backups/$from" ]; then bundle="$DATA/backups/$from"; else bundle="$(readlink -f "$from")"; fi
+        [ -f "$bundle/manifest.json" ] || die "$from is not a backup bundle"
+    fi
+    case "$bundle" in "$DATA"/*) ;; *) die "the bundle must be under $DATA so the worker can see it" ;; esac
+
+    cd "$ROOT"
+    exec docker compose run --rm ingestion-worker backup-restore --bundle "/data${bundle#"$DATA"}" "${args[@]}"
+}
+
+# --------------------------------------------------------------------------
+
+[ $# -gt 0 ] || { sed -n '2,8p' "$SELF" | sed 's/^# \{0,1\}//'; exit 0; }
+cmd="$1"; shift
+case "$cmd" in
+offsite) cmd_offsite "$@" ;;
+init) cmd_init "$@" ;;
+snapshots) cmd_snapshots "$@" ;;
+restore) cmd_restore "$@" ;;
+ack) cmd_ack "$@" ;;
+*) die "unknown command '$cmd'" ;;
+esac

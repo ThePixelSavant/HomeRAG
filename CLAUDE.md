@@ -47,6 +47,7 @@ make unlock / lock / vault-list / vault-query / vault-lifecycle / approve / vaul
 make ledger / ledger-review / ledger-resolve   # receipts, in exact cents
 make receipts-reread [URI=...]   # re-read filed receipts from their encrypted originals
 make admin                 # read-only dashboard, 127.0.0.1:8090 (ADR-031)
+make backup / backup-list / backup-verify / backup-restore   # ADR-032; restic on the host
 make test                  # pytest inside the worker image
 ```
 
@@ -363,6 +364,31 @@ images scaled to 1536 px. A markdown note under `receipts` is still text.
 - **No inline script** (CSP `script-src 'self'`): page JS goes in
   `report_html.CHART_JS`, served from `/admin/static/`.
 
+### Backups
+
+`rag backup` (ADR-032): [app/backup.py](app/backup.py) takes a bundle in the
+worker; [scripts/rag-backup](scripts/rag-backup) runs restic on the host.
+
+- **A bundle is an allowlist**, never "all of `data/`": `rag.db`, the vault
+  files, Qdrant snapshots, `manifest.json`. No `.env`, no key. Restore copies
+  manifest entries only.
+- **`vault.salt` is in every bundle**, and a vault without one is refused:
+  without it the passphrase cannot rebuild the key.
+- **The vault is copied without its key**, so not via the backup API:
+  `copy_stable` copies only while no `-journal` exists and size and mtime hold
+  still, because `mcp-vault` writes audit rows at any time. It refuses WAL.
+- **Nothing leaves unencrypted.** restic only; no rsync path. The restic
+  password lives in `~/.config/rag-backup/`, never in `.env` (the worker gets
+  all of `.env`).
+- **Destinations are assumed hostile** (the NAS gets no updates). The rollback
+  state (`~/.local/state/rag-backup/<repo>.last`) lives on this machine so the
+  destination cannot edit it. `forget` must `--group-by tags`: the bundle's
+  path changes daily, and grouping by path would never forget anything.
+- **Probe before touching a hard NFS mount.** A hung one blocks in D state
+  where `timeout` cannot reach.
+- **Restore moves, never deletes** (`data/pre-restore-<stamp>/`), and fills an
+  inbox only if it is empty.
+
 ## Gotchas that have already bitten
 
 | Thing | Why |
@@ -393,6 +419,7 @@ data/state/rag.db      SQLite (rollback journal): runs, sources, documents, quar
 data/vault/vault.db    SQLCipher: rows, chunk text, vectors, ledger, audit
 data/vault/blobs/      AES-256-GCM originals
 data/qdrant/           open-tier index (derived; rebuildable)
+data/backups/rag-*/    local backup bundles (ADR-032); restic sends them off the machine
 ```
 
 Qdrant is a **derived index, not the source of truth** — deterministic point IDs
