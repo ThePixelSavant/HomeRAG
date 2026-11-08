@@ -496,6 +496,11 @@ Reachability, paths, embedding fingerprint, per-source file counts, backlogs.
 a failure, because that is also what a broken mount looks like and the
 distinction matters to the sweep.
 
+It also reports each backup destination: a warning when its last good backup
+is older than its limit (2 days local, 3 off-machine, or the repo's
+`RAG_BACKUP_MAX_AGE_DAYS`) or was never taken, and a **failure** when an
+off-machine repo has lost snapshots (see `rag backup`).
+
 Vault state reads `not readable from here (by design)` — the control socket
 exists only inside the vault container, on a private tmpfs, so the worker (which
 parses untrusted files) cannot reach it. Use `rag vault-status`, which runs
@@ -562,6 +567,93 @@ terminal. The same data as JSON, for scripts:
 curl -H "Authorization: Bearer $REPORT_TOKEN" \
   'http://127.0.0.1:8090/admin/report?view=documents&domain=manuals&format=json'
 ```
+
+### `rag backup` — local bundle, then off the machine
+
+```bash
+rag backup                      # both steps; what the daily timer runs
+rag backup-local [KEEP=7]       # just the bundle in data/backups/
+rag backup-offsite              # just restic, newest bundle + inbox, every repo
+rag backup-list                 # bundles, latest outcome per destination, snapshots
+rag backup-verify [BUNDLE=rag-20261108T172116Z] [VAULT=1]
+rag backup-restore FROM=rag-20261108T172116Z     # or FROM=nas:latest, FROM=nas:1a2b3c4d
+rag backup-ack REPO=nas         # accept a reported rollback, take a new baseline
+```
+
+A **bundle** is `data/backups/rag-<UTC stamp>/`: `rag.db`, the vault as
+ciphertext with its salt, Qdrant snapshots and a `manifest.json` of hashes.
+About 43 MB today; `BACKUP_KEEP_LOCAL` (default 7) are kept. It waits up to
+30 minutes for a running ingest. If Qdrant is down the bundle is still taken
+and marked `partial`.
+
+`VAULT=1` asks for the passphrase and proves the bundle's vault opens: the
+verifier, `integrity_check`, and every blob's GCM tag and hash.
+
+**Off the machine**, one file per destination in
+`~/.config/rag-backup/repos.d/<name>.env`, mode 0600, `KEY=value` lines only:
+
+```sh
+# nas.env
+RESTIC_REPOSITORY=/mnt/nas/dpbu/rag-restic
+RESTIC_PASSWORD_FILE=$HOME/.config/rag-backup/restic-password
+RAG_BACKUP_PROBE=192.168.50.180:2049        # checked before the hard NFS mount is touched
+
+# usb.env
+RESTIC_REPOSITORY=/run/media/$USER/BACKUP/rag-restic
+RESTIC_PASSWORD_FILE=$HOME/.config/rag-backup/restic-password
+RAG_BACKUP_REQUIRE_PATH=/run/media/$USER/BACKUP   # skipped, not failed, when unplugged
+RAG_BACKUP_MAX_AGE_DAYS=30                        # doctor's limit for this one
+```
+
+Setting one up:
+
+```bash
+sudo dnf install restic
+mkdir -p ~/.config/rag-backup/repos.d && chmod 700 ~/.config/rag-backup
+openssl rand -base64 32 > ~/.config/rag-backup/restic-password
+chmod 600 ~/.config/rag-backup/restic-password
+$EDITOR ~/.config/rag-backup/repos.d/nas.env && chmod 600 ~/.config/rag-backup/repos.d/nas.env
+rag backup-offsite-init REPO=nas
+rag backup
+```
+
+**Copy the restic password and the vault passphrase somewhere off this
+machine** (a password manager, paper). Neither is in any backup; without them
+no backup can be opened.
+
+Each run per repo: probe, list snapshots, **rollback check**, `restic backup`,
+`forget --keep-daily 7 --keep-weekly 4 --keep-monthly 6 --prune`, and once a
+week `restic check --read-data`. The rollback check compares the repo with
+what this machine recorded last time (`~/.local/state/rag-backup/`): if the
+last snapshot is gone or the count shrank, every run reports `rollback` and
+fails until `rag backup-ack`. Delete snapshots by hand and you will trip it;
+ack it afterwards.
+
+**Restore** needs the servers stopped and Qdrant running:
+
+```bash
+docker compose stop mcp-server mcp-vault rag-admin
+rag backup-restore FROM=nas:latest
+make up && rag doctor && rag ingest
+```
+
+It verifies the bundle, shows what differs from the current settings, asks
+for `restore`, then moves the current `rag.db`, vault and index (as a
+snapshot) to `data/pre-restore-<stamp>/`; nothing is deleted. A restored inbox
+is copied in only if `data/inbox` is empty. Receipts filed after the backup
+are not in it: their originals were consumed into the vault, so they exist
+only in the `pre-restore` copy.
+
+**The timer** (daily at 03:30, catches up after the machine was off):
+
+```bash
+sudo cp systemd/rag-backup.service systemd/rag-backup.timer /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now rag-backup.timer
+journalctl -t rag-backup
+```
+
+It runs as your user, not root (edit `User=` if that is not `jnovick`), which
+must be in the `docker` group.
 
 ### `rag review-quarantine`
 

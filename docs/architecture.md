@@ -31,6 +31,10 @@ the Makefile.
 
    you (browser) ──▶ rag-admin :8090 ──▶ rag.db (read-only) + Qdrant (read-only key)
                      read-only dashboard, open tier only (ADR-031)
+
+   rag-backup.timer ──▶ worker: bundle ──▶ data/backups/rag-<stamp>/ (vault as ciphertext)
+                    └─▶ host: restic ──▶ NAS share, USB drive (encrypted; assumed hostile)
+                        ADR-032
 ```
 
 Four containers plus a one-shot worker, on two external networks owned by
@@ -266,6 +270,8 @@ a boilerplate paragraph.
 | `mcp-server` | read | **read-only mount** | **not mounted** | no |
 | `mcp-vault` | not installed | read-only mount | read-write | **yes** |
 | `rag-admin` | read (read-only key) | **read-only mount** | **not mounted** | no |
+| `ingestion-worker backup` | snapshots | online-backup copy | **copied as ciphertext** | **no** |
+| `scripts/rag-backup` (host) | no | no | no (encrypted bundle only) | no; holds the restic password |
 
 The worker's parent holds a key because it writes the encrypted store, so
 extraction was moved out of it: every parser reads attacker-influenced bytes,

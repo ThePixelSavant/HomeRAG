@@ -22,6 +22,7 @@ Defended against:
 | A compromised `mcp-server` replaying the identity assertion it is handed every turn | It cannot reach `mcp-vault`: separate `vault-net` bridge with only `open-webui`; verified by `~/Dev/LLM/scripts/check-vault-net.sh` |
 | A compromised `mcp-server` ARP-spoofing the `open-webui` ↔ `mcp-vault` hop | Not in that broadcast domain; `mcp-server` runs `cap_drop: [NET_RAW]` |
 | Someone reading `vault.db` off the disk or a backup | SQLCipher AES-256; the key is never on disk |
+| Someone reading or tampering with an off-machine backup (the NAS is assumed compromised) | restic encrypts and authenticates on this host; the vault inside is SQLCipher under a separate key; a vanished snapshot raises a persistent alarm ([ADR-032](decisions.md#adr-032-backups-a-local-bundle-then-restic-to-destinations-assumed-hostile)) |
 | Sensitive text recovered from a vector | Sensitive data never gets a Qdrant vector at all |
 | A misfiled sensitive document reaching the open tier | Pre-embedding sensitivity scan → quarantine |
 | Forged `X-OpenWebUI-User-*` headers | Identity comes from a signed HS256 assertion, not plaintext headers |
@@ -205,6 +206,30 @@ that holds the identity-signing secret, so `~/Dev/LLM` keeps them off.
 Other containers on `llm-net` can reach `rag-admin:8080`. The token is what
 stops them: they can send any Host header they like, so the Host check guards
 against browsers, not containers.
+
+### Backups
+
+`rag backup` ([ADR-032](decisions.md#adr-032-backups-a-local-bundle-then-restic-to-destinations-assumed-hostile))
+copies every store to `data/backups/` and then, with restic, off the
+machine. What bounds it:
+
+- **No key in a bundle.** The vault is copied as ciphertext, with the salt it
+  needs and without the passphrase. Taking a bundle never unlocks anything;
+  `rag backup-verify VAULT=1` derives a key from a typed passphrase in the CLI
+  process, on a temporary copy, and discards it.
+- **Nothing leaves unencrypted.** The only off-machine path is restic, which
+  encrypts and authenticates on this host. There is no rsync mode.
+- **Destinations are assumed hostile.** The NAS gets no updates. It can read
+  nothing (restic), forge nothing (restic's MACs), and quietly delete
+  snapshots only until the next run notices (the rollback check). It holds no
+  credential for this machine, is mounted `noexec,nosuid,nodev`, and restic
+  never runs as root against it.
+- **Two passwords live off this machine too:** the restic password
+  (`~/.config/rag-backup/restic-password`) and the vault passphrase. Neither
+  is inside a backup, so losing them makes every backup useless.
+
+Not defended against: malware on this host, which holds the restic password
+and can delete the NAS repo. That is what the unplugged USB copy is for.
 
 ## The three gates
 

@@ -95,6 +95,7 @@ Legend: **done** = built, tested and exercised against real data ·
 | Open WebUI integration | done | Verified end to end through a real browser session, 2026-09-21 |
 | Admin dashboard (`rag-admin`) | built | Read-only, open tier only, `127.0.0.1:8090` (ADR-031). Verified live 2026-11-07: healthy, uid 1000, `cap_drop: [ALL]`, state mounted read-only, `llm-net` only, no JWT secret in its environment; login redirect, 401 without a token, foreign Host refused; reads Qdrant (1,268 chunks) with the read-only key; `check-vault-net.sh` confirms it cannot reach `mcp-vault`. Driven in Firefox 159 over WebDriver BiDi: all five views, the documents filter form, chart hover, dark mode, a 390 px viewport with no sideways scroll, logout, and no CSP violations |
 | Eval history | built | `make eval` records each run in `rag.db` for the dashboard's chart |
+| Backups | built | `rag backup` (ADR-032): local bundle of `rag.db`, the vault as ciphertext with its salt, and Qdrant snapshots; restic to the NAS (assumed compromised) and USB, with a rollback check. A live bundle 2026-11-08: 43.1 MB in 2 s, verifies against its manifest. Off-machine step tested against a stand-in restic; not yet run live |
 | systemd timers | done | Units written; `croniter` cadences honoured in code |
 
 ## What was verified, and how

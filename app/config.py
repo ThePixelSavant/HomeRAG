@@ -44,6 +44,11 @@ class Settings(BaseSettings):
     state_db_path: Path = Path("/data/state/rag.db")
     vault_db_path: Path = Path("/data/vault/vault.db")
     vault_blobs_path: Path = Path("/data/vault/blobs")
+    # Backups (ADR-032). Qdrant writes snapshots into its own /qdrant/snapshots,
+    # which is this directory on the host; the worker sees it here.
+    backups_path: Path = Path("/data/backups")
+    qdrant_snapshots_path: Path = Path("/data/qdrant-snapshots")
+    backup_keep_local: int = 7
     # Inside the vault container only: a tmpfs, not the ./data/vault bind mount,
     # which the ingestion worker shares. See docker-compose.yml.
     vault_control_socket: Path = Path("/run/vault/control.sock")

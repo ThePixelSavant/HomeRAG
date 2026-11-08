@@ -1,0 +1,24 @@
+[Unit]
+Description=RAG backup: local bundle, then restic to every off-machine repo
+Documentation=file:///home/jnovick/Dev/RAG/docs/cli.md
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+# Not root, unlike rag-sync: restic reads this user's ~/.config/rag-backup and
+# writes to a share on a NAS treated as hostile, which root must never do.
+# The user needs the docker group for the worker container.
+User=jnovick
+Group=jnovick
+WorkingDirectory=/home/jnovick/Dev/RAG
+ExecStart=/usr/bin/make -s backup
+# Backstop only: an unreachable NAS is probed before its hard NFS mount is
+# touched, so a hang here should never happen.
+TimeoutStartSec=2h
+
+Nice=10
+IOSchedulingClass=idle
+
+SyslogIdentifier=rag-backup

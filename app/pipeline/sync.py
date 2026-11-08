@@ -26,6 +26,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -89,20 +90,31 @@ class SourceResult:
 
 
 @contextmanager
-def sync_lock(data_root: Path | None = None):
+def sync_lock(data_root: Path | None = None, *, wait: float | None = None):
     """Serialise runs.
 
     The systemd timer and the inbox path unit can fire at once, and two
     concurrent sweeps with different run ids would delete each other's work.
+
+    `wait` polls for up to that many seconds instead of failing at once. The
+    daily backup uses it: an ingest that happens to be running (a vision
+    transcription can take half an hour) should delay the backup, not fail it.
     """
     root = data_root or settings.data_root
     root.mkdir(parents=True, exist_ok=True)
     handle = (root / LOCK_NAME).open("w")
-    try:
-        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        handle.close()
-        raise RuntimeError("Another sync is already running (holding data/.sync.lock).") from None
+    deadline = time.monotonic() + (wait or 0)
+    while True:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                handle.close()
+                raise RuntimeError(
+                    "Another sync is already running (holding data/.sync.lock)."
+                ) from None
+            time.sleep(min(2.0, max(0.05, deadline - time.monotonic())))
     try:
         yield
     finally:

@@ -127,6 +127,11 @@ rag ledger-review                # receipts flagged for a human
 rag ledger-resolve ID=n [TOTAL=] [DATE=] [MERCHANT=] [CATEGORY=]
 rag receipts-reread [URI=...]    # re-read filed receipts from their encrypted originals
 
+rag backup                       # local bundle, then restic to every repo (daily by timer)
+rag backup-list                  # bundles, latest outcome per destination, snapshots
+rag backup-verify [VAULT=1]      # check the newest bundle; VAULT=1 proves it opens
+rag backup-restore FROM=<bundle>|<repo>:<snapshot>   # servers stopped; moves, never deletes
+
 rag test
 rag help                         # shorthands plus every Makefile target
 ```
@@ -150,6 +155,24 @@ It is a separate page rather than part of Open WebUI on purpose: that would
 need Open WebUI's Functions, which `~/Dev/LLM` keeps off because they run in
 the container that signs vault identities. See
 [ADR-031](docs/decisions.md#adr-031-a-read-only-admin-dashboard-in-the-browser-not-in-open-webui).
+
+## Backups
+
+`rag backup` copies `rag.db`, the vault (still encrypted, with the salt it
+cannot be opened without), and a Qdrant snapshot into `data/backups/`, then
+uses restic to push that and the inbox to every destination configured in
+`~/.config/rag-backup/repos.d/`: here, a NAS share and a USB drive.
+`rag-backup.timer` runs it daily, and `rag doctor` warns when a destination's
+last good backup is too old.
+
+Every destination is treated as if it were already compromised: restic
+encrypts before anything leaves, the NAS holds no credentials, and a backup
+that quietly disappears from it raises an alarm on the next run. **Keep the
+restic password and the vault passphrase somewhere off this machine**;
+neither is in any backup. Setup, restore and the timer are in
+[docs/cli.md](docs/cli.md#rag-backup--local-bundle-then-off-the-machine); the
+reasoning is
+[ADR-032](docs/decisions.md#adr-032-backups-a-local-bundle-then-restic-to-destinations-assumed-hostile).
 
 ## Quarantine
 
@@ -356,6 +379,7 @@ free, no resident model idling, and missed runs are caught after a reboot:
 ```bash
 sudo cp systemd/* /etc/systemd/system/
 sudo systemctl enable --now rag-sync.timer rag-inbox.path
+sudo systemctl enable --now rag-backup.timer     # daily backups, as your user
 ```
 
 One timer covers every source; per-source `cadence` is honoured in code so it

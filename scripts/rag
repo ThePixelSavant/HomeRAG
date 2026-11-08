@@ -33,7 +33,8 @@ rag -- RAG knowledge base, from any directory
   rag <target> [VAR=value ...]           anything else in the Makefile
 
 Common targets: status, doctor, ingest, lifecycle, unlock, vault-list,
-vault-query, vault-audit, approve, supersede, stale, rebuild-index.
+vault-query, vault-audit, approve, supersede, stale, rebuild-index,
+backup, backup-list, backup-verify, backup-restore.
 
 The domain on `add` decides whether a document is stored in the clear or in
 the encrypted vault, so it is always required and never guessed.

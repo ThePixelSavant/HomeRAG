@@ -899,3 +899,95 @@ DNS-rebinding page.
 **Revisit if:** the stack moves off this host (then TLS in front of
 `rag-admin`, as for every other port), or write actions are wanted from a
 browser.
+
+## ADR-032: Backups: a local bundle, then restic to destinations assumed hostile
+
+**Chosen:** `rag backup`, run daily by `rag-backup.timer`, in two steps.
+
+1. **A local bundle**, taken in the ingestion worker under `data/.sync.lock`:
+   `data/backups/rag-<UTC stamp>/` with `rag.db` (SQLite online backup),
+   the vault as ciphertext (`vault.db`, **`vault.salt`**, `vault.verifier`,
+   `blobs/`), a Qdrant snapshot of the collection and its fingerprint
+   collection, and a `manifest.json` of sha256 and size per file plus the
+   settings the data depends on. `BACKUP_KEEP_LOCAL` (default 7) are kept.
+2. **restic on the host** (`scripts/rag-backup`) pushes the newest bundle,
+   `data/inbox`, `data/quarantine` and `data/archive` to every repo described
+   in `~/.config/rag-backup/repos.d/<name>.env`. Today: the NAS share at
+   `/mnt/nas/dpbu/rag-restic`, and a USB drive when one is attached.
+
+Each attempt is recorded in `rag.db` (`backup_runs`), which `rag doctor`,
+`rag status` and the dashboard read.
+
+**Why the split.** The worker already mounts `./data` read-write and has the
+full Qdrant key; it never needs the vault key, because the vault is copied as
+ciphertext. restic needs the NAS and USB mounts and a password, none of which
+belong in a container, and the password must never be in `.env`, which the
+worker receives whole.
+
+**The vault without its key.** The worker cannot open `vault.db`, so the
+online-backup API is out of reach, and `mcp-vault` writes an `audit` row on
+every vault query whether or not ingest runs. The file is in rollback-journal
+mode: every write creates `vault.db-journal` and moves the mtime. A copy taken
+with no journal present, and with size and mtime unchanged across it, saw no
+write; otherwise it retries (5 times) and then fails loudly. A WAL file is
+refused outright. **The salt goes in every bundle**: without it the passphrase
+cannot re-derive the key, and a bundle missing it is refused rather than
+written.
+
+**What is deliberately not in a bundle:** `.env` (every secret in it can be
+regenerated, and fewer copies of secrets is better), the sources outside
+`data/` (`~/Dev` notes, Claude transcripts: they have their own homes), and
+anything not on the allowlist. Restore copies manifest entries only.
+
+**The NAS is assumed compromised.** It is a ReadyNAS 212 with no more
+updates, reached over NFSv3 (`sec=sys`, exported to this host only, mounted
+`noexec,nosuid,nodev,hard`). Its job is to hold ciphertext:
+
+- *Confidentiality:* restic encrypts on this side, so the password never goes
+  there. The repo's key file does, wrapped by scrypt, so the password is 32
+  random bytes, never chosen by a person. The vault is a second, independent
+  layer under its own key.
+- *Tampering:* restic authenticates every blob; the manifest's hashes sit
+  inside the encrypted repo; restore reads only through `restic restore`,
+  into a fresh directory, and executes nothing from a backup.
+- *Rollback:* restic cannot tell that recent snapshots were deleted. The
+  script remembers, **on this machine**, the last snapshot ID and how many the
+  repo held after `forget`. If that snapshot is gone, or the count shrank, it
+  raises an alarm that persists across runs until `rag backup-ack`, and
+  doctor reports it as a failure.
+- *Destruction:* nothing on a compromised box prevents it. Detection is the
+  rollback check and a weekly `restic check --read-data`; recovery is the USB
+  copy, kept unplugged, which doctor wants no older than its
+  `RAG_BACKUP_MAX_AGE_DAYS` (30 for a drawer drive).
+- *Attacking back:* push only, so the NAS holds no credential for anything.
+  restic runs as the user, never root. A dead NAS is probed with a 5 s TCP
+  connect before its `hard` mount is touched, because a read of a hung hard
+  mount blocks in D state where no timeout reaches.
+
+**Rejected:**
+
+- *Plain rsync or a tar on the share.* `rag.db`, the Qdrant snapshot and the
+  inbox are plaintext. Nothing leaves the machine unencrypted.
+- *SFTP to the NAS.* The share was already mounted (as are three media
+  shares from the same box), so SFTP would add an SSH key to protect and no
+  defence against a host already treated as hostile.
+- *A pull model (the NAS fetches).* It would put credentials for this machine
+  on the weakest box on the network.
+- *Append-only mode on the NAS (restic's rest-server).* It defends against a
+  compromised workstation, but root on the NAS defeats it, and the NAS is the
+  box assumed compromised. The unplugged USB copy covers both.
+- *A file copy of `data/qdrant`.* Not consistent while Qdrant runs. The
+  snapshot API is, and it is the format restore recovers from.
+- *restic in a container.* The mounts and the password would have to be
+  passed in; on the host they simply are there.
+
+**Restore** (`rag backup-restore FROM=<bundle>|<repo>:<snapshot>`) needs
+`mcp-server`, `mcp-vault` and `rag-admin` stopped and Qdrant running, verifies
+the bundle first, and **moves** the current `rag.db`, vault and index (as a
+snapshot) to `data/pre-restore-<stamp>/` before copying anything in. A restored
+inbox, quarantine or archive is copied only into an empty directory: merging
+into a live inbox would resurrect documents removed since the backup.
+
+**Revisit if:** a copy that no box on the LAN can destroy is wanted (a B2
+bucket with Object Lock is one more file in `repos.d/`), or the corpus grows
+until a weekly full read takes too long (`--read-data-subset`).
