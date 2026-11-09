@@ -343,6 +343,28 @@ images scaled to 1536 px. A markdown note under `receipts` is still text.
 - Review is CLI only (`rag ledger-review`, `rag ledger-resolve`), for the same
   reason lifecycle is.
 
+### Approved clients of the open tier
+
+`mcp-server` answers only clients named in `MCP_CLIENT_TOKENS`
+(`name:token,...`, ADR-033), checked by [app/mcp_auth.py](app/mcp_auth.py)
+before the MCP app sees anything.
+
+- **Fails closed.** Unset refuses everyone; a malformed entry raises at
+  startup. Do not make either skip and carry on.
+- **Pure ASGI**, not `BaseHTTPMiddleware`, which buffers and breaks SSE.
+- `main()` runs uvicorn on `build_app()` itself, so `mcp.run()` would bypass
+  the gate. Do not switch back.
+- A token approves a client, not a model. Which Open WebUI presets may search
+  is still tool scoping there.
+- Changing the variable needs `docker compose up -d mcp-server`; a restart
+  does not re-read `.env`.
+- **Qdrant keys are required** (`${VAR:?}`): unkeyed, anything on `llm-net`
+  reads the index around the gate. Readers get the read-only key, so
+  `mcp-server` calls `check_collection()`, never `init_collection()`.
+- **No `env_file: .env` on `mcp-server` or `rag-admin`**: list the variables.
+  The vault's settings live in `.env.vault`, read by `mcp-vault` alone.
+  `tests/test_compose.py` enforces all of this from `docker-compose.yml`.
+
 ### The admin dashboard
 
 `rag-admin` (ADR-031): [app/admin_server.py](app/admin_server.py) serves

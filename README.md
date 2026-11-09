@@ -52,7 +52,9 @@ cd ~/Dev/LLM && docker compose up -d
 Then:
 
 ```bash
-cp .env.example .env     # set LOCAL_DOCS_PATH, VAULT_ALLOWED_EMAILS, VAULT_JWT_SECRET
+cp .env.example .env              # set LOCAL_DOCS_PATH, the two QDRANT_*_KEYs, MCP_CLIENT_TOKENS
+cp .env.vault.example .env.vault  # set VAULT_JWT_SECRET, VAULT_ALLOWED_EMAILS; read by mcp-vault only
+chmod 600 .env .env.vault
 make build
 make up
 make doctor              # everything should be green before you ingest
@@ -289,7 +291,7 @@ Set these in `~/Dev/LLM/.env` first, or identity verification cannot work:
 WEBUI_AUTH=true
 WEBUI_SECRET_KEY=<openssl rand -hex 32>                     # stable, or registrations are wiped
 ENABLE_FORWARD_USER_INFO_HEADERS=true
-FORWARD_USER_INFO_HEADER_JWT_SECRET=<openssl rand -hex 32>  # must equal VAULT_JWT_SECRET here
+FORWARD_USER_INFO_HEADER_JWT_SECRET=<openssl rand -hex 32>  # must equal VAULT_JWT_SECRET in .env.vault
 ENABLE_PLUGINS=true     # since Open WebUI 0.12.0, false also disables MCP servers
 ENABLE_TOOLS=false      # what ENABLE_PLUGINS=false used to do, minus the tool servers
 ENABLE_FUNCTIONS=false
@@ -309,8 +311,8 @@ secret.
 Then **Admin Panel → Settings → Tools**, adding each as **Connection type:
 MCP**:
 
-- Open tier: `http://mcp-server:8000/mcp`
-- Vault: `http://mcp-vault:8001/mcp`
+- Open tier: `http://mcp-server:8000/mcp`, Auth **Bearer**, the `open-webui` token
+- Vault: `http://mcp-vault:8001/mcp`, Auth **None**
 
 Container names, not `localhost` — inside that container `localhost` is itself.
 
@@ -318,10 +320,14 @@ Three settings decide whether this works at all, and getting any of them wrong
 produces a silent failure that looks like the model simply choosing not to
 search:
 
-- **Auth: None.** The dialog defaults to Bearer. Left blank, Open WebUI 0.11.x
-  sent `Authorization: Bearer ` — an empty header value, which `h11` rejects,
-  so the connection died before a byte was sent and **the MCP server logged
-  nothing at all**. 0.13.0 omits the empty header; None is still correct.
+- **Auth: Bearer for the open tier, None for the vault.** `mcp-server` refuses
+  any request without an approved client token (ADR-033): paste the
+  `open-webui:` token from `MCP_CLIENT_TOKENS` in `.env` as its key. Wrong or
+  missing, the tools fail and `journalctl -t mcp-server` logs
+  `refused ... no approved client token`. The vault takes no token (its
+  identity assertion does that job), so leave it on None: Open WebUI 0.11.x
+  sent a blank Bearer key as `Authorization: Bearer `, which `h11` rejects
+  before a byte is sent, so **the server logged nothing at all**.
 - **Connection type: MCP, not OpenAPI.** OpenAPI is the dialog default; it
   fetches a spec from `/mcp`, which serves JSON-RPC, and gets no tools. The
   symptom is `GET /mcp/openapi.json → 404` in the server log.
@@ -345,13 +351,33 @@ the tools were *offered*; only a fifth `POST /mcp` proves one was *called*.
 
 ## Claude Desktop / Claude Code
 
+Give each client its own entry in `MCP_CLIENT_TOKENS` (`claude-code:<token>`),
+then `docker compose up -d mcp-server`. For Claude Code, without the token
+appearing in your shell history:
+
+```bash
+TOKEN=$(sed -n 's/^MCP_CLIENT_TOKENS=.*claude-code:\([0-9a-f]*\).*/\1/p' .env)
+claude mcp add --transport http -s user rag-docs http://localhost:8000/mcp \
+  --header "Authorization: Bearer $TOKEN"
+```
+
+Elsewhere (Claude Desktop, other clients) the equivalent is:
+
 ```json
 {
   "mcpServers": {
-    "rag-docs": { "type": "streamable-http", "url": "http://localhost:8000/mcp" }
+    "rag-docs": {
+      "type": "http",
+      "url": "http://localhost:8000/mcp",
+      "headers": { "Authorization": "Bearer <claude-code token>" }
+    }
   }
 }
 ```
+
+The token identifies the client, not the model: every model you run in Claude
+Code can use it, in every project at `-s user`. Revoke it by deleting its entry
+and recreating `mcp-server`.
 
 The vault endpoint is intentionally omitted: without Open WebUI's signed
 identity assertion every call is denied anyway. Use `make vault-query`.

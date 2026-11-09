@@ -991,3 +991,67 @@ into a live inbox would resurrect documents removed since the backup.
 **Revisit if:** a copy that no box on the LAN can destroy is wanted (a B2
 bucket with Object Lock is one more file in `repos.d/`), or the corpus grows
 until a weekly full read takes too long (`--read-data-subset`).
+
+## ADR-033: The open-tier MCP server takes only approved clients
+
+**Chosen:** `mcp-server` refuses every request that lacks an approved client
+token. `MCP_CLIENT_TOKENS` in `.env` names each client and its token
+(`open-webui:<hex>,claude-code:<hex>`); the client sends it as
+`Authorization: Bearer`. [app/mcp_auth.py](../app/mcp_auth.py) is a pure ASGI
+gate in front of the SDK's Starlette app, checks every path (an unknown route
+is a 401, not a 404), and compares against every token in constant time.
+Unset means nobody gets in; a malformed entry (no name, under 32 characters,
+a name or token used twice) stops the server at startup. `rag doctor` parses
+the same variable and reports the clients it names.
+
+**Why:** the open tier was protected only by binding to `127.0.0.1`. That
+keeps the LAN out, but every process on the host, every container on
+`llm-net` and any browser page that rebinds a name to localhost could query
+it. The owner wants only clients they approved, Claude Code and Open WebUI,
+to read it.
+
+**Rejected:**
+
+- *The SDK's OAuth resource-server support* (`token_verifier`,
+  `AuthSettings`). It needs an issuer and protected-resource metadata, and
+  makes clients go looking for an authorization server. It solves delegated
+  login for many users; this is one owner approving two programs.
+- *One shared token.* Revoking one client would re-key the other, and a
+  refusal could not say who it was.
+- *Hashing the tokens in `.env`.* Anything that can read `.env` already
+  holds Qdrant's read-write key, and the tokens sit in
+  plaintext in each client's config anyway. A hash would make Open WebUI's
+  token impossible to recover for the admin dialog and buy nothing.
+- *Open WebUI's identity assertion.* It is sent to every tool server, so it
+  says which user is chatting, not which program is calling, and any of them
+  could replay it.
+- *Starlette's `BaseHTTPMiddleware`.* It buffers responses, which breaks the
+  streamable-HTTP transport's SSE stream.
+
+**Limits:** a token approves a client, not a model. Every model Claude Code
+runs, and every Open WebUI preset with the tool attached, uses its client's
+token; which Open WebUI models may search stays per-preset tool scoping. The
+tokens are readable by any process running as the owner (`.env` is 0600,
+`~/.claude.json` holds Claude Code's).
+
+**Closing the way around it.** A gate on `mcp-server` means nothing while the
+index behind it is open, and Qdrant had no API key: `open-webui` and
+`llama-server` share `llm-net` with it and could read every chunk directly.
+Both Qdrant keys are now required (`${VAR:?}` in compose, so it will not start
+without them). The worker holds the read-write key; `mcp-server` and
+`rag-admin` the read-only one, which cannot create a collection, so
+`mcp-server` now calls `check_collection()` (verify, never create) at startup
+instead of `init_collection()`.
+
+**Each container gets only what it reads.** `mcp-server` no longer takes
+`env_file: .env`; like `rag-admin`, it lists its variables, so the
+model-facing server holds its client tokens and Qdrant's read-only key and
+nothing else. The vault's settings (`VAULT_JWT_SECRET`, the allowlist, the
+TTLs) moved to `.env.vault`, which only `mcp-vault` reads, so the ingestion
+worker, which parses untrusted files and still takes `.env` whole, no longer
+receives the identity secret either. `tests/test_compose.py` reads
+`docker-compose.yml` and fails if any of this is undone.
+
+**Revisit if:** the server binds off loopback (TLS first: a bearer token in
+cleartext is a password on the wire), or a client is wanted that cannot send
+a static header.

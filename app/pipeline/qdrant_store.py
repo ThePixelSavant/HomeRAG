@@ -131,6 +131,22 @@ def verify_fingerprint() -> None:
 # --------------------------------------------------------------------------
 
 
+def check_collection() -> bool:
+    """Readers' startup check: verify the fingerprint, create nothing.
+
+    mcp-server holds Qdrant's read-only key, so init_collection would fail
+    with 403 against a missing collection. The worker creates it on its next
+    run; until then a search finds nothing, which is the truth.
+    """
+    name = settings.collection_name
+    if not get_client().collection_exists(name):
+        logger.warning("Collection %r does not exist yet; run `rag ingest`", name)
+        return False
+    verify_fingerprint()
+    logger.info("Collection %r ready (dim=%d)", name, settings.embed_dim)
+    return True
+
+
 def init_collection() -> None:
     client = get_client()
     name = settings.collection_name

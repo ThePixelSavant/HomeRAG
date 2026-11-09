@@ -58,6 +58,9 @@ class Settings(BaseSettings):
     mcp_host: str = "0.0.0.0"
     mcp_port: int = 8000
     vault_port: int = 8001
+    # Approved clients of the open-tier server (ADR-033), as
+    # `name:token,name:token`. Unset and mcp-server refuses every request.
+    mcp_client_tokens: str | None = None
 
     # --- Admin dashboard (rag-admin, ADR-031) ---
     # The one secret for the read-only dashboard: typed once at /login, or sent

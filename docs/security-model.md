@@ -18,6 +18,8 @@ Defended against:
 |---|---|
 | A model deciding on its own to read financial records | Per-request approval, granted at a TTY |
 | A prompt-injected model exfiltrating vault data | Same, plus a typed confirmation naming the principal and query |
+| An unapproved agent, container or browser page querying the open tier | `mcp-server` refuses any request without a per-client token from `MCP_CLIENT_TOKENS`; Qdrant itself requires a key, so it cannot be read around `mcp-server` ([ADR-033](decisions.md#adr-033-the-open-tier-mcp-server-takes-only-approved-clients)) |
+| A compromised `mcp-server` or worker minting identity assertions | Neither receives `VAULT_JWT_SECRET`: it lives in `.env.vault`, read by `mcp-vault` alone; `tests/test_compose.py` holds it there |
 | Another container on `llm-net` reaching vault data | `mcp-vault` is not on `llm-net`; identity gate; no unlock endpoint on the network |
 | A compromised `mcp-server` replaying the identity assertion it is handed every turn | It cannot reach `mcp-vault`: separate `vault-net` bridge with only `open-webui`; verified by `~/Dev/LLM/scripts/check-vault-net.sh` |
 | A compromised `mcp-server` ARP-spoofing the `open-webui` ↔ `mcp-vault` hop | Not in that broadcast domain; `mcp-server` runs `cap_drop: [NET_RAW]` |
@@ -44,7 +46,11 @@ Defended against:
 - **Traffic analysis.** The audit log records that a query happened and its
   hash, which reveals timing and volume.
 - **The open tier.** It is plaintext by design. Anything in `manuals`,
-  `sdk-docs`, `notes` or `infra` is readable by any model with MCP access.
+  `sdk-docs`, `notes` or `infra` is readable by any model an approved client
+  runs: the client token says which program is asking, not which model.
+- **Processes running as you.** The client tokens sit in `.env` and in each
+  client's own config (`~/.claude.json` for Claude Code), readable by
+  anything running under your account.
 
 ### Ingestion runs across a process boundary
 
@@ -156,7 +162,7 @@ route off the host), `mcp-vault` publishes no host port and runs with
 `cap_drop: [ALL]` and `no-new-privileges`, and `make up` fails if
 `~/Dev/LLM/scripts/check-vault-net.sh` does. The host itself can still reach
 `mcp-vault` on its bridge IP; on the host the boundary is the docker group and
-`.env`, not the network. `mcp-vault` makes no outbound network
+`.env.vault` (mode 600, the JWT secret), not the network. `mcp-vault` makes no outbound network
 calls and `vaultctl` reaches it over `control.sock` from inside the same
 container, so it loses nothing by being unreachable from everything else.
 
@@ -178,6 +184,36 @@ between bridges, so this is isolation and not merely a missing DNS record.
 > inside that container, and setting the flag to `false` to "make it work"
 > buys encryption without authentication, which does not stop the MITM the TLS
 > was for.
+
+### Approved clients of the open tier
+
+`mcp-server` serves only clients named in `MCP_CLIENT_TOKENS`
+([ADR-033](decisions.md#adr-033-the-open-tier-mcp-server-takes-only-approved-clients)):
+`open-webui` and `claude-code` today. Each sends its own token as
+`Authorization: Bearer`; anything else gets a 401 from
+[app/mcp_auth.py](../app/mcp_auth.py) before the MCP app sees the request.
+Before this, the only boundary was the `127.0.0.1` port binding, which kept
+the LAN out and let everything else in: every process on the host, every
+container on `llm-net`, and a browser page that rebinds a name to localhost.
+
+- **Fails closed.** Unset, every request is refused; a malformed entry stops
+  the server at startup, so a typo cannot quietly drop a client or let one in.
+- **One token per client**, so revoking Claude Code does not re-key Open
+  WebUI, and the log names who was refused.
+- **Not the identity assertion.** Open WebUI forwards that to every tool
+  server, so it identifies a user, not a client, and any server could replay
+  it. The client token is sent only to `mcp-server`.
+- **Qdrant is keyed too.** Without that the gate is decoration: anything on
+  `llm-net` could read the collection directly. The worker holds the
+  read-write key; `mcp-server` and `rag-admin` the read-only one, which gets
+  403 on any write. Compose refuses to start without both keys.
+- **Each container gets only its own variables.** `mcp-server` and
+  `rag-admin` list theirs instead of reading `.env`; the vault's settings are
+  in `.env.vault`, which only `mcp-vault` reads.
+- **What it does not do:** pick models. Every preset with the tool attached
+  shares Open WebUI's token, so which Open WebUI models may search is still
+  per-preset tool scoping. And a process running as you can read the tokens
+  out of `.env` or `~/.claude.json`.
 
 ### The admin dashboard
 

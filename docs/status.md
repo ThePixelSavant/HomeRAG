@@ -91,6 +91,8 @@ Legend: **done** = built, tested and exercised against real data ·
 | Makefile control plane | done | 34 targets, reachable from any directory via `rag` |
 | `make doctor` preflight | done | |
 | Open-tier MCP server | done | 4 tools, verified over the wire |
+| Open-tier client tokens | built | `MCP_CLIENT_TOKENS` (ADR-033). Verified live 2026-11-09: no token, a wrong token, and `open-webui`'s container without one are all 401; Claude Code's token initialises. Open WebUI's connection needs its token entered in the admin dialog |
+| Qdrant keys and per-container environments | built | ADR-033. Verified live 2026-11-09: `open-webui` → Qdrant without a key is 401; the read-only key reads 1,268 points and gets 403 on a write; `search_docs` through `mcp-server`, `make query`, `doctor` and the dashboard all work. `VAULT_JWT_SECRET` is present in `mcp-vault` only (checked with `env` in `mcp-server`, `rag-admin` and the worker) |
 | Vault MCP server | done | 4 tools, verified to fail closed over the wire |
 | Open WebUI integration | done | Verified end to end through a real browser session, 2026-09-21 |
 | Admin dashboard (`rag-admin`) | built | Read-only, open tier only, `127.0.0.1:8090` (ADR-031). Verified live 2026-11-07: healthy, uid 1000, `cap_drop: [ALL]`, state mounted read-only, `llm-net` only, no JWT secret in its environment; login redirect, 401 without a token, foreign Host refused; reads Qdrant (1,268 chunks) with the read-only key; `check-vault-net.sh` confirms it cannot reach `mcp-vault`. Driven in Firefox 159 over WebDriver BiDi: all five views, the documents filter form, chart hover, dark mode, a 390 px viewport with no sideways scroll, logout, and no CSP violations |

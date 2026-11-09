@@ -3,6 +3,9 @@
 Serves manuals, SDK docs, notes and infra plans. Holds no key, links no crypto,
 and has no vault mount -- a compromise here cannot reach vault.db.
 
+Only approved clients get in: every request needs a token from
+MCP_CLIENT_TOKENS (app/mcp_auth.py, ADR-033).
+
 Vault domains are not served from this process at all. Asking for one returns a
 pointer to the vault server rather than data, so the boundary is visible rather
 than silently empty.
@@ -14,7 +17,7 @@ import logging
 
 from mcp.server.mcpserver import MCPServer
 
-from app import documents
+from app import documents, mcp_auth
 from app.config import settings
 from app.domains import DOMAIN_TIERS, Tier, UnknownDomainError, domains_in, tier_of
 from app.pipeline import qdrant_store, state
@@ -239,9 +242,29 @@ def get_index_status() -> dict:
     }
 
 
+def build_app():
+    """The MCP app behind the client-token gate (ADR-033).
+
+    Raises ClientTokenError on a malformed MCP_CLIENT_TOKENS, so a typo stops
+    the server at startup instead of locking a client out in silence.
+    """
+    tokens = mcp_auth.parse_client_tokens(settings.mcp_client_tokens)
+    if tokens:
+        logger.info("Approved MCP clients: %s", ", ".join(sorted(tokens)))
+    else:
+        logger.error(
+            "MCP_CLIENT_TOKENS is unset: every request will be refused. "
+            "Add name:token pairs to .env and recreate mcp-server."
+        )
+    return mcp_auth.BearerAuth(mcp.streamable_http_app(host=settings.mcp_host), tokens)
+
+
 def main() -> None:
-    logger.info("Initialising Qdrant collection...")
-    qdrant_store.init_collection()
+    import uvicorn
+
+    app = build_app()
+    # Check, never create: this server holds Qdrant's read-only key.
+    qdrant_store.check_collection()
     # Deliberately NOT state.init(): this server is a reader and mounts
     # data/state read-only. The ingestion worker owns that file.
     logger.info(
@@ -250,7 +273,8 @@ def main() -> None:
         settings.mcp_port,
         ",".join(domains_in(Tier.OPEN)),
     )
-    mcp.run(transport="streamable-http", host=settings.mcp_host, port=settings.mcp_port)
+    # What mcp.run(transport="streamable-http") does, with the gate in front.
+    uvicorn.run(app, host=settings.mcp_host, port=settings.mcp_port, log_level="info")
 
 
 if __name__ == "__main__":

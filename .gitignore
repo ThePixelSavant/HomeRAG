@@ -1,4 +1,5 @@
 .env
+.env.vault
 __pycache__/
 *.pyc
 *.pyo
