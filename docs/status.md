@@ -91,7 +91,7 @@ Legend: **done** = built, tested and exercised against real data ·
 | Makefile control plane | done | 34 targets, reachable from any directory via `rag` |
 | `make doctor` preflight | done | |
 | Open-tier MCP server | done | 4 tools, verified over the wire |
-| Open-tier client tokens | built | `MCP_CLIENT_TOKENS` (ADR-033). Verified live 2026-11-09: no token, a wrong token, and `open-webui`'s container without one are all 401; Claude Code's token initialises. Open WebUI's connection needs its token entered in the admin dialog |
+| Open-tier client tokens | built | `MCP_CLIENT_TOKENS` (ADR-033). Verified live 2026-11-09: no token, a wrong token, and `open-webui`'s container without one are all 401; Claude Code's token initialises. Open WebUI's connection, set to Bearer with its token, is refused before and answered 200 after; a fresh Claude Code connection with its header reports Connected |
 | Qdrant keys and per-container environments | built | ADR-033. Verified live 2026-11-09: `open-webui` → Qdrant without a key is 401; the read-only key reads 1,268 points and gets 403 on a write; `search_docs` through `mcp-server`, `make query`, `doctor` and the dashboard all work. `VAULT_JWT_SECRET` is present in `mcp-vault` only (checked with `env` in `mcp-server`, `rag-admin` and the worker) |
 | Vault MCP server | done | 4 tools, verified to fail closed over the wire |
 | Open WebUI integration | done | Verified end to end through a real browser session, 2026-09-21 |
