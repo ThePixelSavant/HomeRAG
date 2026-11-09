@@ -25,10 +25,12 @@ services:
       # move to different hardware. They belong in the rsync-able tree.
       - ./data/qdrant-snapshots:/qdrant/snapshots
     environment:
-      # Set once Qdrant is reachable off the local bridge. Unauthenticated is
-      # survivable on a private bridge, not on a LAN.
-      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:-}
-      QDRANT__SERVICE__READ_ONLY_API_KEY: ${QDRANT_READ_ONLY_API_KEY:-}
+      # Required. llm-net is shared with open-webui and llama-server, and an
+      # unauthenticated Qdrant let any of them read every open-tier chunk
+      # without going through mcp-server's client tokens (ADR-033). The worker
+      # holds the read-write key; mcp-server and rag-admin the read-only one.
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:?set QDRANT_API_KEY in .env (openssl rand -hex 32)}
+      QDRANT__SERVICE__READ_ONLY_API_KEY: ${QDRANT_READ_ONLY_API_KEY:?set QDRANT_READ_ONLY_API_KEY in .env (openssl rand -hex 32)}
     healthcheck:
       # The image ships no curl, wget, nc or python3 -- only bash. The previous
       # `curl -f .../health` could never pass, which is why mcp-server sat in
@@ -60,14 +62,25 @@ services:
     user: "${RAG_UID:-1000}:${RAG_GID:-1000}"
     ports:
       - "127.0.0.1:${MCP_PORT:-8000}:8000"
-    env_file:
-      - .env
+    # NOT env_file: .env. This is the server models talk to, and .env holds
+    # secrets it has no use for (the vault's JWT secret lives in .env.vault
+    # now, but REPORT_TOKEN and whatever is added next would still arrive).
+    # Only what app.main and its imports read; tests/test_compose.py holds it.
     environment:
       QDRANT_URL: http://qdrant:6333
       # Read-only key: this service never writes.
-      QDRANT_API_KEY: ${QDRANT_READ_ONLY_API_KEY:-}
+      QDRANT_API_KEY: ${QDRANT_READ_ONLY_API_KEY:?set QDRANT_READ_ONLY_API_KEY in .env (openssl rand -hex 32)}
+      COLLECTION_NAME: ${COLLECTION_NAME:-docs}
+      # The fingerprint check refuses to start on a mismatch, so a value
+      # dropped here fails loudly rather than embedding queries wrongly.
+      EMBED_MODEL: ${EMBED_MODEL:-BAAI/bge-small-en-v1.5}
+      EMBED_DIM: ${EMBED_DIM:-384}
+      EMBED_THREADS_QUERY: ${EMBED_THREADS_QUERY:-4}
+      FASTEMBED_CACHE_PATH: ${FASTEMBED_CACHE_PATH:-/models}
+      CHUNK_TARGET_TOKENS: ${CHUNK_TARGET_TOKENS:-400}
       STATE_DB_PATH: /data/state/rag.db
       SOURCES_FILE: /app/sources.yaml
+      MCP_CLIENT_TOKENS: ${MCP_CLIENT_TOKENS:-}
     volumes:
       # state/ only. Deliberately NO vault mount: this service must not be able
       # to open vault.db under any circumstances.
@@ -112,7 +125,7 @@ services:
     # it has no use for. Only what the report reads.
     environment:
       QDRANT_URL: http://qdrant:6333
-      QDRANT_API_KEY: ${QDRANT_READ_ONLY_API_KEY:-}
+      QDRANT_API_KEY: ${QDRANT_READ_ONLY_API_KEY:?set QDRANT_READ_ONLY_API_KEY in .env (openssl rand -hex 32)}
       COLLECTION_NAME: ${COLLECTION_NAME:-docs}
       EMBED_MODEL: ${EMBED_MODEL:-BAAI/bge-small-en-v1.5}
       EMBED_DIM: ${EMBED_DIM:-384}
@@ -162,16 +175,20 @@ services:
     # This does NOT hide the vault from the host: the host has an address on
     # every bridge and can still connect to mcp-vault's vault-net IP directly.
     # The network boundary is container-to-container. On the host the boundary
-    # is the docker group (docker exec reaches vaultctl) and .env (mode 600,
-    # holds the JWT secret) -- anything with those needs no network path.
+    # is the docker group (docker exec reaches vaultctl) and .env.vault (mode
+    # 600, holds the JWT secret) -- anything with those needs no network path.
     #
     # Unprivileged uid, high port, no raw sockets: it needs no capabilities.
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
+    # .env.vault holds the identity secret and the vault's allowlist and
+    # TTLs. Only this service reads it: the worker and mcp-server, the two
+    # that handle untrusted input, never see VAULT_JWT_SECRET.
     env_file:
       - .env
+      - .env.vault
     environment:
       VAULT_DB_PATH: /data/vault/vault.db
       VAULT_BLOBS_PATH: /data/vault/blobs
@@ -223,6 +240,9 @@ services:
       - .env
     environment:
       QDRANT_URL: http://qdrant:6333
+      # Read-write: the only service that writes the index. Also in .env, but
+      # stated here so a missing key stops the run instead of a 401 mid-sync.
+      QDRANT_API_KEY: ${QDRANT_API_KEY:?set QDRANT_API_KEY in .env (openssl rand -hex 32)}
       LLAMA_URL: ${LLAMA_URL:-http://llama-server:8080}
       DATA_ROOT: /data
       INBOX_PATH: /data/inbox

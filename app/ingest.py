@@ -119,6 +119,19 @@ def cmd_doctor(args) -> int:
             )
             failed = failed or not complete
 
+    # The worker gets .env whole, so it sees what mcp-server will parse.
+    from app import mcp_auth
+
+    try:
+        clients = mcp_auth.parse_client_tokens(settings.mcp_client_tokens)
+        if clients:
+            rows.append((OK, "mcp clients", ", ".join(sorted(clients))))
+        else:
+            rows.append((WARN, "MCP_CLIENT_TOKENS", "unset; mcp-server refuses every request"))
+    except mcp_auth.ClientTokenError as exc:
+        rows.append((BAD, "MCP_CLIENT_TOKENS", str(exc)[:96]))
+        failed = True
+
     try:
         from app.vault import control
 
