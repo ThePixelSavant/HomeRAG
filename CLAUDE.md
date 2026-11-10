@@ -417,8 +417,9 @@ worker; [scripts/rag-backup](scripts/rag-backup) runs restic on the host.
 |---|---|
 | `mcp` major version | 1.x `FastMCP` became 2.x `MCPServer`. Pinned `<3`. |
 | `qdrant-client` floor | `client.search()` was **removed** in 1.12+. Use `query_points`, read `.points`. Pinned `>=1.12,<2`. |
-| Qdrant healthcheck | The image has no `curl`/`wget`/`nc`, only bash, and the endpoint is `/healthz`. Uses a `/dev/tcp` probe against `127.0.0.1` (not `localhost`, which may resolve `::1`). |
-| Qdrant image digest | Snapshot restore needs a matching minor version, so `:latest` breaks migration. Pinned by digest with a rollback comment. |
+| Qdrant image | `dhi.io/qdrant` (ADR-034): no shell, so **no healthcheck** and no `docker exec qdrant` debugging. Dependents use `service_started`; `mcp-server` waits for it (`check_collection(wait_seconds=60)`). Do not add a shell back for a healthcheck. Pulling needs `docker login dhi.io`. |
+| Qdrant image digest | Snapshot restore needs a matching minor version, so `:latest` breaks migration. Pinned by digest with a rollback comment (the official image, same version, verified against the same storage and snapshots). |
+| Snapshot size in a tmpfs | A snapshot of storage on tmpfs came out 20x larger (665 MB vs 31.6 MB): the segments lose their sparseness. Measure snapshot sizes on the real disk, never in `/tmp`. |
 | Glob matching | `fnmatch("a.md", "**/*")` is **False** — `**/` needs a literal slash. `_matches` handles the prefix; an empty `include` means everything. |
 | Bind-mounted files | Docker creates a *directory* when a bind-mounted file is missing. Mount directories: `data/state/` and `data/vault/` are separate so `mcp-server` gets state read-only and no vault mount at all. |
 | Vault ingestion vs file ownership | `mcp-vault` stayed root after the others moved to 1000, and its `0600` files shut the worker out: every vault ingest failed with `Permission denied: vault.salt`. Everything is 1000 now; the socket moved to a private tmpfs so the shared uid does not hand it to the worker. |

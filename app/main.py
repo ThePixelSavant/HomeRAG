@@ -30,6 +30,8 @@ mcp = MCPServer("rag-docs")
 
 # Per side. Every chunk returned is prefilled before the model writes a word.
 MAX_CONTEXT_CHUNKS = 2
+# Qdrant loads this index in about a second; a minute covers a cold host.
+QDRANT_STARTUP_WAIT_SECONDS = 60
 
 
 @mcp.tool()
@@ -263,8 +265,9 @@ def main() -> None:
     import uvicorn
 
     app = build_app()
-    # Check, never create: this server holds Qdrant's read-only key.
-    qdrant_store.check_collection()
+    # Check, never create: this server holds Qdrant's read-only key. Waits
+    # because the hardened Qdrant image has no healthcheck to wait on (ADR-034).
+    qdrant_store.check_collection(wait_seconds=QDRANT_STARTUP_WAIT_SECONDS)
     # Deliberately NOT state.init(): this server is a reader and mounts
     # data/state read-only. The ingestion worker owns that file.
     logger.info(

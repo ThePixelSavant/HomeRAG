@@ -292,7 +292,7 @@ process with them. See
 | `mcp-server` | **1000:1000** | The HTTP surface the model talks to |
 | `mcp-vault` | **1000:1000** | Holds the key. Migrated 2026-09-27, sealed and backed up first |
 | `rag-admin` | **1000:1000** | Read-only dashboard; `cap_drop: [ALL]`, `no-new-privileges` |
-| `qdrant` | **1000:1000** | Set in compose, since it is a third-party image |
+| `qdrant` | **1000:1000** | Set in compose: the hardened image defaults to 65532, and the storage tree stays owned by the host user. Read-only root filesystem, no capabilities (ADR-034) |
 
 `RAG_UID`/`RAG_GID` are build args and compose variables, defaulting to
 `1000:1000`. They must match the owner of `./data` or every write fails. On a

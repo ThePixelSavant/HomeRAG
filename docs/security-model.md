@@ -215,6 +215,23 @@ container on `llm-net`, and a browser page that rebinds a name to localhost.
   per-preset tool scoping. And a process running as you can read the tokens
   out of `.env` or `~/.claude.json`.
 
+### Qdrant's container
+
+Qdrant holds every open-tier chunk in plaintext, so a compromise of it is a
+compromise of the open tier. It runs the Docker Hardened Image
+(`dhi.io/qdrant`, [ADR-034](decisions.md#adr-034-qdrant-runs-the-docker-hardened-image)):
+the Qdrant binary and its libraries, no shell, no package manager. An
+attacker who gets code execution inside finds nothing to run. Around it:
+uid 1000, a read-only root filesystem, every capability dropped,
+`no-new-privileges`, no host port, keys required (ADR-033), and telemetry
+off, so it makes no outbound calls.
+
+The cost is that nothing can be run inside it: no healthcheck and no
+`docker exec qdrant` debugging. `check-vault-net.sh` probes it from a
+throwaway container that joins its network namespace (which sees exactly
+what Qdrant sees) and treats a probe that fails to run as unproven, not as
+unreachable.
+
 ### The admin dashboard
 
 `rag-admin` ([ADR-031](decisions.md#adr-031-a-read-only-admin-dashboard-in-the-browser-not-in-open-webui))

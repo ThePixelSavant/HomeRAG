@@ -1055,3 +1055,71 @@ receives the identity secret either. `tests/test_compose.py` reads
 **Revisit if:** the server binds off loopback (TLS first: a bearer token in
 cleartext is a password on the wire), or a client is wanted that cannot send
 a static header.
+
+## ADR-034: Qdrant runs the Docker Hardened Image
+
+**Chosen:** `qdrant` runs `dhi.io/qdrant` 1.20.0-debian13, pinned by digest,
+with a read-only root filesystem, `cap_drop: [ALL]`, `no-new-privileges`,
+uid 1000 (the image defaults to 65532) and `QDRANT__TELEMETRY_DISABLED`.
+The image holds the Qdrant binary and its libraries: no shell, no package
+manager, three entries in `/usr/bin` against the official image's 341, and
+165 MB against 276 MB.
+
+**Why:** Qdrant holds every open-tier chunk in plaintext. The official image
+is a full Debian with `bash`, `apt-get` and coreutils, a toolbox for anyone
+who gets code execution inside it, and nothing in this stack used any of it
+but the healthcheck. Telemetry was on by default: an hourly report to
+`telemetry.qdrant.io`, which failed and logged an ERROR every hour.
+
+**Verified before switching**, against copies of `data/qdrant`, never the
+live tree:
+
+- Its built-in `config.yaml` and `production.yaml` are identical to the
+  official image's, so the storage and snapshot mounts carry over unchanged.
+- Every point (id, payload, dense and sparse vectors) and the top-5 hits for
+  three queries are identical to the live instance.
+- A snapshot taken by it restores into an empty instance of it identically;
+  so does the latest backup bundle, which the official image took. Backups
+  from before the switch stay restorable.
+- Every file it writes stays owned by uid 1000. The read-only key cannot
+  snapshot (403).
+
+**What it costs:**
+
+- *No healthcheck.* There is nothing in the image to run one with. The old
+  one only proved the port accepted a TCP connection. `mcp-server` and
+  `rag-admin` depend on `service_started`, and `mcp-server` retries
+  `check_collection` for up to 60 s while Qdrant refuses connections (only
+  then: a 401 or 403 is a wrong key and fails at once).
+- *No `docker exec qdrant`.* `~/Dev/LLM/scripts/check-vault-net.sh` probed
+  every container from inside. For one with no tools it now runs a
+  throwaway container from an image that has `python3`, joined to the
+  target's network namespace, so it sees exactly what the target sees. A
+  probe that fails to run is reported as unproven, never as unreachable,
+  and a positive control (the helper in `open-webui`'s namespace) connected.
+- *A registry login.* Pulling needs `docker login dhi.io` with a Docker Hub
+  account. A restore onto a new machine needs one too; the rollback below
+  does not.
+
+**Rejected:**
+
+- *A shell or a static probe added back for the healthcheck.* It would
+  re-add part of what the image removes, to check something `mcp-server`
+  now checks anyway.
+- *Qdrant's own `-unprivileged` tag.* It changes only the default user,
+  which compose already sets.
+- *Chainguard's image.* Pinning a version needs a paid plan, and pinning is
+  what snapshot restore depends on.
+
+**Measuring:** a snapshot of storage held on tmpfs came out 20 times larger
+(665 MB against 31.6 MB): the segments lose their sparseness. On the real
+disk both images produce 31.6 MB. Measure on disk.
+
+**Rollback:** the official image at the same version,
+`qdrant/qdrant@sha256:9bfc89f9914fc14876a88c05270685921a55b8877b254a98bcc1cc2f0a424cd2`,
+reads the same storage. Restore the healthcheck with it (`bash`
+`/dev/tcp` against `127.0.0.1:6333`).
+
+**Revisit if:** Docker stops publishing the free tier, or a Qdrant upgrade
+lands there late: snapshot restore pins the minor version, so the image tag
+moves only when a backup has been verified against it.

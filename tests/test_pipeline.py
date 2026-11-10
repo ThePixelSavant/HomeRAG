@@ -1087,3 +1087,56 @@ def test_a_partly_changed_document_keeps_its_unchanged_chunks(tmp_path, monkeypa
     assert 0 < result.chunks_upserted < before, "only the edited section is re-embedded"
     assert result.chunks_deleted == 0
     assert len(points) == before
+
+
+# --------------------------------------------------------------------------
+# Readers wait for Qdrant at startup (ADR-034)
+# --------------------------------------------------------------------------
+
+
+class _FlakyClient:
+    def __init__(self, failures, exc):
+        self.failures, self.exc, self.calls = failures, exc, 0
+
+    def collection_exists(self, name):
+        self.calls += 1
+        if self.calls <= self.failures:
+            raise self.exc
+        return False
+
+
+def test_check_collection_waits_while_qdrant_is_unreachable(monkeypatch):
+    from qdrant_client.http.exceptions import ResponseHandlingException
+
+    from app.pipeline import qdrant_store
+
+    client = _FlakyClient(2, ResponseHandlingException(ConnectionError("refused")))
+    monkeypatch.setattr(qdrant_store, "get_client", lambda: client)
+    monkeypatch.setattr(qdrant_store.time, "sleep", lambda s: None)
+    assert qdrant_store.check_collection(wait_seconds=60) is False
+    assert client.calls == 3
+
+
+def test_check_collection_gives_up_after_its_deadline(monkeypatch):
+    from qdrant_client.http.exceptions import ResponseHandlingException
+
+    from app.pipeline import qdrant_store
+
+    client = _FlakyClient(10**6, ResponseHandlingException(ConnectionError("refused")))
+    monkeypatch.setattr(qdrant_store, "get_client", lambda: client)
+    with pytest.raises(ResponseHandlingException):
+        qdrant_store.check_collection(wait_seconds=0)
+    assert client.calls == 1
+
+
+def test_check_collection_does_not_retry_a_rejected_key(monkeypatch):
+    from qdrant_client.http.exceptions import UnexpectedResponse
+
+    from app.pipeline import qdrant_store
+
+    client = _FlakyClient(1, UnexpectedResponse(403, "Forbidden", b"", None))
+    monkeypatch.setattr(qdrant_store, "get_client", lambda: client)
+    monkeypatch.setattr(qdrant_store.time, "sleep", lambda s: None)
+    with pytest.raises(UnexpectedResponse):
+        qdrant_store.check_collection(wait_seconds=60)
+    assert client.calls == 1
