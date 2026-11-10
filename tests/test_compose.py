@@ -117,3 +117,31 @@ def test_env_vault_is_gitignored():
     if not gitignore.exists():
         pytest.skip(".gitignore is not in the image")
     assert ".env.vault" in gitignore.read_text().split()
+
+
+# --------------------------------------------------------------------------
+# Qdrant's container (ADR-034)
+# --------------------------------------------------------------------------
+
+
+def test_qdrant_is_the_hardened_image_pinned_by_digest(services):
+    image = services["qdrant"]["image"]
+    assert image.startswith("dhi.io/qdrant@sha256:"), image
+
+
+def test_qdrant_runs_with_nothing_it_does_not_need(services):
+    q = services["qdrant"]
+    assert q["cap_drop"] == ["ALL"]
+    assert "no-new-privileges:true" in q["security_opt"]
+    assert q["read_only"] is True
+    assert q["user"].startswith("${RAG_UID:-1000}")
+    assert q["environment"]["QDRANT__TELEMETRY_DISABLED"] == "true"
+
+
+def test_nothing_waits_on_a_qdrant_healthcheck_that_cannot_exist(services):
+    # The image has no shell to run one; service_healthy would never start.
+    assert "healthcheck" not in services["qdrant"]
+    for name, service in services.items():
+        dep = (service.get("depends_on") or {})
+        if isinstance(dep, dict) and "qdrant" in dep:
+            assert dep["qdrant"]["condition"] == "service_started", name

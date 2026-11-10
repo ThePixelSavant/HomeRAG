@@ -97,7 +97,7 @@ asserting the two ends in one function call.
 |---|---|
 | `mcp` major version | 1.x `FastMCP` became 2.x `MCPServer`. Pinned `<3`. |
 | `qdrant-client` floor | `client.search()` was **removed** in 1.12+. Use `query_points`, read `.points`. Pinned `>=1.12,<2`. |
-| Qdrant healthcheck | The image has no `curl`/`wget`/`nc`, only bash, and the endpoint is `/healthz`. Uses a `/dev/tcp` probe against `127.0.0.1`, not `localhost` (which may resolve `::1`). |
+| Qdrant healthcheck | None since ADR-034: the hardened image has no shell to run one. Before that, the official image had only bash, so it was a `/dev/tcp` probe against `127.0.0.1`. `mcp-server` now waits for Qdrant itself. |
 | Qdrant image digest | Snapshot restore needs a matching minor version, so `:latest` breaks migration. Pinned by digest with a rollback comment. |
 | Glob matching | `fnmatch("a.md", "**/*")` is **False** — `**/` needs a literal slash. An empty `include` means everything. |
 | Bind-mounted files | Docker creates a *directory* when a bind-mounted file is missing. Mount directories. |

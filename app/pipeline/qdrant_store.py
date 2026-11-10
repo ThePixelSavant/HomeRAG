@@ -8,10 +8,12 @@ inversion recovers most of the source text from one.
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 
 from qdrant_client import QdrantClient
 from qdrant_client import models as qm
+from qdrant_client.http.exceptions import ResponseHandlingException
 
 from app import documents
 from app.config import settings
@@ -131,15 +133,28 @@ def verify_fingerprint() -> None:
 # --------------------------------------------------------------------------
 
 
-def check_collection() -> bool:
+def check_collection(wait_seconds: float = 0) -> bool:
     """Readers' startup check: verify the fingerprint, create nothing.
 
     mcp-server holds Qdrant's read-only key, so init_collection would fail
     with 403 against a missing collection. The worker creates it on its next
     run; until then a search finds nothing, which is the truth.
+
+    `wait_seconds` retries while Qdrant is not yet accepting connections, and
+    only then: a 401 or 403 is a wrong key and fails at once.
     """
     name = settings.collection_name
-    if not get_client().collection_exists(name):
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        try:
+            exists = get_client().collection_exists(name)
+            break
+        except ResponseHandlingException as exc:  # connection refused, DNS, timeout
+            if time.monotonic() >= deadline:
+                raise
+            logger.info("Waiting for Qdrant at %s: %s", settings.qdrant_url, exc)
+            time.sleep(1)
+    if not exists:
         logger.warning("Collection %r does not exist yet; run `rag ingest`", name)
         return False
     verify_fingerprint()

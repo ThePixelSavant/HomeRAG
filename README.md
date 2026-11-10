@@ -55,6 +55,7 @@ Then:
 cp .env.example .env              # set LOCAL_DOCS_PATH, the two QDRANT_*_KEYs, MCP_CLIENT_TOKENS
 cp .env.vault.example .env.vault  # set VAULT_JWT_SECRET, VAULT_ALLOWED_EMAILS; read by mcp-vault only
 chmod 600 .env .env.vault
+docker login dhi.io       # Qdrant is a Docker Hardened Image; a free Docker Hub account, read-only token
 make build
 make up
 make doctor              # everything should be green before you ingest

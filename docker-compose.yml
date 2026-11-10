@@ -3,20 +3,36 @@ services:
   # a vector cannot be encrypted and stay searchable, and inversion recovers
   # most of the source text from one.
   #
+  # Docker Hardened Image (ADR-034): Qdrant and nothing else -- no shell, no
+  # package manager, three entries in /usr/bin against the official image's
+  # 341. Pulling needs `docker login dhi.io` (a free Docker Hub account).
+  #
   # Pinned by digest: snapshot restore requires a matching minor version, so a
   # silent `latest` bump between taking a backup and restoring it breaks the
-  # migration. Current: v1.20.0.
-  # Rollback digest: sha256:057ee3a8da769fe7310dd3537b4dc7583bf87a95ce8ac43c0af5a46bc580d1fc
-  # (v1.19.0); storage backup from before the bump is
-  # data/qdrant-backup-2026-11-05-pre-1.20.tar.gz.
+  # migration. Current: dhi.io/qdrant 1.20.0-debian13.
+  # Rollback to the official image, same version (verified to read the same
+  # storage and restore the same snapshots), which needs the healthcheck back:
+  #   qdrant/qdrant@sha256:9bfc89f9914fc14876a88c05270685921a55b8877b254a98bcc1cc2f0a424cd2
+  # Before that, v1.19.0: sha256:057ee3a8da769fe7310dd3537b4dc7583bf87a95ce8ac43c0af5a46bc580d1fc
+  # (storage backup from before the 1.20 bump is
+  # data/qdrant-backup-2026-11-05-pre-1.20.tar.gz).
   qdrant:
-    image: qdrant/qdrant@sha256:9bfc89f9914fc14876a88c05270685921a55b8877b254a98bcc1cc2f0a424cd2
+    image: dhi.io/qdrant@sha256:a7f3687ad9690253dc91c81897712989d983d4bb324cbe96b86b31ea20fbfb73
     container_name: qdrant
     restart: unless-stopped
-    # Non-root. Third-party image, so this is set here rather than baked in.
-    # Verified: it serves reads and writes as 1000:1000 and the storage tree
-    # comes out owned by the host user instead of root.
+    # The image runs as 65532; this keeps the storage tree owned by the host
+    # user, like every other service. Verified: it serves reads, writes and
+    # snapshots as 1000:1000.
     user: "${RAG_UID:-1000}:${RAG_GID:-1000}"
+    # It listens on high ports and writes only its own bind mounts, so it
+    # needs no capabilities and no writable root filesystem. (It logs one WARN
+    # at startup: it cannot write `.qdrant-initialized`, a Kubernetes readiness
+    # marker nothing here reads.)
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
     volumes:
       - ./data/qdrant:/qdrant/storage
       # Snapshots were landing in the container's own layer, where a
@@ -31,16 +47,13 @@ services:
       # holds the read-write key; mcp-server and rag-admin the read-only one.
       QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:?set QDRANT_API_KEY in .env (openssl rand -hex 32)}
       QDRANT__SERVICE__READ_ONLY_API_KEY: ${QDRANT_READ_ONLY_API_KEY:?set QDRANT_READ_ONLY_API_KEY in .env (openssl rand -hex 32)}
-    healthcheck:
-      # The image ships no curl, wget, nc or python3 -- only bash. The previous
-      # `curl -f .../health` could never pass, which is why mcp-server sat in
-      # Created for six weeks. 127.0.0.1 rather than localhost: the latter can
-      # resolve ::1 first and fail against a v4-only listener.
-      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/6333"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 20s
+      # On by default: an hourly report to telemetry.qdrant.io. Nothing in this
+      # stack should phone home, and the attempts logged an ERROR every hour.
+      QDRANT__TELEMETRY_DISABLED: "true"
+    # No healthcheck: the image has nothing to run one with, and adding a
+    # shell back would undo the point of it. The old check only proved the
+    # port accepted a TCP connection. mcp-server waits for Qdrant itself
+    # (check_collection(wait_seconds=60)), so dependents use service_started.
     networks:
       - llm-net
     logging:
@@ -87,7 +100,7 @@ services:
       - ./data/state:/data/state:ro
     depends_on:
       qdrant:
-        condition: service_healthy
+        condition: service_started
     # This service parses untrusted open-tier documents, which makes it the most
     # likely thing on the bridge to be compromised. NET_RAW is in Docker's
     # default set and is what ARP spoofing needs; nothing here sends raw packets.
@@ -136,7 +149,7 @@ services:
       - ./data/state:/data/state:ro
     depends_on:
       qdrant:
-        condition: service_healthy
+        condition: service_started
     cap_drop:
       - ALL
     security_opt:
