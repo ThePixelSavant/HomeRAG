@@ -1,0 +1,41 @@
+# A tenant of someone else's Qdrant (ADR-035).
+#
+# There is no local qdrant, and every service talks to QDRANT_URL from .env
+# with the tokens the Qdrant admin issued (`rag tenant-token`). Documents,
+# rag.db and the vault stay on this machine; only open-tier chunks and their
+# vectors go to the shared server.
+#
+# Use it for every command by adding this line to .env, which both docker
+# compose and the Makefile read:
+#
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.tenant.yml
+#
+# and in .env:
+#
+#   QDRANT_URL=https://qdrant.example:6333
+#   QDRANT_API_KEY=<write token>             the worker
+#   QDRANT_READ_ONLY_API_KEY=<read token>    mcp-server and rag-admin
+#   COLLECTION_NAME=<tenant name>
+#
+# A tenant cannot create, drop or recover a collection. `rag rebuild-index`
+# empties it instead, and `rag backup-restore` empties it and re-embeds on the
+# next ingest; changing the embedding model needs the admin.
+
+services:
+  qdrant:
+    # Only started on request, which is never.
+    profiles: ["local-qdrant"]
+
+  mcp-server:
+    environment:
+      QDRANT_URL: ${QDRANT_URL:?set QDRANT_URL in .env to the shared Qdrant}
+    depends_on: !reset {}
+
+  rag-admin:
+    environment:
+      QDRANT_URL: ${QDRANT_URL:?set QDRANT_URL in .env to the shared Qdrant}
+    depends_on: !reset {}
+
+  ingestion-worker:
+    environment:
+      QDRANT_URL: ${QDRANT_URL:?set QDRANT_URL in .env to the shared Qdrant}

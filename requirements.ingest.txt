@@ -18,6 +18,9 @@ cryptography>=42.0
 
 # Per-source cron cadences from sources.yaml.
 croniter>=2.0.0
+# Signs tenant tokens for a shared Qdrant (ADR-035). Worker only: readers
+# decode a token's claims without it.
+PyJWT>=2.8.0
 # Calls llama-server for VLM receipt extraction and page transcription.
 httpx>=0.27.0
 # Scales receipt photos and rendered PDF pages for the vision model. fastembed

@@ -45,7 +45,8 @@ class Settings(BaseSettings):
     vault_db_path: Path = Path("/data/vault/vault.db")
     vault_blobs_path: Path = Path("/data/vault/blobs")
     # Backups (ADR-032). Qdrant writes snapshots into its own /qdrant/snapshots,
-    # which is this directory on the host; the worker sees it here.
+    # which is this directory on the host; the worker sees it here. Backups
+    # download snapshots through the API (ADR-035); only restore stages here.
     backups_path: Path = Path("/data/backups")
     qdrant_snapshots_path: Path = Path("/data/qdrant-snapshots")
     backup_keep_local: int = 7

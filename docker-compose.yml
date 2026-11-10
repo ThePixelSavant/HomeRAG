@@ -50,6 +50,11 @@ services:
       # On by default: an hourly report to telemetry.qdrant.io. Nothing in this
       # stack should phone home, and the attempts logged an ERROR every hour.
       QDRANT__TELEMETRY_DISABLED: "true"
+      # Accept tokens signed with the main key, each confined to the
+      # collections it names: how tenants share this Qdrant (ADR-035). The
+      # plain keys above work as before; tokens signed with the read-only key
+      # are rejected, so the readers holding it cannot mint one.
+      QDRANT__SERVICE__JWT_RBAC: "true"
     # No healthcheck: the image has nothing to run one with, and adding a
     # shell back would undo the point of it. The old check only proved the
     # port accepted a TCP connection. mcp-server waits for Qdrant itself

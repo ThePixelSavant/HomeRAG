@@ -1123,3 +1123,130 @@ reads the same storage. Restore the healthcheck with it (`bash`
 **Revisit if:** Docker stops publishing the free tier, or a Qdrant upgrade
 lands there late: snapshot restore pins the minor version, so the image tag
 moves only when a backup has been verified against it.
+
+## ADR-035: Tenants share one Qdrant, each confined by Qdrant to their own collections
+
+**Chosen:** Qdrant runs with `QDRANT__SERVICE__JWT_RBAC`. Each tenant gets a
+collection pair (`<name>` and `<name>__meta`), created by the admin, and
+tokens that name exactly those two collections: `rw` for their ingestion
+worker, `r` for their MCP server and dashboard. The admin commands are
+`rag tenant-create`, `tenant-token`, `tenant-list`, `tenant-revoke` and
+`tenant-delete` ([app/tenants.py](../app/tenants.py)). A tenant's machine
+runs this stack with `docker-compose.tenant.yml`: no local Qdrant, every
+service pointed at `QDRANT_URL`. Their documents, `rag.db` and vault never
+leave it.
+
+**Why:** the question was whether several people could each run their own
+MCP server against one Qdrant without seeing each other's data. Two ways to
+split a Qdrant:
+
+- *A collection per tenant, scoped by token.* Qdrant refuses anything outside
+  the token's collections. A buggy or compromised tenant server cannot read
+  a neighbour, whatever it sends.
+- *One collection with a tenant field, filtered per query.* This is Qdrant's
+  pattern for thousands of tenants, but the separation is a filter the
+  client chooses to send. Every server would hold a key that reads every
+  tenant, and one missing filter returns everyone's documents.
+
+The first one, because the second makes isolation a property of every query
+path being right forever.
+
+**Verified** against Qdrant 1.20 (the hardened image) with JWT RBAC on,
+before any code was written. Each item below is a call made with a real
+token:
+
+- *Inside the token's own collections:* reads, writes, payload indexes,
+  creating, listing and downloading snapshots, and deleting points all
+  succeed.
+- *Another tenant's collection:* querying, retrieving, upserting, deleting
+  it, downloading its snapshots, or pointing `COLLECTION_NAME` at it all get
+  403.
+- *Probing for collection names:* `exists` answers 403 for a real name and a
+  made-up one alike, and `get_collections` lists only the token's own.
+- *Server-wide operations:* creating, deleting or recovering a collection, a
+  full snapshot, `/metrics` and `/cluster` all need global access, so a
+  tenant gets 403.
+- *Forged, read-only-key and expired tokens:*
+  - A token with a forged signature is rejected.
+  - **A token signed with the read-only key is rejected**, even one claiming
+    global manage. `mcp-server` and `rag-admin` hold that key, so they
+    cannot mint tokens.
+  - An expired token is rejected beyond a clock-skew allowance of a few
+    seconds.
+- *Existing keys:* the plain main and read-only keys keep working
+  unchanged, so turning RBAC on changed nothing for this install.
+- *The real code:* `qdrant_store` and `backup` ran end to end under a tenant
+  token (`rag tenant-*` throughout).
+
+**Revocation is a registry row, not a key rotation.** Every token carries a
+`value_exists` claim: it is valid only while `rag_tenants` holds a row with
+the tenant's name and the generation it was issued under. `tenant-revoke`
+writes a new generation and that tenant's old tokens fail with 401 at once,
+nobody else's. Tenants cannot read the registry. The generation is a
+nanosecond timestamp, not a counter, so a lost or recreated registry never
+revives an old token: a fresh row gets a fresh value, and every tenant needs
+a new token, which is the safe way to fail. For the same reason the registry
+is not in backups: restoring an old copy would undo every revocation since.
+
+**Every token expires** (1-730 days, default 365). Qdrant accepts a token
+with no `exp` indefinitely. `rag doctor` shows a tenant's token, its scope
+and its expiry, warns 14 days ahead, and fails once it has passed.
+
+**What a tenant cannot do, and what replaces it:**
+
+| Needs global access | Under a tenant token |
+|---|---|
+| Create the collection | `init_collection` says to ask the admin for `rag tenant-create <name>` |
+| `rebuild-index` drops it | It clears every point instead, after checking the fingerprint, so a model the collection cannot hold fails before anything is deleted |
+| `backup-restore` recovers the snapshot | It keeps the current index aside (downloading its own snapshots works), empties the collection, and marks every open-tier document in the restored `rag.db` for re-embedding. Tombstones keep their rows. The next `rag ingest` rebuilds the index |
+| A new embedding model | The admin deletes and re-creates the tenant. The vector size is fixed at creation, and a tenant's collections take the server's model |
+
+**Two changes reach the single-user install too:**
+
+- *Backups download snapshots through the API* (`download_snapshot`) instead
+  of copying them out of `data/qdrant-snapshots`. That directory is on the
+  Qdrant host, not a tenant's machine. The download is checked against
+  Qdrant's own SHA-256 and written to a `.part` file first. Restore still
+  stages through the shared directory, which only the admin uses.
+- *The fingerprint gap is closed.* A collection created by someone else and
+  never fingerprinted left the model-swap guard off for good:
+  `verify_fingerprint` passes when there is nothing to compare. Now
+  `tenant-create` writes it, and `init_collection` writes one into an empty,
+  unfingerprinted collection. A non-empty one gets a warning rather than a
+  guess, since recording today's model would bless points of unknown
+  origin.
+
+**Not built: exposing Qdrant beyond this host.** It still listens only on
+`llm-net`. Remote tenants need it published behind TLS (Qdrant's own
+`QDRANT__SERVICE__ENABLE_TLS`, or a proxy) or over an encrypted link such as
+WireGuard, and a firewall. That is a deployment step for the first real
+tenant. `rag doctor` warns when a key is sent over plain http to anything
+but a local name.
+
+**What sharing does not hide:**
+
+- *From the operator:* whoever holds the main key, or the host's disk, reads
+  every tenant. Payloads hold chunk text in plaintext, and vectors invert to
+  most of their source text. Tenants are separated from each other, not from
+  the admin. Anyone who should not trust the admin with their open-tier data
+  needs their own Qdrant.
+- *Key custody:* the main key signs every token, so it mints anything. It
+  stays in the admin's `.env` and worker, as before.
+- *Vault data:* it never reaches Qdrant, so sharing changes nothing for it.
+
+**Rejected:**
+
+- *Payload-filter isolation*, as above.
+- *Tokens restricted by a payload filter.* Some older Qdrant versions had
+  this. It is the same filter-as-boundary idea with the filter moved into
+  the token, and collection scoping already does the job.
+- *A Qdrant per tenant on one host.* This is strongest, and right for a
+  tenant who should not trust the admin. For people who do, it costs a
+  process and its memory per tenant on a box that shares RAM with
+  llama-server.
+- *Revoking by rotating the main key.* It kills every tenant, the admin's
+  own readers included.
+
+**Revisit if:** tenants number in the dozens (per-collection overhead starts
+to matter, and Qdrant's tiered multitenancy becomes the better trade), or a
+tenant needs isolation from the operator.

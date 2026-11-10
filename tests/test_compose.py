@@ -145,3 +145,40 @@ def test_nothing_waits_on_a_qdrant_healthcheck_that_cannot_exist(services):
         dep = (service.get("depends_on") or {})
         if isinstance(dep, dict) and "qdrant" in dep:
             assert dep["qdrant"]["condition"] == "service_started", name
+
+
+# --------------------------------------------------------------------------
+# Tenants of a shared Qdrant (ADR-035)
+# --------------------------------------------------------------------------
+
+TENANT_COMPOSE = ROOT / "docker-compose.tenant.yml"
+
+
+class _ComposeLoader(yaml.SafeLoader):
+    """safe_load plus compose's `!reset`, which plain YAML does not know."""
+
+
+_ComposeLoader.add_constructor("!reset", lambda loader, node: {"__reset__": True})
+
+
+def test_qdrant_accepts_scoped_tokens(services):
+    assert services["qdrant"]["environment"]["QDRANT__SERVICE__JWT_RBAC"] == "true"
+
+
+@pytest.mark.skipif(not TENANT_COMPOSE.exists(), reason="docker-compose.tenant.yml not present")
+def test_the_tenant_override_runs_no_qdrant_and_points_everything_at_the_shared_one(services):
+    override = yaml.load(TENANT_COMPOSE.read_text(), Loader=_ComposeLoader)["services"]
+    # Never started: a profile nothing enables.
+    assert override["qdrant"]["profiles"]
+    for name, service in services.items():
+        if "qdrant_url" not in {k.lower() for k in _env_keys(service)}:
+            continue
+        # Every service that talks to Qdrant is redirected, and must be told where.
+        assert override[name]["environment"]["QDRANT_URL"].startswith("${QDRANT_URL:?"), name
+        deps = service.get("depends_on") or {}
+        if "qdrant" in deps:
+            assert override[name]["depends_on"] == {"__reset__": True}, name
+    # The override adds no secrets of its own and no env file.
+    for name, service in override.items():
+        assert not _env_files(service), name
+        assert not (_env_keys(service) & VAULT_ONLY), name

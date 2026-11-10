@@ -403,6 +403,22 @@ def delete_document(conn: sqlite3.Connection, doc_id: str) -> None:
     conn.execute("DELETE FROM transcription_requests WHERE doc_id=?", (doc_id,))
 
 
+def mark_for_reembed(conn: sqlite3.Connection, source_id: str | None = None) -> int:
+    """Blank stored hashes so the next run re-embeds every open-tier document.
+
+    Rows are kept, never deleted: deleting also dropped the tombstone that keeps
+    a retracted document out -- so it came back -- and every other document's
+    lifecycle, which re-indexing must preserve. None means every source.
+    """
+    placeholders = ",".join("?" for _ in documents.TOMBSTONED)
+    where = f"tier='open' AND lifecycle NOT IN ({placeholders})"
+    params: list = sorted(documents.TOMBSTONED)
+    if source_id is not None:
+        where += " AND source_id=?"
+        params.append(source_id)
+    return conn.execute(f"UPDATE documents SET content_hash='' WHERE {where}", params).rowcount
+
+
 def documents_missing_run(
     conn: sqlite3.Connection, source_id: str, run_id: str
 ) -> list[sqlite3.Row]:

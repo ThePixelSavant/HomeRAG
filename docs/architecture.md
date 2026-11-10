@@ -272,6 +272,8 @@ a boilerplate paragraph.
 | `rag-admin` | read (read-only key) | **read-only mount** | **not mounted** | no |
 | `ingestion-worker backup` | snapshots | online-backup copy | **copied as ciphertext** | **no** |
 | `scripts/rag-backup` (host) | no | no | no (encrypted bundle only) | no; holds the restic password |
+| `ingestion-worker tenant-*` (admin) | main key: creates tenants' collections, signs their tokens | no | no | no |
+| A tenant's own stack | its own pair only, by token (ADR-035) | its own | its own | its own |
 
 The worker's parent holds a key because it writes the encrypted store, so
 extraction was moved out of it: every parser reads attacker-influenced bytes,

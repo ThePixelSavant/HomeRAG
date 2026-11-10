@@ -135,6 +135,10 @@ rag backup-list                  # bundles, latest outcome per destination, snap
 rag backup-verify [VAULT=1]      # check the newest bundle; VAULT=1 proves it opens
 rag backup-restore FROM=<bundle>|<repo>:<snapshot>   # servers stopped; moves, never deletes
 
+rag tenant-create NAME=alice     # share this Qdrant: her own collections (ADR-035)
+rag tenant-token NAME=alice [READ=1] [DAYS=365]   # a token Qdrant confines to them
+rag tenant-list / tenant-revoke NAME= / tenant-delete NAME=
+
 rag test
 rag help                         # shorthands plus every Makefile target
 ```
@@ -176,6 +180,18 @@ neither is in any backup. Setup, restore and the timer are in
 [docs/cli.md](docs/cli.md#rag-backup--local-bundle-then-off-the-machine); the
 reasoning is
 [ADR-032](docs/decisions.md#adr-032-backups-a-local-bundle-then-restic-to-destinations-assumed-hostile).
+
+## Sharing Qdrant with other people
+
+Other people can run this stack on their own machines and keep their open-tier
+index in your Qdrant, each confined by Qdrant itself to their own collections:
+`rag tenant-create`, then `rag tenant-token` for each of their two services,
+with `docker-compose.tenant.yml` on their side. Their documents, `rag.db` and
+vault never leave their machine; their chunks and vectors are readable by you,
+the admin, as plaintext. Exposing Qdrant beyond this host (TLS, firewall) is
+not set up yet. Details in
+[docs/cli.md](docs/cli.md#tenants-of-a-shared-qdrant-admin) and
+[ADR-035](docs/decisions.md#adr-035-tenants-share-one-qdrant-each-confined-by-qdrant-to-their-own-collections).
 
 ## Quarantine
 

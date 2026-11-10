@@ -48,6 +48,7 @@ make ledger / ledger-review / ledger-resolve   # receipts, in exact cents
 make receipts-reread [URI=...]   # re-read filed receipts from their encrypted originals
 make admin                 # read-only dashboard, 127.0.0.1:8090 (ADR-031)
 make backup / backup-list / backup-verify / backup-restore   # ADR-032; restic on the host
+make tenant-create / tenant-token / tenant-list / tenant-revoke / tenant-delete   # ADR-035, admin only
 make test                  # pytest inside the worker image
 ```
 
@@ -364,6 +365,30 @@ before the MCP app sees anything.
 - **No `env_file: .env` on `mcp-server` or `rag-admin`**: list the variables.
   The vault's settings live in `.env.vault`, read by `mcp-vault` alone.
   `tests/test_compose.py` enforces all of this from `docker-compose.yml`.
+
+### Tenants of a shared Qdrant
+
+ADR-035: [app/tenants.py](app/tenants.py), `rag tenant-*`. Qdrant runs with
+`JWT_RBAC`; each tenant's token names only `<name>` and `<name>__meta`, and
+Qdrant refuses the rest. The boundary is Qdrant's check, not ours.
+
+- **Only the main key mints.** Tokens signed with the read-only key are
+  rejected (verified), so readers holding it cannot mint. Admin commands
+  refuse to run under a token.
+- **Every token has `exp`**; Qdrant honours one without it indefinitely.
+- **Revocation is the `rag_tenants` row** (`value_exists`), with a
+  nanosecond generation, so a recreated row never revives an old token. The
+  registry is deliberately not backed up: a restore would undo revocations.
+- **A tenant cannot create, drop or recover a collection.** `rebuild-index`
+  clears instead (fingerprint checked first); `backup-restore` clears and
+  marks for re-embed (`state.mark_for_reembed`, tombstones untouched).
+  `qdrant_store.is_tenant()` reads the token's claims, **unverified**, to
+  pick the path, never to grant anything.
+- **Snapshots are downloaded through the API** (`download_snapshot`,
+  checksum-checked), not copied from `data/qdrant-snapshots`: a tenant is on
+  another machine.
+- `create_collection` writes the fingerprint; `init_collection` adds one to
+  an empty unfingerprinted collection, and only warns on a full one.
 
 ### The admin dashboard
 
