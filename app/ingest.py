@@ -51,6 +51,51 @@ def _print_rows(rows: list[tuple[str, str, str]]) -> None:
 # doctor
 # --------------------------------------------------------------------------
 
+# Hostnames a Qdrant key may be sent to over plain http without crossing a network.
+LOCAL_HOSTS = {"qdrant", "localhost", "127.0.0.1", "::1"}
+TOKEN_RENEW_DAYS = 14
+
+
+def _qdrant_access_rows(now: float | None = None) -> list[tuple[str, str, str]]:
+    """What the configured Qdrant key is, and whether it is about to stop working."""
+    import time
+    from datetime import datetime, timezone
+    from urllib.parse import urlsplit
+
+    rows: list[tuple[str, str, str]] = []
+    now = time.time() if now is None else now
+    claims = qdrant_store.token_claims()
+    if claims is None:
+        detail = "API key" if settings.qdrant_api_key else "no key"
+        rows.append((OK, "qdrant access", f"{detail} (not a tenant token)"))
+    else:
+        scope = claims.get("access")
+        if isinstance(scope, list):
+            names = ", ".join(f"{a.get('collection')}:{a.get('access')}" for a in scope)
+            label = f"tenant token for {names}"
+        else:
+            label = f"token with global access {scope!r}"
+        exp = claims.get("exp")
+        if exp is None:
+            rows.append((WARN, "qdrant access", f"{label}; NEVER expires -- ask for one that does"))
+        else:
+            when = datetime.fromtimestamp(exp, timezone.utc).date().isoformat()
+            left = (exp - now) / 86400
+            if left <= 0:
+                rows.append((BAD, "qdrant access", f"{label}; EXPIRED {when}"))
+            elif left < TOKEN_RENEW_DAYS:
+                rows.append((WARN, "qdrant access", f"{label}; expires {when}, ask for a new one"))
+            else:
+                rows.append((OK, "qdrant access", f"{label}; expires {when}"))
+
+    url = urlsplit(settings.qdrant_url)
+    if settings.qdrant_api_key and url.scheme == "http" and url.hostname not in LOCAL_HOSTS:
+        rows.append(
+            (WARN, "qdrant transport",
+             f"key sent in clear to {url.hostname}; use https unless the link is already encrypted")
+        )
+    return rows
+
 
 def cmd_doctor(args) -> int:
     import platform
@@ -73,6 +118,10 @@ def cmd_doctor(args) -> int:
     except Exception as exc:  # noqa: BLE001
         rows.append((BAD, "qdrant", f"unreachable: {type(exc).__name__}: {exc}"))
         failed = True
+
+    access_rows = _qdrant_access_rows()
+    rows.extend(access_rows)
+    failed = failed or any(status == BAD for status, _, _ in access_rows)
 
     if shutil.which("pdftotext"):
         rows.append((OK, "pdftotext", shutil.which("pdftotext")))
@@ -315,17 +364,8 @@ def cmd_reindex(args) -> int:
         raise SystemExit(f"No source with id {args.source_id!r}")
     source = sources[0]
     if not source.is_vault:
-        # Blank the stored hash so every document reads as changed, rather
-        # than deleting the rows. Deleting also dropped the tombstone that
-        # keeps a retracted document out -- so reindex re-indexed it -- and
-        # every other document's lifecycle, which re-indexing must preserve.
-        placeholders = ",".join("?" for _ in documents.TOMBSTONED)
         with state.writer() as conn:
-            conn.execute(
-                "UPDATE documents SET content_hash='' "
-                f"WHERE source_id=? AND lifecycle NOT IN ({placeholders})",
-                (source.id, *sorted(documents.TOMBSTONED)),
-            )
+            state.mark_for_reembed(conn, source.id)
     return _run(sources, force=True, dry_run=False)
 
 
@@ -787,7 +827,19 @@ def cmd_rebuild_index(args) -> int:
         if input("Type 'rebuild' to continue: ").strip() != "rebuild":
             print("aborted")
             return 1
-    qdrant_store.drop_collection()
+    if qdrant_store.is_tenant():
+        # A tenant token cannot drop a collection, so empty it instead. That
+        # keeps the vector size the admin created it with, so the model must
+        # still match: check before deleting anything (ADR-035).
+        try:
+            qdrant_store.verify_fingerprint()
+        except qdrant_store.FingerprintMismatch as exc:
+            print(f"{exc}\nA tenant cannot change the embedding model itself: the Qdrant "
+                  "admin must delete and re-create the tenant first.", file=sys.stderr)
+            return 1
+        qdrant_store.clear_collection()
+    else:
+        qdrant_store.drop_collection()
     with state.writer() as conn:
         conn.execute("DELETE FROM documents WHERE tier=?", (Tier.OPEN.value,))
     qdrant_store.init_collection()
@@ -927,6 +979,90 @@ def cmd_backup_record(args) -> int:
             snapshot_id=args.snapshot_id, snapshot_count=args.snapshot_count,
             max_age_days=args.max_age_days, detail=args.detail,
         )
+    return 0
+
+
+# --------------------------------------------------------------------------
+# tenants of a shared Qdrant (ADR-035) -- admin only
+# --------------------------------------------------------------------------
+
+
+def _tenant_call(fn, *args, **kwargs):
+    from app import tenants
+
+    _quiet_http()
+    try:
+        return fn(*args, **kwargs)
+    except tenants.TenantError as exc:
+        raise SystemExit(f"tenant: {exc}") from exc
+
+
+def cmd_tenant_create(args) -> int:
+    from app import tenants
+
+    _tenant_call(tenants.create, args.name)
+    print(f"Created tenant {args.name}: collections {args.name} and "
+          f"{qdrant_store.meta_collection(args.name)} ({settings.embed_model}, {settings.embed_dim}d).")
+    print(f"Next: rag tenant-token NAME={args.name}  (and again with READ=1 for their MCP server)")
+    return 0
+
+
+def cmd_tenant_token(args) -> int:
+    from datetime import datetime, timezone
+
+    from app import tenants
+
+    access = "read" if args.read else "write"
+    token, expires = _tenant_call(tenants.issue_token, args.name, access=access, days=args.days)
+    when = datetime.fromtimestamp(expires, timezone.utc).date().isoformat()
+    where = "QDRANT_READ_ONLY_API_KEY" if args.read else "QDRANT_API_KEY"
+    # The token alone on stdout, so it can be piped; the advice on stderr.
+    print(f"{access} token for {args.name}, expires {when}. Goes in the tenant's .env as "
+          f"{where}, with COLLECTION_NAME={args.name}. Shown once; not stored here.",
+          file=sys.stderr)
+    print(token)
+    return 0
+
+
+def cmd_tenant_list(args) -> int:
+    from app import tenants
+
+    rows = _tenant_call(tenants.list_tenants)
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    if not rows:
+        print("no tenants")
+    for r in rows:
+        points = "MISSING" if r["points"] is None else f"{r['points']} points"
+        print(f"  {r['tenant']:<24} {points:>14}  created {r['created_at']}  "
+              f"tokens valid since {r['tokens_valid_since']}")
+    return 0
+
+
+def cmd_tenant_revoke(args) -> int:
+    from app import tenants
+
+    _tenant_call(tenants.revoke, args.name)
+    print(f"Every token issued to {args.name} before now is dead. Issue new ones with "
+          f"`rag tenant-token NAME={args.name}`.")
+    return 0
+
+
+def cmd_tenant_delete(args) -> int:
+    from app import tenants
+
+    if not args.yes:
+        if not sys.stdin.isatty():
+            print("Not a terminal: pass --yes to confirm.", file=sys.stderr)
+            return 2
+        print(f"This drops {args.name}'s index from this Qdrant and kills its tokens.")
+        print("Their documents and rag.db are on their machine and are not touched.")
+        if input(f"Type '{args.name}' to continue: ").strip() != args.name:
+            print("aborted")
+            return 1
+    dropped = _tenant_call(tenants.delete, args.name)
+    print(f"Deleted: {', '.join(dropped)}")
     return 0
 
 
@@ -1087,6 +1223,30 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-age-days", type=float)
     p.add_argument("--detail")
     p.set_defaults(func=cmd_backup_record)
+
+    # --- tenants of a shared Qdrant (ADR-035), admin only ---
+    p = sub.add_parser("tenant-create", help="create a tenant's collections on this Qdrant")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_tenant_create)
+
+    p = sub.add_parser("tenant-token", help="issue a token scoped to one tenant's collections")
+    p.add_argument("name")
+    p.add_argument("--read", action="store_true", help="read-only, for their MCP server")
+    p.add_argument("--days", type=int, default=365, help="lifetime in days (1-730)")
+    p.set_defaults(func=cmd_tenant_token)
+
+    p = sub.add_parser("tenant-list", help="tenants, their size, and when tokens were last revoked")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_tenant_list)
+
+    p = sub.add_parser("tenant-revoke", help="invalidate every token issued to a tenant")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_tenant_revoke)
+
+    p = sub.add_parser("tenant-delete", help="drop a tenant's collections and tokens")
+    p.add_argument("name")
+    p.add_argument("--yes", action="store_true")
+    p.set_defaults(func=cmd_tenant_delete)
 
     # Vault commands live in app/vaultctl.py: they run inside the vault
     # container, which deliberately lacks this module's qdrant dependency.

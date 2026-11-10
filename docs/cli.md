@@ -501,6 +501,11 @@ is older than its limit (2 days local, 3 off-machine, or the repo's
 `RAG_BACKUP_MAX_AGE_DAYS`) or was never taken, and a **failure** when an
 off-machine repo has lost snapshots (see `rag backup`).
 
+It names the Qdrant key this install holds: a plain key, or a tenant token
+with its collections and expiry (a warning 14 days out, a failure once
+expired). It also warns when a key goes over plain http to anything but a
+local hostname.
+
 Vault state reads `not readable from here (by design)` — the control socket
 exists only inside the vault container, on a private tmpfs, so the worker (which
 parses untrusted files) cannot reach it. Use `rag vault-status`, which runs
@@ -679,6 +684,50 @@ Drops the collection and re-embeds every open-tier document. Required after
 changing `EMBED_MODEL`, `EMBED_DIM` or `SCHEMA_VERSION`; the fingerprint stored
 with the vectors enforces it rather than letting two embedding spaces mix
 silently. **The vault is not touched.**
+
+Under a tenant token (see below) it cannot drop the collection, so it empties
+it instead. It checks the fingerprint first, so a model the collection cannot
+hold fails before anything is deleted. A model change there needs the
+admin.
+
+### Tenants of a shared Qdrant (admin)
+
+```bash
+rag tenant-create NAME=alice              # her collections, fingerprinted with this server's model
+rag tenant-token NAME=alice               # write token, for her worker (365 days)
+rag tenant-token NAME=alice READ=1        # read token, for her mcp-server and dashboard
+rag tenant-token NAME=alice DAYS=90       # 1-730; every token expires
+rag tenant-list                           # tenants, points, when tokens were last revoked
+rag tenant-revoke NAME=alice              # kill every token issued to her so far
+rag tenant-delete NAME=alice [YES=1]      # drop her index and tokens (asks you to type the name)
+```
+
+Other people's MCP servers can keep their indexes in this Qdrant, each in a
+collection pair that only their tokens reach. Qdrant refuses everything else
+([ADR-035](decisions.md#adr-035-tenants-share-one-qdrant-each-confined-by-qdrant-to-their-own-collections)).
+Run these on the machine that hosts Qdrant: they need the main key, and
+refuse to run under a token. `tenant-token` prints the token alone on stdout
+and nothing keeps a copy. Revoking writes a new generation to the
+`rag_tenants` registry: that tenant's old tokens fail at once and nobody
+else's change.
+
+**On the tenant's machine**, this repo with `docker-compose.tenant.yml`: no
+local Qdrant, every service pointed at the shared one. In their `.env`:
+
+```bash
+COMPOSE_FILE=docker-compose.yml:docker-compose.tenant.yml
+QDRANT_URL=https://qdrant.example:6333     # TLS or an encrypted link: the token is a bearer secret
+QDRANT_API_KEY=<write token>
+QDRANT_READ_ONLY_API_KEY=<read token>
+COLLECTION_NAME=alice
+```
+
+Their documents, `rag.db` and vault stay on their machine. Their `rag backup`
+downloads their own snapshots through the API. Their `rag backup-restore`
+cannot recover a snapshot, so it empties their collection and the next
+`rag ingest` re-embeds what the restored `rag.db` describes. Sharing hides a
+tenant from other tenants, **not from the admin**: the main key reads every
+collection.
 
 ### Stack control
 

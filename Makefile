@@ -20,7 +20,8 @@ BACKUP     = scripts/rag-backup
         unlock lock vault-status vault-query vault-list vault-lifecycle \
         approve vault-audit ledger ledger-review ledger-resolve receipts-reread admin test \
         backup backup-local backup-offsite backup-offsite-init backup-list backup-verify \
-        backup-restore backup-ack
+        backup-restore backup-ack tenant-create tenant-token tenant-list tenant-revoke \
+        tenant-delete
 
 ## --- stack ---------------------------------------------------------------
 
@@ -226,6 +227,31 @@ backup-restore:         ## make backup-restore FROM=<bundle> | FROM=<repo>:<snap
 backup-ack:             ## Accept a reported rollback and re-baseline: make backup-ack REPO=nas
 	@test -n "$(REPO)" || { echo "usage: make backup-ack REPO=<name>"; exit 2; }
 	@$(BACKUP) ack $(REPO)
+
+## --- tenants of a shared Qdrant (ADR-035) ---------------------------------
+##
+## Admin only: run on the machine that hosts Qdrant, whose worker holds the
+## main key. Each tenant gets its own collections and tokens Qdrant confines
+## to them. Their documents, rag.db and vault stay on their own machine.
+
+tenant-create:          ## Create a tenant's collections: make tenant-create NAME=alice
+	@test -n "$(NAME)" || { echo "usage: make tenant-create NAME=<tenant>"; exit 2; }
+	@$(WORKER) tenant-create "$(NAME)"
+
+tenant-token:           ## Issue a token: make tenant-token NAME=alice [READ=1] [DAYS=365]
+	@test -n "$(NAME)" || { echo "usage: make tenant-token NAME=<tenant> [READ=1] [DAYS=n]"; exit 2; }
+	@$(WORKER) tenant-token "$(NAME)" $(if $(READ),--read) $(if $(DAYS),--days $(DAYS))
+
+tenant-list:            ## Tenants, their size, and when their tokens were last revoked
+	@$(WORKER) tenant-list $(if $(JSON),--json)
+
+tenant-revoke:          ## Kill every token issued to a tenant: make tenant-revoke NAME=alice
+	@test -n "$(NAME)" || { echo "usage: make tenant-revoke NAME=<tenant>"; exit 2; }
+	@$(WORKER) tenant-revoke "$(NAME)"
+
+tenant-delete:          ## Drop a tenant's index and tokens: make tenant-delete NAME=alice [YES=1]
+	@test -n "$(NAME)" || { echo "usage: make tenant-delete NAME=<tenant> [YES=1]"; exit 2; }
+	@$(WORKER) tenant-delete "$(NAME)" $(if $(YES),--yes)
 
 ## --- development ---------------------------------------------------------
 

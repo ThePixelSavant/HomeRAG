@@ -7,10 +7,17 @@ inversion recovers most of the source text from one.
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
+import json
 import logging
 import time
 import uuid
+from pathlib import Path
+from urllib.parse import quote
 
+import httpx
 from qdrant_client import QdrantClient
 from qdrant_client import models as qm
 from qdrant_client.http.exceptions import ResponseHandlingException
@@ -53,6 +60,14 @@ class SweepRefused(RuntimeError):
     pass
 
 
+class TenantScopeError(RuntimeError):
+    """An operation a collection-scoped token cannot perform (ADR-035)."""
+
+
+class SnapshotChecksumError(RuntimeError):
+    pass
+
+
 def get_client() -> QdrantClient:
     global _client
     if _client is None:
@@ -65,8 +80,44 @@ def reset_client() -> None:
     _client = None
 
 
-def meta_collection() -> str:
-    return f"{settings.collection_name}__meta"
+def meta_collection(collection: str | None = None) -> str:
+    return f"{collection or settings.collection_name}__meta"
+
+
+# --------------------------------------------------------------------------
+# What the configured key may do (ADR-035)
+# --------------------------------------------------------------------------
+
+
+def token_claims(api_key: str | None = None) -> dict | None:
+    """The claims of a Qdrant JWT, NOT verified; None for a plain API key.
+
+    Only Qdrant can verify the signature, and it does on every request. This
+    is read to choose a code path and to report expiry, never to grant
+    anything: a forged claim here changes which call is made, and Qdrant still
+    refuses it.
+    """
+    key = settings.qdrant_api_key if api_key is None else api_key
+    parts = (key or "").split(".")
+    if len(parts) != 3:
+        return None
+    try:
+        payload = parts[1] + "=" * (-len(parts[1]) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+    except (binascii.Error, ValueError):
+        return None
+    return claims if isinstance(claims, dict) else None
+
+
+def is_tenant(api_key: str | None = None) -> bool:
+    """True when the key is a token scoped to named collections.
+
+    Such a token reads and writes points, payload indexes and its own
+    snapshots, but cannot create, delete or recover a collection: Qdrant
+    answers "Global access is required".
+    """
+    claims = token_claims(api_key)
+    return claims is not None and isinstance(claims.get("access"), list)
 
 
 def point_id(source_id: str, doc_id: str, chunk_index: int) -> str:
@@ -93,9 +144,9 @@ def _read_fingerprint() -> dict | None:
     return points[0].payload if points else None
 
 
-def _write_fingerprint() -> None:
+def _write_fingerprint(collection: str | None = None) -> None:
     client = get_client()
-    name = meta_collection()
+    name = meta_collection(collection)
     if not client.collection_exists(name):
         client.create_collection(
             collection_name=name,
@@ -162,15 +213,13 @@ def check_collection(wait_seconds: float = 0) -> bool:
     return True
 
 
-def init_collection() -> None:
+def create_collection(name: str) -> None:
+    """Create `name` empty, with this install's vectors and payload indexes.
+
+    Needs the main key. `rag tenant-create` calls it for a tenant's collection
+    so the tenant's own worker never has to (ADR-035).
+    """
     client = get_client()
-    name = settings.collection_name
-
-    if client.collection_exists(name):
-        verify_fingerprint()
-        logger.info("Collection %r ready (dim=%d)", name, settings.embed_dim)
-        return
-
     client.create_collection(
         collection_name=name,
         vectors_config={
@@ -187,12 +236,60 @@ def init_collection() -> None:
         # to speed up single-tenant reads, which is the opposite of the
         # cross-domain recall this index exists for.
         client.create_payload_index(name, field, schema)
+    _write_fingerprint(name)
 
-    _write_fingerprint()
+
+def init_collection() -> None:
+    client = get_client()
+    name = settings.collection_name
+
+    if client.collection_exists(name):
+        if _read_fingerprint() is None:
+            # A collection someone else created and nobody fingerprinted would
+            # leave the model-swap guard off for good. Empty, it is about to be
+            # filled by this configuration, so that is the right record.
+            if count_points() == 0:
+                _write_fingerprint()
+            else:
+                logger.warning(
+                    "Collection %r holds points but no embedding fingerprint; "
+                    "a model change will not be detected. `rag rebuild-index` records one.",
+                    name,
+                )
+        verify_fingerprint()
+        logger.info("Collection %r ready (dim=%d)", name, settings.embed_dim)
+        return
+
+    if is_tenant():
+        raise TenantScopeError(
+            f"Collection {name!r} does not exist, and this install's Qdrant token is "
+            "scoped to its own collections, which cannot create one (ADR-035). Ask the "
+            f"Qdrant admin to run `rag tenant-create {name}`."
+        )
+    create_collection(name)
     logger.info("Created collection %r (dim=%d, dense+sparse)", name, settings.embed_dim)
 
 
+def clear_collection() -> None:
+    """Delete every point and keep the collection and its fingerprint.
+
+    What `rag rebuild-index` does under a tenant token, which cannot drop a
+    collection. The model cannot change this way: the vector size was fixed
+    when the admin created it.
+    """
+    get_client().delete(
+        collection_name=settings.collection_name,
+        points_selector=qm.FilterSelector(filter=qm.Filter()),
+        wait=True,
+    )
+
+
 def drop_collection() -> None:
+    if is_tenant():
+        raise TenantScopeError(
+            "This install's Qdrant token cannot drop a collection (ADR-035); "
+            "`rag rebuild-index` clears it instead."
+        )
     client = get_client()
     for name in (settings.collection_name, meta_collection()):
         if client.collection_exists(name):
@@ -542,3 +639,42 @@ def search(
         )
 
     return [_hit(hit.payload or {}, hit.score) for hit in _stable_top(response.points, limit)]
+
+
+# --------------------------------------------------------------------------
+# Snapshots
+# --------------------------------------------------------------------------
+
+
+def _http() -> httpx.Client:
+    headers = {"api-key": settings.qdrant_api_key} if settings.qdrant_api_key else {}
+    return httpx.Client(base_url=settings.qdrant_url, headers=headers, timeout=120)
+
+
+def download_snapshot(collection: str, snapshot, dest: Path) -> None:
+    """Fetch a snapshot through Qdrant's API and check Qdrant's own checksum.
+
+    Over HTTP rather than out of data/qdrant-snapshots, because a tenant's
+    Qdrant is on another machine and its snapshot directory is not theirs to
+    read (ADR-035). Written to a `.part` file and renamed, so a dropped
+    connection never leaves a truncated snapshot under the real name.
+    """
+    part = dest.with_name(dest.name + ".part")
+    digest = hashlib.sha256()
+    try:
+        with _http() as http, http.stream(
+            "GET", f"/collections/{quote(collection)}/snapshots/{quote(snapshot.name)}"
+        ) as response:
+            response.raise_for_status()
+            with part.open("wb") as out:
+                for block in response.iter_bytes(1 << 20):
+                    out.write(block)
+                    digest.update(block)
+        if snapshot.checksum and digest.hexdigest() != snapshot.checksum:
+            raise SnapshotChecksumError(
+                f"snapshot {collection}/{snapshot.name} does not match Qdrant's checksum"
+            )
+        part.replace(dest)
+    finally:
+        part.unlink(missing_ok=True)
+

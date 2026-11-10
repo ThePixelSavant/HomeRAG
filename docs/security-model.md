@@ -19,6 +19,7 @@ Defended against:
 | A model deciding on its own to read financial records | Per-request approval, granted at a TTY |
 | A prompt-injected model exfiltrating vault data | Same, plus a typed confirmation naming the principal and query |
 | An unapproved agent, container or browser page querying the open tier | `mcp-server` refuses any request without a per-client token from `MCP_CLIENT_TOKENS`; Qdrant itself requires a key, so it cannot be read around `mcp-server` ([ADR-033](decisions.md#adr-033-the-open-tier-mcp-server-takes-only-approved-clients)) |
+| One tenant of a shared Qdrant reading or altering another's index | Each tenant's token names only their own collections, and Qdrant refuses the rest, including probing for names. Tokens are revocable per tenant, and tokens signed with the read-only key are rejected ([ADR-035](decisions.md#adr-035-tenants-share-one-qdrant-each-confined-by-qdrant-to-their-own-collections)) |
 | A compromised `mcp-server` or worker minting identity assertions | Neither receives `VAULT_JWT_SECRET`: it lives in `.env.vault`, read by `mcp-vault` alone; `tests/test_compose.py` holds it there |
 | Another container on `llm-net` reaching vault data | `mcp-vault` is not on `llm-net`; identity gate; no unlock endpoint on the network |
 | A compromised `mcp-server` replaying the identity assertion it is handed every turn | It cannot reach `mcp-vault`: separate `vault-net` bridge with only `open-webui`; verified by `~/Dev/LLM/scripts/check-vault-net.sh` |
@@ -51,6 +52,10 @@ Defended against:
 - **Processes running as you.** The client tokens sit in `.env` and in each
   client's own config (`~/.claude.json` for Claude Code), readable by
   anything running under your account.
+- **The operator of a shared Qdrant.** A tenant's open-tier chunks are
+  plaintext on the admin's disk, readable with the main key, which also mints
+  any token. Tenants are isolated from each other, not from the admin
+  (ADR-035).
 
 ### Ingestion runs across a process boundary
 
@@ -231,6 +236,27 @@ The cost is that nothing can be run inside it: no healthcheck and no
 throwaway container that joins its network namespace (which sees exactly
 what Qdrant sees) and treats a probe that fails to run as unproven, not as
 unreachable.
+
+### Tenants of a shared Qdrant
+
+With `QDRANT__SERVICE__JWT_RBAC` on, Qdrant also accepts HS256 tokens signed
+with its main key, each confined to the collections it names
+([ADR-035](decisions.md#adr-035-tenants-share-one-qdrant-each-confined-by-qdrant-to-their-own-collections)).
+That is how other people's MCP servers can share this Qdrant without seeing
+each other's data, or this install's. The boundary is Qdrant's check, not
+this code's. Every refusal listed in the ADR was confirmed against a real
+server with a real token.
+
+- *Who can mint:* only the main key's holder (this install's worker). Qdrant
+  rejects tokens signed with the read-only key, which the readers hold.
+- *Revocation:* each token is tied to a row in `rag_tenants` by a
+  `value_exists` claim. `rag tenant-revoke` kills one tenant's tokens without
+  touching anyone else's. A lost registry fails closed.
+- *Expiry:* every token issued here has one, because Qdrant honours a token
+  without `exp` indefinitely.
+- *The network:* nothing here exposes Qdrant beyond `llm-net` yet. A remote
+  tenant needs TLS or an encrypted link; `rag doctor` flags a key sent over
+  plain http to a non-local host.
 
 ### The admin dashboard
 

@@ -1,7 +1,8 @@
 """Backups (ADR-032): a consistent bundle of every store, verified and restorable.
 
-Runs in the ingestion worker, which mounts ./data read-write and has the full
-Qdrant key. Taking the bundle never needs the vault key -- vault.db and the
+Runs in the ingestion worker, which mounts ./data read-write and holds the
+Qdrant main key, or on a tenant's machine a token for its own collections
+(ADR-035): snapshots are downloaded through Qdrant's API either way. Taking the bundle never needs the vault key -- vault.db and the
 blobs are copied as ciphertext -- and only `verify --vault` derives one, from a
 passphrase typed at a terminal, in this CLI process (never in parse_worker).
 
@@ -41,7 +42,7 @@ from typing import Callable
 
 from app.config import settings
 from app.domains import SCHEMA_VERSION, Tier, domains_in
-from app.pipeline import qdrant_store, sync
+from app.pipeline import qdrant_store, state, sync
 
 logger = logging.getLogger("backup")
 
@@ -222,10 +223,9 @@ def _snapshot_qdrant(dest: Path) -> dict:
         snap = client.create_snapshot(name, wait=True)
         if snap is None:
             raise BackupError(f"Qdrant returned no snapshot for {name}")
-        produced = settings.qdrant_snapshots_path / name / snap.name
         try:
             out.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(produced, out / f"{name}.snapshot")
+            qdrant_store.download_snapshot(name, snap, out / f"{name}.snapshot")
         finally:
             try:
                 client.delete_snapshot(name, snap.name, wait=True)
@@ -495,8 +495,10 @@ def _snapshot_current_qdrant(aside: Path) -> list[str]:
         if snap is None:
             continue
         aside.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(settings.qdrant_snapshots_path / name / snap.name, aside / f"{name}.snapshot")
-        client.delete_snapshot(name, snap.name, wait=True)
+        try:
+            qdrant_store.download_snapshot(name, snap, aside / f"{name}.snapshot")
+        finally:
+            client.delete_snapshot(name, snap.name, wait=True)
         kept.append(name)
     return kept
 
@@ -560,7 +562,23 @@ def restore_bundle(
 
         # qdrant
         collections = manifest.get("qdrant", {}).get("collections", {})
-        if collections:
+        if qdrant_store.is_tenant():
+            # Recovering a snapshot needs the server's main key, which a tenant
+            # does not hold (ADR-035). The index is derived, so empty it and
+            # let the next run re-embed what the restored rag.db describes;
+            # keeping it would leave chunks of anything indexed since.
+            kept = _snapshot_current_qdrant(aside / "qdrant")
+            if kept:
+                log.append(f"current index snapshotted to {aside.name}/qdrant ({', '.join(kept)})")
+            qdrant_store.clear_collection()
+            with state.writer() as conn:
+                marked = state.mark_for_reembed(conn)
+            log.append(
+                f"index cleared, not recovered: this install's Qdrant token is scoped to its "
+                f"own collections. `rag ingest` re-embeds the {marked} open-tier document(s) "
+                "the restored rag.db describes"
+            )
+        elif collections:
             kept = _snapshot_current_qdrant(aside / "qdrant")
             if kept:
                 log.append(f"current index snapshotted to {aside.name}/qdrant ({', '.join(kept)})")

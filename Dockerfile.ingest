@@ -35,7 +35,7 @@ COPY tests/ tests/
 COPY pyproject.toml .
 # Read by tests/test_compose.py, which holds the per-service environments.
 # The examples only: .env itself never enters an image.
-COPY docker-compose.yml .env.example .env.vault.example ./
+COPY docker-compose.yml docker-compose.tenant.yml .env.example .env.vault.example ./
 
 # Create the user and hand it the two directories it writes to: /app (pytest
 # drops its cache there) and /models (the embedding cache). Done before the

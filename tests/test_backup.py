@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import stat
 import threading
@@ -30,6 +31,7 @@ class FakeQdrant:
         self.collections = {settings.collection_name: b"points-v1", qdrant_store.meta_collection(): b"meta"}
         self.recovered: list[tuple[str, bytes]] = []
         self.deleted: list[str] = []
+        self.cleared: list[str] = []
         self.n = 0
 
     def _check(self):
@@ -60,6 +62,16 @@ class FakeQdrant:
     def delete_snapshot(self, name, snap, wait=True):
         (self.root / name / snap).unlink()
         self.deleted.append(snap)
+
+    def delete(self, collection_name, points_selector, wait=True):
+        # Only clear_collection deletes through here: an empty filter is every point.
+        assert points_selector.filter.must is None
+        self.collections[collection_name] = b""
+        self.cleared.append(collection_name)
+
+    def download(self, collection, snapshot, dest):
+        # What qdrant_store.download_snapshot does over HTTP.
+        shutil.copyfile(self.root / collection / snapshot.name, dest)
 
     def recover_snapshot(self, name, location, priority=None, wait=True):
         rel = location.removeprefix(f"file://{backup.QDRANT_SNAPSHOT_ROOT}/")
@@ -100,6 +112,7 @@ def data(tmp_path, monkeypatch, unlocked):
 
     fake = FakeQdrant(root / "qdrant-snapshots")
     monkeypatch.setattr(qdrant_store, "get_client", lambda: fake)
+    monkeypatch.setattr(qdrant_store, "download_snapshot", fake.download)
     monkeypatch.setattr(qdrant_store, "count_points", lambda *a, **k: 7)
     return SimpleNamespace(root=root, vault=unlocked, qdrant=fake)
 
@@ -315,6 +328,41 @@ def test_restore_moves_the_current_data_aside_and_puts_the_bundle_back(data):
     assert (aside / "qdrant" / f"{settings.collection_name}.snapshot").read_bytes() == b"points-v2"
     # The staged snapshot copies are gone from Qdrant's directory.
     assert not list((data.root / "qdrant-snapshots").rglob("restore-*"))
+
+
+def test_a_tenant_restore_empties_the_index_and_re_embeds_instead(data, monkeypatch):
+    # A tenant token cannot recover a snapshot (ADR-035). The restore must
+    # still put rag.db back, keep the current index aside, and leave the next
+    # ingest to rebuild the index from what the restored rag.db describes.
+    from app.pipeline import state as st
+
+    with st.writer() as conn:
+        st.upsert_document(
+            conn, doc_id="d-open", source_id="inbox:notes", domain="notes", tier="open",
+            uri="a.md", title="a", content_hash="h1", chunk_count=1, extractor="text",
+            status=st.INDEXED, last_seen_run="r1",
+        )
+        st.upsert_document(
+            conn, doc_id="d-gone", source_id="inbox:notes", domain="notes", tier="open",
+            uri="b.md", title="b", content_hash="h2", chunk_count=1, extractor="text",
+            status=st.INDEXED, last_seen_run="r1",
+        )
+        st.set_lifecycle(conn, "d-gone", "retracted", reason="wrong")
+    bundle = backup.create_bundle(wait=0)["path"]
+    data.qdrant.collections[settings.collection_name] = b"points-v2"
+    monkeypatch.setattr(qdrant_store, "is_tenant", lambda *a: True)
+
+    log = backup.restore_bundle(bundle, now=datetime(2026, 11, 8, tzinfo=timezone.utc))
+
+    assert data.qdrant.recovered == []
+    assert data.qdrant.cleared == [settings.collection_name]
+    aside = data.root / "pre-restore-20261108T000000Z"
+    assert (aside / "qdrant" / f"{settings.collection_name}.snapshot").read_bytes() == b"points-v2"
+    with st.reader() as conn:
+        assert st.get_document(conn, "d-open")["content_hash"] == ""
+        # A tombstone keeps its hash and its row: re-embedding must not revive it.
+        assert st.get_document(conn, "d-gone")["content_hash"] == "h2"
+    assert any("index cleared" in line for line in log)
 
 
 def test_restore_never_merges_into_a_live_inbox(data, tmp_path):
