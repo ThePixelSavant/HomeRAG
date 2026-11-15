@@ -9,15 +9,20 @@ services:
   #
   # Pinned by digest: snapshot restore requires a matching minor version, so a
   # silent `latest` bump between taking a backup and restoring it breaks the
-  # migration. Current: dhi.io/qdrant 1.20.0-debian13.
-  # Rollback to the official image, same version (verified to read the same
-  # storage and restore the same snapshots), which needs the healthcheck back:
-  #   qdrant/qdrant@sha256:9bfc89f9914fc14876a88c05270685921a55b8877b254a98bcc1cc2f0a424cd2
+  # migration. Current: dhi.io/qdrant 1.20.1-debian13 (2026-11-14).
+  # Rollback, previous pin (1.20.0-debian13, same minor, so snapshots still
+  # restore; storage backup is data/qdrant-backup-2026-11-14-pre-1.20.1.tar.gz):
+  #   dhi.io/qdrant@sha256:a7f3687ad9690253dc91c81897712989d983d4bb324cbe96b86b31ea20fbfb73
+  # Rollback to the official image, which needs the healthcheck back. 1.20.0
+  # was verified to read the same storage and restore the same snapshots;
+  # the 1.20.1 digest is listed but not yet verified that way:
+  #   qdrant/qdrant@sha256:9bfc89f9914fc14876a88c05270685921a55b8877b254a98bcc1cc2f0a424cd2  (v1.20.0)
+  #   qdrant/qdrant@sha256:d18c8e5061be3eaea2f53fbee1f0bf0382dc59cbb9b7112e41ffcc937ec14220  (v1.20.1)
   # Before that, v1.19.0: sha256:057ee3a8da769fe7310dd3537b4dc7583bf87a95ce8ac43c0af5a46bc580d1fc
   # (storage backup from before the 1.20 bump is
   # data/qdrant-backup-2026-11-05-pre-1.20.tar.gz).
   qdrant:
-    image: dhi.io/qdrant@sha256:a7f3687ad9690253dc91c81897712989d983d4bb324cbe96b86b31ea20fbfb73
+    image: dhi.io/qdrant@sha256:82d1b2d1a3b83b750ab8bbc9f0ac9a257a646c81d1292de4f8b2f786c0dce57b
     container_name: qdrant
     restart: unless-stopped
     # The image runs as 65532; this keeps the storage tree owned by the host
